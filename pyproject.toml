@@ -1,0 +1,43 @@
+[project]
+name = "factor-mining"
+version = "0.1.0"
+description = "Local-first rigorous factor mining automation for BTC/ETH."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "apscheduler>=3.10.4",
+    "duckdb>=1.1.3",
+    "hmmlearn>=0.3.3",
+    "httpx>=0.28.1",
+    "numba>=0.60.0",
+    "numpy>=2.2.0",
+    "pandas>=2.2.3",
+    "pyarrow>=18.0.0",
+    "pydantic>=2.10.0",
+    "pyyaml>=6.0.2",
+    "typer>=0.15.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-cov>=6.0.0",
+]
+
+[project.scripts]
+fm = "factor_mining.cli:app"
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["factor_mining*"]
+
+[tool.setuptools.package-data]
+factor_mining = ["static/*.css", "static/*.js"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["."]

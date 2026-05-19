@@ -1,0 +1,324 @@
+from __future__ import annotations
+
+from typing import Any
+
+from factor_mining.models import (
+    BacktestResult,
+    CandidateStrategySpec,
+    FactorEvidenceReport,
+    GateCheckResult,
+    NearMissAnalysis,
+    ResearchGateResult,
+)
+
+
+def analyze_near_misses(
+    *,
+    candidates: list[CandidateStrategySpec],
+    results: list[BacktestResult],
+    gatechecks: list[GateCheckResult],
+    evidence_reports: list[FactorEvidenceReport],
+    research_gates: list[ResearchGateResult],
+) -> list[NearMissAnalysis]:
+    candidate_by_id = {candidate.candidate_id: candidate for candidate in candidates}
+    evidence_by_exp = {report.experiment_id: report for report in evidence_reports}
+    research_by_exp = {gate.experiment_id: gate for gate in research_gates}
+    out: list[NearMissAnalysis] = []
+    for result, gatecheck in zip(results, gatechecks, strict=False):
+        out.append(
+            analyze_near_miss(
+                candidate=candidate_by_id.get(result.candidate_id),
+                result=result,
+                gatecheck=gatecheck,
+                evidence=evidence_by_exp.get(result.experiment_id),
+                research_gate=research_by_exp.get(result.experiment_id),
+            )
+        )
+    return out
+
+
+def analyze_near_miss(
+    *,
+    candidate: CandidateStrategySpec | None,
+    result: BacktestResult,
+    gatecheck: GateCheckResult,
+    evidence: FactorEvidenceReport | None,
+    research_gate: ResearchGateResult | None,
+) -> NearMissAnalysis:
+    if gatecheck.passed:
+        return NearMissAnalysis(
+            experiment_id=result.experiment_id,
+            candidate_id=result.candidate_id,
+            primary_reason="production_passed",
+            reasons=["production_gate_passed"],
+            diagnostics=_diagnostics(candidate, result, gatecheck, evidence, research_gate),
+        )
+
+    diagnostics = _diagnostics(candidate, result, gatecheck, evidence, research_gate)
+    reasons: list[str] = []
+    suggested: dict[str, Any] = {}
+    actions: list[str] = []
+
+    is_underpowered_survivor = _statistically_underpowered_survivor(diagnostics)
+    if is_underpowered_survivor:
+        reasons.append("statistically_underpowered_survivor")
+        actions.append("accumulate_oos_evidence")
+
+    if _cost_destroyed_edge(diagnostics):
+        reasons.append("cost_destroyed_edge")
+        suggested.update(_low_turnover_params(result))
+        actions.append("reduce_turnover")
+
+    if _excess_turnover(diagnostics):
+        reasons.append("excess_turnover")
+        suggested.update(_low_turnover_params(result))
+        actions.append("reduce_turnover")
+
+    best_horizon = diagnostics.get("best_horizon_bars")
+    current_lookback = diagnostics.get("current_lookback")
+    if best_horizon is not None and current_lookback is not None and int(best_horizon) != int(current_lookback):
+        if float(diagnostics.get("max_abs_ic") or 0.0) >= 0.01:
+            reasons.append("horizon_mismatch")
+            suggested["factor_lookback"] = int(best_horizon)
+            suggested["evidence_horizon_bars"] = int(best_horizon)
+            actions.append("use_best_horizon")
+
+    best_regime = diagnostics.get("best_regime")
+    if best_regime and _conditional_edge(diagnostics, "max_abs_regime_ic"):
+        reasons.append("regime_mixing")
+        suggested["regime_filter"] = [str(best_regime)]
+        actions.append("add_regime_filter")
+
+    best_funding_key = diagnostics.get("best_funding_key")
+    if best_funding_key and _conditional_edge(diagnostics, "max_abs_funding_ic"):
+        reasons.append("funding_state_mixing")
+        if str(best_funding_key).startswith("state:"):
+            suggested["funding_state_filter"] = [str(best_funding_key).split(":", 1)[1]]
+        elif str(best_funding_key).startswith("trend:"):
+            suggested["funding_trend_filter"] = [str(best_funding_key).split(":", 1)[1]]
+        actions.append("add_funding_filter")
+
+    best_side = diagnostics.get("best_side")
+    if best_side and _side_asymmetry(diagnostics):
+        reasons.append("long_short_asymmetry")
+        suggested["side_mode"] = best_side
+        actions.append("split_long_short")
+
+    failures = set(diagnostics.get("gate_failures", "").split(","))
+    if not is_underpowered_survivor and ("G7" in failures or int(diagnostics.get("oos_trade_count") or 0) < 100):
+        reasons.append("insufficient_trades")
+        suggested.setdefault("signal_threshold", 0.10)
+        suggested.setdefault("position_buffer", 0.05)
+        actions.append("broaden_entries")
+
+    if "G2" in failures or "G5" in failures:
+        reasons.append("overfit_or_unstable")
+        suggested.setdefault("smooth_span", 24)
+        suggested.setdefault("signal_threshold", 0.20)
+        suggested["repair_complexity"] = "simplify"
+        actions.append("simplify_signal")
+
+    if not reasons and (research_gate and research_gate.status == "research_survivor"):
+        reasons.append("weak_but_stable_ic")
+        suggested.setdefault("signal_role", "filter")
+        actions.append("use_as_filter")
+
+    if not reasons:
+        reasons.append("no_evidence")
+
+    actionable = bool(suggested) and reasons[0] != "no_evidence"
+    return NearMissAnalysis(
+        experiment_id=result.experiment_id,
+        candidate_id=result.candidate_id,
+        primary_reason=reasons[0],
+        reasons=_dedupe(reasons),
+        actionable=actionable,
+        suggested_params=suggested,
+        repair_actions=_dedupe(actions),
+        diagnostics=diagnostics,
+    )
+
+
+def repair_adjustments_from_near_misses(near_misses: list[NearMissAnalysis], *, limit: int = 16) -> list[dict]:
+    adjustments: list[dict] = []
+    for miss in near_misses:
+        if not miss.actionable:
+            continue
+        adjustments.append({
+            "candidate_id": miss.candidate_id,
+            "param": "repair_params",
+            "current": "failed_candidate",
+            "suggested": {
+                **miss.suggested_params,
+                "near_miss_reason": miss.primary_reason,
+                "near_miss_reasons": miss.reasons,
+                "repair_actions": miss.repair_actions,
+            },
+            "rationale": f"Near-miss repair for {miss.primary_reason}: {', '.join(miss.repair_actions)}",
+        })
+        if len(adjustments) >= limit:
+            break
+    return adjustments
+
+
+def _diagnostics(
+    candidate: CandidateStrategySpec | None,
+    result: BacktestResult,
+    gatecheck: GateCheckResult,
+    evidence: FactorEvidenceReport | None,
+    research_gate: ResearchGateResult | None,
+) -> dict[str, float | int | str | bool | None]:
+    gross = result.metrics_gross
+    gross_sharpe = gross.sharpe if gross is not None else None
+    cost_drag = None if gross_sharpe is None else gross_sharpe - result.metrics_primary.sharpe
+    max_abs_ic, best_horizon = _best_abs(evidence.ic_by_horizon if evidence else {})
+    max_abs_rankic, _ = _best_abs(evidence.rankic_by_horizon if evidence else {})
+    max_abs_regime_ic, best_regime = _best_nested_abs(evidence.regime_conditional_ic if evidence else {})
+    max_abs_funding_ic, best_funding_key = _best_nested_abs(evidence.funding_conditional_ic if evidence else {})
+    long_sharpe = evidence.long_only_metrics.sharpe if evidence else 0.0
+    short_sharpe = evidence.short_only_metrics.sharpe if evidence else 0.0
+    best_side = "long_only" if long_sharpe >= short_sharpe else "short_only"
+    params = candidate.params if candidate is not None else {}
+    current_lookback = params.get("factor_lookback") or params.get("lookback")
+    failures = [item.rule_id for item in gatecheck.failures]
+    warnings = [item.rule_id for item in gatecheck.warnings]
+    g3_status = _gate_item_status(gatecheck, "G3")
+    g7_status = _gate_item_status(gatecheck, "G7")
+    return {
+        "production_gate_passed": gatecheck.passed,
+        "gate_failure_count": len(failures),
+        "gross_sharpe": gross_sharpe,
+        "net_sharpe": result.metrics_primary.sharpe,
+        "deflated_sharpe": result.deflated_sharpe,
+        "probabilistic_sharpe": result.probabilistic_sharpe,
+        "permutation_pvalue": result.permutation_test_pvalue,
+        "fdr_adjusted_pvalue": _gate_item_value(gatecheck, "G3"),
+        "pbo": result.pbo,
+        "cost_drag_sharpe": cost_drag,
+        "cost_margin_bps": result.break_even_cost_bps - 2.0 * result.actual_cost_bps,
+        "break_even_cost_bps": result.break_even_cost_bps,
+        "actual_cost_bps": result.actual_cost_bps,
+        "factor_turnover": result.factor_turnover,
+        "avg_holding_period_bars": result.avg_holding_period_bars,
+        "oos_trade_count": result.oos_trade_count,
+        "trade_count": result.metrics_primary.trade_count,
+        "max_abs_ic": max_abs_ic,
+        "max_abs_rankic": max_abs_rankic,
+        "best_horizon_bars": int(best_horizon) if best_horizon is not None else None,
+        "current_lookback": int(current_lookback) if _is_int_like(current_lookback) else None,
+        "max_abs_regime_ic": max_abs_regime_ic,
+        "best_regime": best_regime,
+        "max_abs_funding_ic": max_abs_funding_ic,
+        "best_funding_key": best_funding_key,
+        "long_sharpe": long_sharpe,
+        "short_sharpe": short_sharpe,
+        "best_side": best_side,
+        "research_gate_status": research_gate.status if research_gate is not None else None,
+        "research_gate_reasons": ",".join(research_gate.reasons) if research_gate is not None else "",
+        "gate_failures": ",".join(failures),
+        "gate_warnings": ",".join(warnings),
+        "g3_fdr_not_passed": g3_status in {"fail", "warn"},
+        "g7_trades_not_passed": g7_status in {"fail", "warn"},
+    }
+
+
+def _cost_destroyed_edge(diagnostics: dict) -> bool:
+    gross = diagnostics.get("gross_sharpe")
+    cost_drag = diagnostics.get("cost_drag_sharpe")
+    return (
+        gross is not None
+        and float(gross) >= 0.5
+        and (
+            float(diagnostics.get("net_sharpe") or 0.0) <= 0.0
+            or (cost_drag is not None and float(cost_drag) >= 0.75)
+            or float(diagnostics.get("cost_margin_bps") or 0.0) < 0.0
+        )
+    )
+
+
+def _statistically_underpowered_survivor(diagnostics: dict) -> bool:
+    return (
+        bool(diagnostics.get("g3_fdr_not_passed"))
+        and bool(diagnostics.get("g7_trades_not_passed"))
+        and float(diagnostics.get("deflated_sharpe") or 0.0) > 0.0
+        and float(diagnostics.get("net_sharpe") or 0.0) > 0.0
+        and float(diagnostics.get("cost_margin_bps") or 0.0) > 0.0
+    )
+
+
+def _excess_turnover(diagnostics: dict) -> bool:
+    return float(diagnostics.get("factor_turnover") or 0.0) >= 0.15
+
+
+def _conditional_edge(diagnostics: dict, key: str) -> bool:
+    overall = max(float(diagnostics.get("max_abs_ic") or 0.0), 0.005)
+    conditional = float(diagnostics.get(key) or 0.0)
+    return conditional >= max(0.015, overall * 1.5)
+
+
+def _side_asymmetry(diagnostics: dict) -> bool:
+    best = max(float(diagnostics.get("long_sharpe") or 0.0), float(diagnostics.get("short_sharpe") or 0.0))
+    net = float(diagnostics.get("net_sharpe") or 0.0)
+    return best >= 0.4 and best - net >= 0.5
+
+
+def _low_turnover_params(result: BacktestResult) -> dict[str, float | int]:
+    smooth_span = 48 if result.factor_turnover >= 0.20 else 24
+    signal_threshold = 0.30 if result.factor_turnover >= 0.20 else 0.20
+    position_buffer = 0.25 if result.factor_turnover >= 0.20 else 0.15
+    return {
+        "smooth_span": smooth_span,
+        "signal_threshold": signal_threshold,
+        "position_buffer": position_buffer,
+    }
+
+
+def _best_abs(values: dict[str, float]) -> tuple[float, str | None]:
+    if not values:
+        return 0.0, None
+    key, value = max(values.items(), key=lambda item: abs(float(item[1])))
+    return abs(float(value)), key
+
+
+def _best_nested_abs(values: dict[str, dict[str, float]]) -> tuple[float, str | None]:
+    best_value = 0.0
+    best_key: str | None = None
+    for label, nested in values.items():
+        for value in nested.values():
+            abs_value = abs(float(value))
+            if abs_value > best_value:
+                best_value = abs_value
+                best_key = label
+    return best_value, best_key
+
+
+def _is_int_like(value: Any) -> bool:
+    try:
+        int(value)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _gate_item_value(gatecheck: GateCheckResult, rule_id: str) -> float | str | None:
+    for item in gatecheck.items:
+        if item.rule_id == rule_id:
+            return item.value
+    return None
+
+
+def _gate_item_status(gatecheck: GateCheckResult, rule_id: str) -> str | None:
+    for item in gatecheck.items:
+        if item.rule_id == rule_id:
+            return item.status
+    return None
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        if value not in seen:
+            out.append(value)
+            seen.add(value)
+    return out

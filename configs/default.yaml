@@ -1,0 +1,101 @@
+data:
+  symbols: ["BTCUSDT", "ETHUSDT"]
+  markets: ["spot", "um_futures"]
+  default_interval: "5m"
+  on_demand_intervals: ["1m"]
+  start_date: "2020-01-01"
+  raw_dir: "data/raw"
+  parquet_dir: "data/parquet"
+  sqlite_path: "data/factor_mining.sqlite3"
+
+trial_ledger:
+  partition: "family_and_rolling_window"
+  window_days: 90
+
+walk_forward:
+  mode: "rolling"
+  train_months: 12
+  validation_months: 3
+  test_months: 3
+  purge_bars_floor: 288
+  embargo_bars: 288
+  min_folds: 4
+
+cpcv:
+  n_groups: 8
+  test_groups: 2
+  pbo_threshold: 0.40
+  ml_pbo_threshold: 0.30
+
+regime:
+  method: "btc_rolling_60d"
+  bull_threshold: 0.20
+  bear_threshold: -0.20
+  high_vol_rank: 0.85
+
+bootstrap:
+  method: "stationary_block"
+  n_resamples: 1000
+  min_block_length_bars: 288
+  block_length_multiplier: 2.0
+  ci_levels: [0.05, 0.95]
+
+newey_west:
+  kernel: "bartlett"
+  bandwidth: "fixed_cube_root"
+
+permutation_test:
+  n_permutations: 5000
+  permute_target: "factor_values"
+  test_statistic: "mean_ic"
+  rejection_threshold: 0.05
+
+position_sizing:
+  primary: "vol_target"
+  secondary: "fixed_notional"
+  target_annual_vol: 0.15
+  vol_window_days: 30
+  max_leverage: 3.0
+  fixed_notional_usd: 10000.0
+
+costs:
+  maker_bps: 2.0
+  taker_bps: 5.0
+  slippage_base_bps: 1.0
+  slippage_k: 25.0
+  slippage_gamma: 0.5
+
+capacity:
+  adv_participation: 0.05
+  min_capacity_usd: 10000.0
+
+ml_complexity:
+  max_depth: 3
+  max_features: 32
+  min_train_samples: 5000
+
+llm:
+  deepseek:
+    base_url: "https://api.deepseek.com"
+    api_key_env: "DEEPSEEK_API_KEY"
+    hypothesis_model: "deepseek-chat"
+    hardscore_model: "deepseek-chat"
+  minimax:
+    base_url: "https://api.minimaxi.com/v1"
+    api_key_env: "MINIMAX_API_KEY"
+    optimizer_model: "MiniMax-M2.7"
+
+gatecheck:
+  fdr_q: 0.05
+  ic_tstat_nw_min: 2.0
+  rankic_tstat_nw_min: 2.0
+  sharpe_ci_5_min: 0.0
+  min_oos_trades: 100
+  max_regime_pnl_concentration: 0.80
+  break_even_cost_multiple: 2.0
+  prior_posterior_ic_max_ratio: 5.0
+  return_autocorr_warn_abs: 0.10
+  data_quality_degraded_warn_ratio: 0.10
+  data_quality_degraded_block_ratio: 0.20
+  research_survivor_promotion_fdr_p: 0.10
+  research_survivor_min_oos_days: 90
