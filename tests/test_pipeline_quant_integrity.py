@@ -3,7 +3,7 @@ import pandas as pd
 
 from factor_mining.config import BootstrapConfig, CPCVConfig, DataConfig, PermutationTestConfig, Settings
 from factor_mining.models import BacktestResult, CandidateStrategySpec, FactorEvidenceReport, GateCheckItem, GateCheckResult, MetricsBlock
-from factor_mining.optimizers.minimax_optimizer import apply_optimization_result, build_optimization_context, _fallback_optimization
+from factor_mining.optimizers.minimax_optimizer import apply_exit_adjustments, apply_optimization_result, build_optimization_context, _fallback_optimization
 from factor_mining.pipeline import (
     _apply_batch_pbo,
     _apply_merge_pool_trial_penalty,
@@ -175,6 +175,92 @@ def test_optimization_result_accepts_minimax_schema_variants() -> None:
     assert adjusted.params["smooth_span"] == 48
     assert repaired.params["search_variant"] == "repair_optimizer_repair"
     assert repaired.params["regime_filter"] == ["sideways", "unknown"]
+
+
+def test_exit_adjustments_can_disable_exit_rules() -> None:
+    candidate = CandidateStrategySpec(
+        candidate_id="c_exit_base",
+        hypothesis_id="h1",
+        method_id="factor_scoring",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+        market="um_futures",
+        params={
+            "stop_loss_pct": -0.05,
+            "max_hold_bars": 100,
+            "tp_tiers": [[0.02, 0.50]],
+            "trailing_stop_pct": 0.02,
+        },
+    )
+
+    candidates = apply_exit_adjustments(
+        {
+            "exit_adjustments": [{
+                "candidate_id": "c_exit_base",
+                "stop_loss_pct": 0,
+                "max_hold_bars": 0,
+                "tp_tiers": [],
+                "trailing_stop_pct": 0,
+                "trailing_after_first_tp": False,
+            }]
+        },
+        [candidate],
+        Settings(),
+    )
+
+    assert len(candidates) == 2
+    adjusted = candidates[-1]
+    assert adjusted.params["stop_loss_pct"] == 0.0
+    assert adjusted.params["max_hold_bars"] == 0
+    assert adjusted.params["tp_tiers"] == []
+    assert adjusted.params["trailing_stop_pct"] == 0.0
+    assert adjusted.params["trailing_after_first_tp"] is False
+
+
+def test_exit_adjustments_skip_effective_duplicate_defaults() -> None:
+    candidate = CandidateStrategySpec(
+        candidate_id="c_default_exit",
+        hypothesis_id="h1",
+        method_id="factor_scoring",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+        market="um_futures",
+    )
+
+    candidates = apply_exit_adjustments(
+        {"exit_adjustments": [{"candidate_id": "c_default_exit", "stop_loss_pct": -0.05}]},
+        [candidate],
+        Settings(),
+    )
+
+    assert candidates == [candidate]
+
+
+def test_exit_adjustments_dedupe_within_parent_not_across_candidates() -> None:
+    first = CandidateStrategySpec(
+        candidate_id="c_first",
+        hypothesis_id="h1",
+        method_id="factor_scoring",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+        market="um_futures",
+    )
+    second = first.model_copy(update={"candidate_id": "c_second"})
+
+    candidates = apply_exit_adjustments(
+        {
+            "exit_adjustments": [
+                {"candidate_id": "c_first", "stop_loss_pct": -0.03},
+                {"candidate_id": "c_second", "stop_loss_pct": -0.03},
+            ]
+        },
+        [first, second],
+        Settings(),
+    )
+
+    generated = [c for c in candidates if c.params.get("generated_by") == "minimax_exit_adjustment"]
+    assert len(generated) == 2
+    assert {c.params["parent_id"] for c in generated} == {"c_first", "c_second"}
 
 
 def test_optimizer_uses_research_survivors_when_gatecheck_has_no_passes() -> None:

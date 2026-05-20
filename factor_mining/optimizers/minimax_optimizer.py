@@ -604,14 +604,17 @@ def apply_exit_adjustments(
     Deduplicates by (parent_id, exit_params) signature so MiniMax cannot
     inflate the candidate pool with near-identical exit variants.
     """
-    import json as _json, uuid as _uuid
+    import uuid as _uuid
     bounds = settings.exit_bounds
     exit_adjustments = optimization.get("exit_adjustments", [])
     if not exit_adjustments:
         return candidates
     candidate_by_id = {c.candidate_id: c for c in candidates}
     new_candidates = list(candidates)
-    seen: set[tuple] = set()
+    seen: set[tuple] = {
+        _exit_variant_signature(candidate, _effective_exit_params(candidate.params, settings))
+        for candidate in candidates
+    }
     for adj in exit_adjustments:
         cid = adj.get("candidate_id", "")
         target = candidate_by_id.get(cid)
@@ -620,14 +623,9 @@ def apply_exit_adjustments(
         clamped = _clamp_exit_params(adj, bounds)
         if not clamped:
             continue
-        sig = (
-            cid,
-            clamped.get("stop_loss_pct"),
-            _json.dumps(clamped.get("tp_tiers", []), sort_keys=True),
-            clamped.get("trailing_stop_pct"),
-            clamped.get("max_hold_bars"),
-            clamped.get("trailing_after_first_tp"),
-        )
+        effective = _effective_exit_params(target.params, settings)
+        effective.update(clamped)
+        sig = _exit_variant_signature(target, effective)
         if sig in seen:
             continue
         seen.add(sig)
@@ -760,12 +758,10 @@ def _clamp_exit_params(params: dict, bounds) -> dict:
     clamped: dict[str, object] = {}
     if "stop_loss_pct" in params:
         sl = float(params["stop_loss_pct"])
-        if sl >= 0.0:
-            sl = bounds.stop_loss_pct_max
-        clamped["stop_loss_pct"] = float(max(bounds.stop_loss_pct_min, min(bounds.stop_loss_pct_max, sl)))
+        clamped["stop_loss_pct"] = 0.0 if sl >= 0.0 else float(max(bounds.stop_loss_pct_min, min(bounds.stop_loss_pct_max, sl)))
     if "max_hold_bars" in params:
         mh = int(params["max_hold_bars"])
-        clamped["max_hold_bars"] = int(max(bounds.max_hold_bars_min, min(bounds.max_hold_bars_max, mh)))
+        clamped["max_hold_bars"] = 0 if mh <= 0 else int(max(bounds.max_hold_bars_min, min(bounds.max_hold_bars_max, mh)))
     if "tp_tiers" in params:
         raw = params["tp_tiers"]
         if isinstance(raw, list):
@@ -778,10 +774,48 @@ def _clamp_exit_params(params: dict, bounds) -> dict:
             clamped["tp_tiers"] = clamped_tiers
     if "trailing_stop_pct" in params:
         tr = float(params["trailing_stop_pct"])
-        clamped["trailing_stop_pct"] = float(max(bounds.trailing_stop_pct_min, min(bounds.trailing_stop_pct_max, tr)))
+        clamped["trailing_stop_pct"] = 0.0 if tr <= 0.0 else float(max(bounds.trailing_stop_pct_min, min(bounds.trailing_stop_pct_max, tr)))
     if "trailing_after_first_tp" in params:
         clamped["trailing_after_first_tp"] = bool(params["trailing_after_first_tp"])
     return clamped
+
+
+def _effective_exit_params(params: dict, settings: Settings) -> dict:
+    ex = settings.exit
+    return {
+        "stop_loss_pct": float(params.get("stop_loss_pct", ex.stop_loss_pct)),
+        "max_hold_bars": int(params.get("max_hold_bars", ex.max_hold_bars)),
+        "tp_tiers": _normalize_tp_tiers(params.get("tp_tiers", ex.tp_tiers)),
+        "trailing_stop_pct": float(params.get("trailing_stop_pct", ex.trailing_stop_pct)),
+        "trailing_after_first_tp": bool(params.get("trailing_after_first_tp", ex.trailing_after_first_tp)),
+    }
+
+
+def _normalize_tp_tiers(raw) -> tuple[tuple[float, float], ...]:
+    if not isinstance(raw, list | tuple):
+        return ()
+    tiers: list[tuple[float, float]] = []
+    for tier in raw:
+        if isinstance(tier, list | tuple) and len(tier) >= 2:
+            tiers.append((float(tier[0]), float(tier[1])))
+    return tuple(sorted(tiers, key=lambda tier: tier[0]))
+
+
+def _exit_signature(params: dict) -> tuple:
+    return (
+        round(float(params.get("stop_loss_pct", 0.0)), 10),
+        int(params.get("max_hold_bars", 0)),
+        _normalize_tp_tiers(params.get("tp_tiers", ())),
+        round(float(params.get("trailing_stop_pct", 0.0)), 10),
+        bool(params.get("trailing_after_first_tp", True)),
+    )
+
+
+def _exit_variant_signature(candidate: CandidateStrategySpec, effective_exit: dict) -> tuple:
+    return (
+        str(candidate.params.get("parent_id") or candidate.candidate_id),
+        _exit_signature(effective_exit),
+    )
 
 
 def _expected_ic_mid(value) -> float:
