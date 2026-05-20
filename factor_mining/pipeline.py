@@ -2741,7 +2741,7 @@ def _fit_regime_model(
     """Fit HMM on an initial prefix and expose only lagged live regimes."""
     from factor_mining.regime.hmm import MarkovRegimeDetector
 
-    detector = MarkovRegimeDetector(n_states=3, random_state=42)
+    detector = MarkovRegimeDetector(n_states=5, random_state=42)
     n_rows = len(frame)
     if n_rows < 100:
         return pd.Series("unknown", index=frame.index)

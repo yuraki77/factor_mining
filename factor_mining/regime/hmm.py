@@ -19,14 +19,37 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from factor_mining.config import RegimeConfig
+
+def _diag_covars(covars: np.ndarray) -> np.ndarray:
+    if covars.ndim == 3:
+        diag = np.array([np.diag(cov) for cov in covars], dtype=float)
+    elif covars.ndim == 2:
+        diag = covars.astype(float, copy=False)
+    else:
+        raise ValueError(f"Unsupported covariance shape for diagonal HMM: {covars.shape}")
+    return np.clip(diag, 1e-12, None)
+
+
+def _diag_gaussian_logpdf(x: np.ndarray, means: np.ndarray, covars: np.ndarray) -> np.ndarray:
+    diff = means - x
+    n_features = means.shape[1]
+    return -0.5 * (
+        n_features * np.log(2.0 * np.pi)
+        + np.log(covars).sum(axis=1)
+        + ((diff * diff) / covars).sum(axis=1)
+    )
+
+
+def _logsumexp(values: np.ndarray) -> float:
+    max_value = float(np.max(values))
+    return max_value + float(np.log(np.exp(values - max_value).sum()))
 
 
 class MarkovRegimeDetector:
     """HMM-based regime detection with forward prediction.
 
     Usage:
-        detector = MarkovRegimeDetector(n_states=3)
+        detector = MarkovRegimeDetector(n_states=5)
         detector.fit(frame)
         states = detector.predict(frame)           # in-sample smoothed states
         labels = detector.label_states(states)      # bull/bear/sideways
@@ -34,7 +57,7 @@ class MarkovRegimeDetector:
         prob = detector.forward_probability(current_state, horizon=48)
     """
 
-    def __init__(self, n_states: int = 3, random_state: int = 42):
+    def __init__(self, n_states: int = 5, random_state: int = 42):
         self.n_states = n_states
         self.random_state = random_state
         self._model = None
@@ -134,7 +157,11 @@ class MarkovRegimeDetector:
         return states
 
     def predict_proba(self, frame: pd.DataFrame) -> np.ndarray:
-        """Return full posterior state probabilities per bar."""
+        """Return full posterior state probabilities per bar.
+
+        This uses hmmlearn's posterior smoother and may use future observations.
+        Use ``predict_proba_filtered`` for live trading decisions.
+        """
         if self._model is None:
             raise RuntimeError("Model not fitted. Call fit() first.")
         X, _ = self._extract_features(frame)
@@ -143,6 +170,41 @@ class MarkovRegimeDetector:
         proba_clean = self._model.predict_proba(X_clean)
         proba = np.zeros((len(frame), self.n_states))
         proba[valid] = proba_clean
+        return proba
+
+    def predict_proba_filtered(self, frame: pd.DataFrame) -> np.ndarray:
+        """Return causal filtered state probabilities per bar.
+
+        The recursion only uses observations up to the current valid row:
+        prior = previous_filtered_probability @ transition_matrix, then a
+        Bayesian update with the current emission likelihood.
+        """
+        if self._model is None:
+            raise RuntimeError("Model not fitted. Call fit() first.")
+        if self._transition_matrix is None:
+            raise RuntimeError("Model not fitted. Call fit() first.")
+        X, _ = self._extract_features(frame)
+        valid = np.isfinite(X).all(axis=1)
+        valid_idx = np.flatnonzero(valid)
+        proba = np.zeros((len(frame), self.n_states))
+        if valid_idx.size == 0:
+            return proba
+
+        means = np.asarray(self._model.means_, dtype=float)
+        covars = _diag_covars(np.asarray(self._model.covars_, dtype=float))
+        start = np.asarray(self._model.startprob_, dtype=float)
+        start = start / max(float(start.sum()), 1e-12)
+        filtered = start
+
+        for idx in valid_idx:
+            log_prior = np.log(np.clip(filtered, 1e-12, None))
+            log_emit = _diag_gaussian_logpdf(X[idx], means, covars)
+            log_unnormalized = log_prior + log_emit
+            filtered = np.exp(log_unnormalized - _logsumexp(log_unnormalized))
+            proba[idx] = filtered
+            filtered = filtered @ self._transition_matrix
+            filtered = filtered / max(float(filtered.sum()), 1e-12)
+
         return proba
 
     # ── regime labeling ─────────────────────────────────────────────
@@ -163,6 +225,8 @@ class MarkovRegimeDetector:
 
         For n_states=3: bull / sideways / bear
         For n_states=4: bull / mild_bull (sideways) / bear / high_vol
+        For n_states=5: bear / mild_bear / sideways / mild_bull / bull,
+        with unusually volatile middle states collapsed to high_vol.
         """
         close = frame["close"].to_numpy(dtype=float)
         returns = np.diff(np.log(close))
@@ -202,6 +266,19 @@ class MarkovRegimeDetector:
                     labels[state] = "bull"
                 else:
                     labels[state] = "high_vol" if ann_vol > global_vol * 1.3 else "sideways"
+            elif n == 5:
+                if rank == 0:
+                    labels[state] = "bear"
+                elif rank == n - 1:
+                    labels[state] = "bull"
+                elif ann_vol > global_vol * 1.25:
+                    labels[state] = "high_vol"
+                elif rank == 1:
+                    labels[state] = "bear"
+                elif rank == 3:
+                    labels[state] = "bull"
+                else:
+                    labels[state] = "sideways"
             else:  # 4+
                 if rank == 0:
                     labels[state] = "bear"
@@ -258,7 +335,7 @@ class MarkovRegimeDetector:
         if not self._state_labels:
             raise RuntimeError("States not labeled. Call label_states() first.")
 
-        proba = self.predict_proba(frame)
+        proba = self.predict_proba_filtered(frame)
         regimes = np.full(len(frame), "unknown", dtype=object)
         valid = proba.sum(axis=1) > 0
         if not valid.any():
