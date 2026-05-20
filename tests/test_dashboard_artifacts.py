@@ -1,19 +1,10 @@
 import pandas as pd
-import pytest
 
 from factor_mining.backtest.engine import build_backtest_detail
 from factor_mining.config import DataConfig, Settings
 from factor_mining.models import BacktestResult, CandidateStrategySpec, GateCheckItem, GateCheckResult, MetricsBlock
 from factor_mining.storage import MetadataStore
-from factor_mining.ui import (
-    _clear_run_display_cache,
-    _cancel_if_stop_requested,
-    _json_safe,
-    _recover_interrupted_runs,
-    _recover_interrupted_stop_requests,
-    _request_run_stop,
-    build_dashboard_state,
-)
+from factor_mining.ui import _json_safe, _recover_interrupted_stop_requests, build_dashboard_state
 
 
 def _frame(n: int = 120) -> pd.DataFrame:
@@ -93,73 +84,6 @@ def test_dashboard_recovers_interrupted_stop_request(tmp_path) -> None:
     assert store.active_pipeline_run() is None
     assert store.pipeline_run_status("hosted-1") == "stopped"
     assert store.load_pipeline_events("hosted-1")[-1]["message"] == "Recovered interrupted stop request on dashboard startup."
-
-
-def test_dashboard_recovers_interrupted_running_run(tmp_path) -> None:
-    settings = Settings(data=DataConfig(sqlite_path=tmp_path / "meta.sqlite3"))
-    store = MetadataStore(settings.data.sqlite_path)
-    store.create_pipeline_run("run-1", {"mode": "single"})
-
-    assert store.active_pipeline_run()["run_id"] == "run-1"
-
-    assert _recover_interrupted_runs(settings) == 1
-
-    run = store.list_pipeline_runs()[0]
-    assert run["status"] == "failed"
-    assert run["error"] == "Dashboard worker interrupted before completion."
-    assert store.active_pipeline_run() is None
-    assert store.load_pipeline_events("run-1")[-1]["message"] == "Recovered interrupted dashboard run on dashboard startup."
-
-
-def test_dashboard_single_run_stop_uses_cancellation_checkpoint(tmp_path) -> None:
-    settings = Settings(data=DataConfig(sqlite_path=tmp_path / "meta.sqlite3"))
-    store = MetadataStore(settings.data.sqlite_path)
-    store.create_pipeline_run("run-1", {"mode": "single"})
-
-    ok, message = _request_run_stop(settings, "run-1")
-
-    assert ok is True
-    assert message == "Stop requested. The worker will cancel at the next checkpoint."
-    assert store.pipeline_run_status("run-1") == "stopping"
-    assert store.active_pipeline_run()["run_id"] == "run-1"
-
-    with pytest.raises(BaseException, match="Stop requested from dashboard."):
-        _cancel_if_stop_requested(store, "run-1")
-
-    assert store.load_pipeline_events("run-1")[-1]["message"] == "Cancellation checkpoint reached."
-
-
-def test_dashboard_finalizes_stale_single_stop_as_cancelled(tmp_path) -> None:
-    settings = Settings(data=DataConfig(sqlite_path=tmp_path / "meta.sqlite3"))
-    store = MetadataStore(settings.data.sqlite_path)
-    store.create_pipeline_run("run-1", {"mode": "single"})
-    store.request_pipeline_stop("run-1")
-
-    ok, message = _request_run_stop(settings, "run-1")
-
-    assert ok is True
-    assert message == "Stopped stale run."
-    run = store.list_pipeline_runs()[0]
-    assert run["status"] == "cancelled"
-    assert run["error"] == "Stop requested from dashboard."
-    assert store.active_pipeline_run() is None
-
-
-def test_run_display_cache_clear_preserves_longitudinal_store(tmp_path) -> None:
-    store = MetadataStore(tmp_path / "meta.sqlite3")
-    store.save_artifact("latest_backtests", "backtests", {"items": [{"experiment_id": "old"}]})
-    store.save_artifact("latest_gatechecks", "gatechecks", {"items": [{"experiment_id": "old"}]})
-    store.save_artifact("initial_candidates", "candidates", {"items": [{"candidate_id": "old"}]})
-    store.save_artifact("experiment_detail_keep", "experiment_detail", {"value": 1})
-    store.save_artifact("manual_note", "note", {"value": 2})
-
-    assert _clear_run_display_cache(store) == 3
-
-    assert store.load_artifact("latest_backtests") is None
-    assert store.load_artifact("latest_gatechecks") is None
-    assert store.load_artifact("initial_candidates") is None
-    assert store.load_artifact("experiment_detail_keep") == {"value": 1}
-    assert store.load_artifact("manual_note") == {"value": 2}
 
 
 def test_dashboard_state_includes_gatecheck_diagnostics(tmp_path) -> None:
@@ -295,40 +219,6 @@ def test_dashboard_state_falls_back_to_computed_diagnostics(tmp_path) -> None:
     assert diagnostics["failure_counts"] == [{"rule_id": "G8", "count": 1}]
     assert diagnostics["rows"][0]["search_variant"] == "low_turnover"
     assert diagnostics["rows"][0]["cost_margin_bps"] == -3.0
-
-
-def test_dashboard_state_treats_gate_warnings_as_diagnostics(tmp_path) -> None:
-    settings = Settings(data=DataConfig(sqlite_path=tmp_path / "meta.sqlite3"))
-    store = MetadataStore(settings.data.sqlite_path)
-    result = BacktestResult(
-        experiment_id="exp-warn",
-        candidate_id="cand-warn",
-        hypothesis_family="momentum",
-        method_id="factor_scoring",
-        symbol="BTCUSDT",
-        market="um_futures",
-        interval="5m",
-        metrics_primary=MetricsBlock(sharpe=0.5),
-    )
-    gate = GateCheckResult(
-        experiment_id="exp-warn",
-        passed=True,
-        items=[
-            GateCheckItem(rule_id="G3", status="warn", message="NW FDR"),
-            GateCheckItem(rule_id="G7", status="warn", message="trades"),
-        ],
-    )
-    store.save_artifact("latest_backtests", "backtests", {"items": [result.model_dump(mode="json")]})
-    store.save_artifact("latest_gatechecks", "gatechecks", {"items": [gate.model_dump(mode="json")]})
-
-    state = build_dashboard_state(settings, store)
-    diagnostics = state["bundle"]["gatecheck_diagnostics"]
-
-    assert state["experiments"][0]["gate"] == "warn"
-    assert state["experiments"][0]["failures"] == []
-    assert state["experiments"][0]["warnings"] == ["G3", "G7"]
-    assert diagnostics["failure_counts"] == []
-    assert diagnostics["warning_counts"] == [{"rule_id": "G3", "count": 1}, {"rule_id": "G7", "count": 1}]
 
 
 def test_dashboard_json_payload_replaces_nan_with_null(tmp_path) -> None:

@@ -66,7 +66,7 @@ def _score(
         + 10.0 * math.tanh(max(0.0, result.ic_tstat_nw, result.rankic_tstat_nw) / 4.0)
         + 7.0 * _clip(1.0 - float(fdr_adjusted_pvalue) / max(settings.gatecheck.fdr_q, 1e-12))
         + 6.0 * math.sqrt(_clip(result.oos_trade_count / max(settings.gatecheck.min_oos_trades, 1)))
-        + 5.0 * _clip(1.0 - _positive_regime_pnl_concentration(result))
+        + 5.0 * _regime_diversity_bonus(result)
         + 4.0 * _calibration_score(ratio)
         + 3.0 * _clip(1.0 - abs(result.return_autocorr_lag1) / autocorr_scale)
     )
@@ -86,9 +86,27 @@ def _calibration_score(ratio: float) -> float:
     return _clip(1.0 - abs(math.log(ratio)) / math.log(5.0))
 
 
-def _positive_regime_pnl_concentration(result: BacktestResult) -> float:
-    positive_pnls = [max(0.0, block.pnl) for block in result.regime_conditional_metrics.values()]
-    total = sum(positive_pnls)
-    if total <= 0.0:
-        return 1.0
-    return float(max(positive_pnls) / total)
+def _regime_diversity_bonus(result: BacktestResult) -> float:
+    """Normalised 0-1 score: 1 = perfectly balanced across active regimes, 0 = single regime.
+
+    Regimes where the strategy barely traded (<5% of total trades) are excluded
+    from the calculation, so intentionally directional strategies aren't penalised
+    for avoiding regimes they don't target."""
+    blocks = list(result.regime_conditional_metrics.values())
+    total_trades = sum(block.trade_count for block in blocks)
+    if total_trades == 0:
+        return 0.0
+    active_pnls = [
+        max(0.0, block.pnl)
+        for block in blocks
+        if block.trade_count / max(total_trades, 1) >= 0.05
+    ]
+    if not active_pnls:
+        return 0.0
+    total = sum(active_pnls)
+    n = len(active_pnls)
+    if total <= 0.0 or n <= 1:
+        return 0.0
+    concentration = float(max(active_pnls) / total)
+    min_possible = 1.0 / n
+    return _clip((1.0 - concentration) / (1.0 - min_possible))

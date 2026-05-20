@@ -7,6 +7,7 @@ until convergence or max_iterations.
 from __future__ import annotations
 
 import os
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -267,6 +268,7 @@ def run_pipeline(
     event_sink: Callable[[str, str, str, dict[str, Any] | None], None] | None = None,
     seed_hypotheses: list[HypothesisSpec] | None = None,
     direction_scope: dict[str, Any] | None = None,
+    stop_event: threading.Event | None = None,
 ) -> PipelineResult:
     """Execute the full factor mining workflow with optional iterative optimization.
 
@@ -302,6 +304,7 @@ def run_pipeline(
             t_start=t_start,
             seed_hypotheses=seed_hypotheses,
             direction_scope=normalized_scope,
+            stop_event=stop_event,
         )
     finally:
         _EVENT_SINK = previous_sink
@@ -322,6 +325,7 @@ def _run_pipeline_impl(
     t_start: float,
     seed_hypotheses: list[HypothesisSpec] | None,
     direction_scope: dict[str, Any] | None,
+    stop_event: threading.Event | None = None,
 ) -> PipelineResult:
     active_survivor_records = store.list_research_survivors(status="active") if store else []
     survivor_seed_candidates = _survivor_seed_candidates(active_survivor_records, result.errors)
@@ -449,6 +453,7 @@ def _run_pipeline_impl(
 
     for round_num in range(1, iterations + 1):
         _step_header(2 + round_num, f"Mining round {round_num}/{iterations} — {len(current_candidates)} candidates")
+        _check_stop(stop_event)
 
         round_backtests: list[BacktestResult] = []
         round_gatechecks: list[GateCheckResult] = []
@@ -458,6 +463,7 @@ def _run_pipeline_impl(
         child_history: list[dict[str, Any]] = []
 
         for key, symbol_candidates in _group_candidates_by_data(current_candidates).items():
+            _check_stop(stop_event)
             context = data_contexts.get(key)
             if context is None:
                 _log(f"  Skip {key[0]}/{key[1]}: no local parquet data")
@@ -480,6 +486,8 @@ def _run_pipeline_impl(
                 artifact_scope=f"round{round_num}_{context.symbol}_{context.market}",
                 cumulative_trial_counts=cumulative_trial_counts,
                 survivor_candidate_ids=survivor_candidate_ids,
+                previous_actions=list(result.optimization_history),
+                stop_event=stop_event,
             )
 
             round_backtests.extend(round_data["backtests"])
@@ -603,7 +611,13 @@ def _run_pipeline_impl(
     return result
 
 
-# ── mining round ────────────────────────────────────────────────────
+def _check_stop(stop_event: threading.Event | None) -> None:
+    if stop_event is not None and stop_event.is_set():
+        raise _PipelineCancelled("Stop requested from dashboard")
+
+
+class _PipelineCancelled(BaseException):
+    pass
 
 
 def _run_mining_round(
@@ -624,9 +638,12 @@ def _run_mining_round(
     cumulative_trial_counts: dict[str, int],
     artifact_scope: str | None = None,
     survivor_candidate_ids: set[str] | None = None,
+    previous_actions: list[dict] | None = None,
+    stop_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     """Execute one complete mining round: backtest → gatecheck → hardscore → optimize."""
     artifact_scope = artifact_scope or f"round{round_num}"
+    _check_stop(stop_event)
     survivor_candidate_ids = survivor_candidate_ids or set()
 
     # ── Backtest ────────────────────────────────────────────────────
@@ -668,9 +685,11 @@ def _run_mining_round(
 
     _log(f"  Discovery backtests: {len(discovery_backtests)}/{len(current_candidates)} completed "
          f"({time.perf_counter() - t0:.0f}s)")
+    _check_stop(stop_event)
 
     if discovery_backtests:
         _apply_batch_pbo(discovery_frame, discovery_tasks, discovery_backtests, settings, funding_df)
+        _check_stop(stop_event)
 
     if not discovery_backtests:
         return {
@@ -742,6 +761,7 @@ def _run_mining_round(
     pre_gate_completed = sum(1 for result in validation_backtests if result.candidate_id in pre_gate_ids)
     if validation_backtests:
         _apply_batch_pbo(repair_validation_frame, validation_tasks, validation_backtests, settings, funding_df)
+    _check_stop(stop_event)
 
     if not validation_backtests:
         return {
@@ -810,6 +830,7 @@ def _run_mining_round(
     round_backtests = final_backtests
     tasks = final_tasks
     _log(f"  Final OOS backtests: {len(round_backtests)} completed")
+    _check_stop(stop_event)
 
     if store:
         store.save_artifact(f"backtests_{artifact_scope}", "backtests", {
@@ -996,9 +1017,11 @@ def _run_mining_round(
 
     _log(f"  HardScore: {sum(1 for s in round_hardscores if s.score > 0)} positive ({time.perf_counter() - t0:.0f}s)")
 
-    # ── Optimize ────────────────────────────────────────────────────
+    # ── Optimize: signal-side ───────────────────────────────────────
+    _check_stop(stop_event)
     t0 = time.perf_counter()
     from factor_mining.optimizers.minimax_optimizer import (
+        apply_exit_adjustments,
         apply_optimization_result,
         build_optimization_context,
         minimax_optimize,
@@ -1006,12 +1029,9 @@ def _run_mining_round(
     )
 
     ctx = build_optimization_context(
-        round_candidates,
-        round_backtests,
-        round_gatechecks,
-        iteration,
-        research_gates=round_research_gates,
-        near_misses=round_near_misses,
+        round_candidates, round_backtests, round_gatechecks, iteration,
+        previous_actions=previous_actions,
+        research_gates=round_research_gates, near_misses=round_near_misses,
     )
     research_survivors = ctx.get("research_survivors", [])
     _log(f"  Research survivors: {len(research_survivors)} selected for optimizer")
@@ -1026,16 +1046,28 @@ def _run_mining_round(
         )
     try:
         optimization = minimax_optimize(ctx, settings, mode="full")
-        _log(f"  MiniMax action: {optimization.get('action', 'unknown')}")
+        _log(f"  MiniMax signal: {optimization.get('action', 'unknown')}")
     except Exception as exc:
-        _log(f"  MiniMax failed: {exc}, using fallback")
+        _log(f"  MiniMax signal failed: {exc}, using fallback")
         optimization = _fallback_optimization(ctx, "full")
 
-    new_candidates, opt_summary = apply_optimization_result(optimization, round_candidates, round_backtests)
-    _log(f"  Optimization: {opt_summary['combinations_created']} combos, "
+    signal_candidates, opt_summary = apply_optimization_result(optimization, round_candidates, round_backtests)
+    new_candidates = list(signal_candidates)
+    _log(f"  Signal optimization: {opt_summary['combinations_created']} combos, "
          f"{opt_summary['adjustments_applied']} adjustments, "
          f"{opt_summary.get('repairs_created', 0)} repairs, "
-         f"{opt_summary['hypotheses_suggested']} new hypotheses "
+         f"{opt_summary['hypotheses_suggested']} new hypotheses")
+
+    # ── Optimize: exit-side ──────────────────────────────────────────
+    try:
+        exit_opt = minimax_optimize(ctx, settings, mode="exit_params")
+        _log(f"  MiniMax exit: {len(exit_opt.get('exit_adjustments', []))} adjustments")
+        new_candidates = apply_exit_adjustments(exit_opt, new_candidates, settings)
+    except Exception as exc:
+        _log(f"  MiniMax exit failed: {exc}, skipping exit optimization")
+        exit_opt = {"exit_adjustments": []}
+
+    _log(f"  Total optimization: {len(new_candidates) - len(round_candidates)} new candidates "
          f"({time.perf_counter() - t0:.0f}s)")
 
     history_entry = {

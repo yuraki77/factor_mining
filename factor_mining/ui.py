@@ -16,7 +16,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from factor_mining.config import Settings, load_settings
-from factor_mining.pipeline import run_pipeline
+from factor_mining.pipeline import _PipelineCancelled, run_pipeline
 from factor_mining.registry import METHOD_REGISTRY, schedulable_methods
 from factor_mining.storage import MetadataStore
 
@@ -24,6 +24,7 @@ from factor_mining.storage import MetadataStore
 UTC = timezone.utc
 STATIC_DIR = Path(__file__).with_name("static")
 _RUN_THREADS: dict[str, threading.Thread] = {}
+_STOP_EVENTS: dict[str, threading.Event] = {}
 _INTERRUPTED_RUN_ERROR = "Dashboard worker interrupted before completion."
 _STOP_REQUESTED_ERROR = "Stop requested from dashboard."
 _RUN_DISPLAY_ARTIFACT_IDS = {
@@ -174,6 +175,9 @@ def _make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
                 experiment_id = (query.get("id") or [""])[0]
                 self._send_json(_load_experiment_detail(settings, experiment_id))
                 return
+            if parsed.path == "/api/archives":
+                self._send_json({"archives": _load_archives()})
+                return
             if parsed.path in {"/dashboard.css", "/dashboard.js"}:
                 self._send_static(parsed.path.removeprefix("/"))
                 return
@@ -293,8 +297,12 @@ def _start_dashboard_run(settings: Settings, args: dict[str, Any]) -> tuple[bool
 
     def worker() -> None:
         worker_store = MetadataStore(settings.data.sqlite_path)
+        stop_event = threading.Event()
+        _STOP_EVENTS[run_id] = stop_event
 
         def sink(phase: str, level: str, message: str, payload: dict[str, Any] | None = None) -> None:
+            if stop_event.is_set():
+                raise _DashboardRunCancelled(_STOP_REQUESTED_ERROR)
             _cancel_if_stop_requested(worker_store, run_id)
             worker_store.append_pipeline_event(run_id, phase=phase, level=level, message=message, payload=payload)
 
@@ -311,6 +319,7 @@ def _start_dashboard_run(settings: Settings, args: dict[str, Any]) -> tuple[bool
                 iterations=args["iterations"],
                 store=worker_store,
                 event_sink=sink,
+                stop_event=stop_event,
             )
             if worker_store.pipeline_run_status(run_id) == "stopping":
                 worker_store.append_pipeline_event(run_id, phase="ui", level="warn", message="Run cancelled after stop request.")
@@ -318,7 +327,7 @@ def _start_dashboard_run(settings: Settings, args: dict[str, Any]) -> tuple[bool
             else:
                 worker_store.append_pipeline_event(run_id, phase="ui", level="info", message="Run completed.")
                 worker_store.update_pipeline_run(run_id, "completed")
-        except _DashboardRunCancelled:
+        except (_DashboardRunCancelled, _PipelineCancelled):
             worker_store.append_pipeline_event(run_id, phase="ui", level="warn", message="Run cancelled at pipeline checkpoint.")
             worker_store.update_pipeline_run(run_id, "cancelled", error=_STOP_REQUESTED_ERROR)
         except Exception as exc:
@@ -332,6 +341,7 @@ def _start_dashboard_run(settings: Settings, args: dict[str, Any]) -> tuple[bool
             worker_store.update_pipeline_run(run_id, "failed", error=str(exc))
         finally:
             _RUN_THREADS.pop(run_id, None)
+            _STOP_EVENTS.pop(run_id, None)
 
     thread = threading.Thread(target=worker, name=f"factor-mining-{run_id}", daemon=True)
     _RUN_THREADS[run_id] = thread
@@ -464,6 +474,9 @@ def _request_run_stop(settings: Settings, run_id: str) -> tuple[bool, str]:
     if status == "running":
         store.request_pipeline_stop(run_id)
         store.append_pipeline_event(run_id, phase="ui", level="warn", message="Stop requested.")
+        stop_event = _STOP_EVENTS.get(run_id)
+        if stop_event is not None:
+            stop_event.set()
     if mode == "hosted":
         return True, "Stop requested. The hosted worker will stop after the current cycle."
     return True, "Stop requested. The worker will cancel at the next checkpoint."
@@ -558,6 +571,54 @@ def _load_experiment_detail(settings: Settings, experiment_id: str) -> dict[str,
         "candidate": candidate,
         "hypothesis": hypothesis,
     }
+
+
+def _load_archives() -> list[dict[str, Any]]:
+    archives_root = Path("archives")
+    if not archives_root.is_dir():
+        return []
+    results: list[dict[str, Any]] = []
+    for archive_dir in sorted(archives_root.iterdir(), reverse=True):
+        if not archive_dir.is_dir():
+            continue
+        manifest_path = archive_dir / "manifest.json"
+        hardscore_path = archive_dir / "hardscore.json"
+        gatecheck_path = archive_dir / "gatecheck.json"
+        result_path = archive_dir / "backtest_result.json"
+        if not manifest_path.exists():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            hardscore = json.loads(hardscore_path.read_text(encoding="utf-8")) if hardscore_path.exists() else {}
+            gatecheck = json.loads(gatecheck_path.read_text(encoding="utf-8")) if gatecheck_path.exists() else {}
+            integrity = "valid"
+            if result_path.exists():
+                from factor_mining.archive import stable_hash
+                result_payload = json.loads(result_path.read_text(encoding="utf-8"))
+                if stable_hash(result_payload) != manifest.get("result_hash"):
+                    integrity = "invalid"
+            else:
+                integrity = "incomplete"
+            results.append({
+                "experiment_id": manifest.get("experiment_id", archive_dir.name),
+                "created_at": manifest.get("created_at", ""),
+                "git_sha": manifest.get("git_sha"),
+                "hardscore": hardscore.get("score"),
+                "sharpe": hardscore.get("sharpe"),
+                "dsr": hardscore.get("dsr"),
+                "gate_passed": gatecheck.get("passed", False),
+                "risk_tier": gatecheck.get("risk_tier", "unknown"),
+                "integrity": integrity,
+            })
+        except (json.JSONDecodeError, OSError):
+            results.append({
+                "experiment_id": archive_dir.name,
+                "created_at": "",
+                "hardscore": None,
+                "sharpe": None,
+                "integrity": "corrupt",
+            })
+    return results
 
 
 def _load_latest_bundle(store: MetadataStore) -> dict[str, Any]:
@@ -745,6 +806,7 @@ def _experiment_rows(bundle: dict[str, Any]) -> list[dict[str, Any]]:
                 "factor_turnover": _as_float(diag.get("factor_turnover")),
                 "search_variant": diag.get("search_variant") or (candidate.get("params") or {}).get("search_variant") or "unknown",
                 "signal_source": diag.get("signal_source") or (candidate.get("params") or {}).get("signal_source"),
+                "exit": _exit_summary(candidate.get("params") or {}),
                 "created_at": backtest.get("created_at"),
             }
         )
@@ -833,6 +895,11 @@ def _as_optional_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _exit_summary(params: dict[str, Any]) -> dict[str, Any]:
+    keys = ("stop_loss_pct", "max_hold_bars", "tp_tiers", "trailing_stop_pct", "trailing_after_first_tp")
+    return {k: params[k] for k in keys if k in params}
 
 
 def _as_int(value: Any, default: int) -> int:

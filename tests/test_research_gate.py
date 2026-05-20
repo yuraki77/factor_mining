@@ -187,8 +187,8 @@ def test_research_survivor_record_tracks_underpowered_high_edge_candidate() -> N
         experiment_id=result.experiment_id,
         passed=False,
         items=[
-            GateCheckItem(rule_id="G3", status="warn", message="FDR"),
-            GateCheckItem(rule_id="G7", status="warn", message="trades"),
+            GateCheckItem(rule_id="G3", status="fail", message="FDR"),
+            GateCheckItem(rule_id="G7", status="fail", message="trades"),
         ],
     )
     research = evaluate_research_gate(result=result, gatecheck=gate, evidence=None)

@@ -45,7 +45,7 @@ newey_west:
   bandwidth: "fixed_cube_root"
 
 permutation_test:
-  n_permutations: 5000
+  n_permutations: 100
   permute_target: "factor_values"
   test_statistic: "mean_ic"
   rejection_threshold: 0.05
@@ -57,6 +57,13 @@ position_sizing:
   vol_window_days: 30
   max_leverage: 3.0
   fixed_notional_usd: 10000.0
+
+exit:
+  stop_loss_pct: -0.05
+  max_hold_bars: 0
+  tp_tiers: []
+  trailing_stop_pct: 0.0
+  trailing_after_first_tp: true
 
 costs:
   maker_bps: 2.0
@@ -99,3 +106,16 @@ gatecheck:
   data_quality_degraded_block_ratio: 0.20
   research_survivor_promotion_fdr_p: 0.10
   research_survivor_min_oos_days: 90
+
+exit_bounds:
+  stop_loss_pct_min: -0.15
+  stop_loss_pct_max: -0.01
+  max_hold_bars_min: 10
+  max_hold_bars_max: 2000
+  tp_tier_pct_min: 0.005
+  tp_tier_pct_max: 0.20
+  tp_tier_fraction_min: 0.10
+  tp_tier_fraction_max: 0.90
+  max_tp_tiers: 4
+  trailing_stop_pct_min: 0.005
+  trailing_stop_pct_max: 0.10

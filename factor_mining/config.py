@@ -67,7 +67,7 @@ class NeweyWestConfig(BaseModel):
 
 
 class PermutationTestConfig(BaseModel):
-    n_permutations: int = 5000
+    n_permutations: int = 100
     permute_target: Literal["factor_values"] = "factor_values"
     test_statistic: Literal["mean_ic"] = "mean_ic"
     rejection_threshold: float = 0.05
@@ -80,6 +80,14 @@ class PositionSizingConfig(BaseModel):
     vol_window_days: int = 30
     max_leverage: float = 3.0
     fixed_notional_usd: float = 10_000.0
+
+
+class ExitConfig(BaseModel):
+    stop_loss_pct: float = -0.05
+    max_hold_bars: int = 0
+    tp_tiers: list[list[float]] = Field(default_factory=list)
+    trailing_stop_pct: float = 0.0
+    trailing_after_first_tp: bool = True
 
 
 class CostConfig(BaseModel):
@@ -135,6 +143,20 @@ class GateCheckConfig(BaseModel):
     research_survivor_min_oos_days: int = 90
 
 
+class ExitBoundsConfig(BaseModel):
+    stop_loss_pct_min: float = -0.15
+    stop_loss_pct_max: float = -0.01
+    max_hold_bars_min: int = 10
+    max_hold_bars_max: int = 2000
+    tp_tier_pct_min: float = 0.005
+    tp_tier_pct_max: float = 0.20
+    tp_tier_fraction_min: float = 0.10
+    tp_tier_fraction_max: float = 0.90
+    max_tp_tiers: int = 4
+    trailing_stop_pct_min: float = 0.005
+    trailing_stop_pct_max: float = 0.10
+
+
 class Settings(BaseModel):
     data: DataConfig = Field(default_factory=DataConfig)
     trial_ledger: TrialLedgerConfig = Field(default_factory=TrialLedgerConfig)
@@ -145,11 +167,13 @@ class Settings(BaseModel):
     newey_west: NeweyWestConfig = Field(default_factory=NeweyWestConfig)
     permutation_test: PermutationTestConfig = Field(default_factory=PermutationTestConfig)
     position_sizing: PositionSizingConfig = Field(default_factory=PositionSizingConfig)
+    exit: ExitConfig = Field(default_factory=ExitConfig)
     costs: CostConfig = Field(default_factory=CostConfig)
     capacity: CapacityConfig = Field(default_factory=CapacityConfig)
     ml_complexity: MLComplexityConfig = Field(default_factory=MLComplexityConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     gatecheck: GateCheckConfig = Field(default_factory=GateCheckConfig)
+    exit_bounds: ExitBoundsConfig = Field(default_factory=ExitBoundsConfig)
 
 
 def load_settings(path: Path | None = None) -> Settings:

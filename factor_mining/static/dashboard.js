@@ -17,6 +17,7 @@ const app = {
     research_brief: "",
   },
   toast: "",
+  archives: null,
 };
 
 const tabDefs = [
@@ -28,6 +29,7 @@ const tabDefs = [
   { id: "methods", label: "Methods", icon: "table" },
   { id: "ledger", label: "Trial Ledger", icon: "shield" },
   { id: "data", label: "Data", icon: "database" },
+  { id: "archive", label: "Archive", icon: "archive" },
 ];
 
 const stageOrder = ["hypothesis", "candidates", "backtests", "gatecheck", "research", "survivor", "hardscore", "archive"];
@@ -119,6 +121,10 @@ async function getJson(url, options) {
 async function loadState() {
   try {
     app.data = await getJson("/api/state");
+    if (app.data.active_run && app.data.active_run.args) {
+      Object.assign(app.runArgs, app.data.active_run.args);
+    }
+    loadArchives();
     render();
   } catch (error) {
     document.getElementById("app").innerHTML = `<div class="boot">Dashboard error: ${esc(error.message)}</div>`;
@@ -180,6 +186,8 @@ function statusInfo() {
 
 function render() {
   if (!app.data) return;
+  var screenEl = document.querySelector(".screen.scrollbar");
+  var scrollTop = screenEl ? screenEl.scrollTop : (app._scrollByTab || {})[app.activeTab] || 0;
   document.documentElement.dataset.theme = "dark";
   document.documentElement.dataset.density = "comfortable";
   document.getElementById("app").className = "";
@@ -195,6 +203,16 @@ function render() {
       ${app.toast ? `<div class="toast">${esc(app.toast)}</div>` : ""}
     </div>
   `;
+  requestAnimationFrame(function() {
+    var newScreen = document.querySelector(".screen.scrollbar");
+    if (newScreen) newScreen.scrollTop = scrollTop;
+  });
+}
+
+function saveScroll() {
+  var screenEl = document.querySelector(".screen.scrollbar");
+  if (!app._scrollByTab) app._scrollByTab = {};
+  if (screenEl) app._scrollByTab[app.activeTab] = screenEl.scrollTop;
 }
 
 function renderTopbar() {
@@ -219,6 +237,7 @@ function renderTopbar() {
         <span>run</span><span class="sep">/</span><span class="now">${esc(runLabel)}</span><span class="sep">·</span><span>${data.bundle.optimization_history.length || 0} rounds</span>
       </div>
       <span class="topbar-spacer"></span>
+      ${active ? `<span class="poll-indicator"><span class="dot"></span>live</span>` : ""}
       <div class="status-pill ${esc(status.className)}">
         <span class="status-dot"></span>${icon(status.icon, 11)}<span>${esc(status.label)}</span>
       </div>
@@ -266,7 +285,7 @@ function renderRail() {
             <label class="toggle-row"><span>Use DeepSeek hypotheses</span><input data-run-field="use_llm" type="checkbox" ${app.runArgs.use_llm ? "checked" : ""} ${active ? "disabled" : ""}></label>
             <div class="field-row">
               ${field("Rounds", "iterations", "number", 1, 7, active)}
-              ${field("Hypotheses", "hypothesis_count", "number", 1, 10, active)}
+              ${app.runArgs.use_llm ? field("Hypotheses", "hypothesis_count", "number", 1, 10, active) : `<span class="muted" style="font-size:11px;align-self:center">19 built-in</span>`}
             </div>
             <div class="field-row">
               ${field("Workers", "max_workers", "number", 1, 64, active)}
@@ -304,6 +323,7 @@ function navCount(tabId) {
     methods: data.methods.length,
     ledger: (data.ledger || []).reduce((sum, row) => sum + Number(row.family_trials || 0), 0),
     data: data.coverage.length,
+    archive: (data.archives || []).length,
   };
   return map[tabId] ?? "";
 }
@@ -386,6 +406,7 @@ function renderActiveTab() {
   if (app.activeTab === "methods") return renderMethods();
   if (app.activeTab === "ledger") return renderLedger();
   if (app.activeTab === "data") return renderData();
+  if (app.activeTab === "archive") return renderArchive();
   return "";
 }
 
@@ -438,7 +459,7 @@ function workflowStages() {
     { id: "gatecheck", label: "GateCheck", count: `${k.gates.accepted}/${totalGate || data.experiments.length}`, prev: data.bundle.backtests.length, color: "var(--stage-gate)", detail: "full pass plus warning-tier acceptance", state: k.gates.fail ? "warn" : "done" },
     { id: "research", label: "Research gate", count: `${researchGateCounts.production_passed || 0}/${researchGateCounts.research_survivor || 0}/${researchGateCounts.rejected || 0}`, prev: totalGate, color: "var(--stage-research)", detail: "production · survivor · rejected", state: researchGate.length ? "done" : "warn" },
     { id: "survivor", label: "Survivors", count: survivors, prev: totalGate, color: "var(--c-violet)", detail: "paper-trade candidates kept for recheck", state: survivors ? "done" : "warn" },
-    { id: "hardscore", label: "HardScore", count: fmt.num(k.topScore, 1), prev: k.gates.accepted, color: "var(--stage-final)", detail: "DSR-aware rank with cost and capacity haircut", state: k.topScore > 0 ? "done" : "warn" },
+    { id: "hardscore", label: "HardScore", count: fmt.num(k.topScore, 1), prev: k.gates.accepted, color: "var(--stage-final)", detail: "10-dim: DSR+haircut+PBO+PSR+IC+FDR+trades+regime+calib+purity", state: k.topScore > 0 ? "done" : "warn" },
     { id: "archive", label: "Archive", count: k.archived, prev: k.gates.accepted, color: "var(--stage-archive)", detail: "reproducible top-ranked bundles", state: k.archived ? "done" : "warn" },
   ];
   if (!data.active_run || liveIndex < 0) return stages;
@@ -831,6 +852,72 @@ function renderExperimentTable(rows, compact = false) {
   `;
 }
 
+async function loadArchives() {
+  if (app.archives) return;
+  try {
+    const data = await getJson("/api/archives");
+    app.archives = data.archives || [];
+  } catch (error) {
+    app.archives = [];
+  }
+}
+
+function renderArchive() {
+  const archives = app.archives || [];
+  if (!archives.length) {
+    return `
+      <div class="screen-grid">
+        ${panel("Archived experiments", "Permanent archives across runs", `<div class="empty">No archives found in archives/ directory. Run the pipeline with archive_top > 0 to populate.</div>`)}
+      </div>
+    `;
+  }
+  const valid = archives.filter(function(a) { return a.integrity === "valid"; }).length;
+  const invalid = archives.filter(function(a) { return a.integrity === "invalid" || a.integrity === "corrupt"; }).length;
+  return `
+    <div class="screen-grid">
+      <div class="kpi-grid">
+        ${kpiTile("Total archived", archives.length, "across all runs", "info")}
+        ${kpiTile("Integrity valid", valid, "checksum matches", "pass")}
+        ${kpiTile("Integrity invalid", invalid, "checksum mismatch or corrupt", invalid ? "fail" : "")}
+        ${kpiTile("Top score", fmt.num(Math.max.apply(null, archives.map(function(a) { return Number(a.hardscore || 0); })), 1), "best HardScore")}
+      </div>
+      ${panel("Archive index", `${archives.length} experiments`, `
+        <div class="table-wrap scrollbar">
+          <table class="fm">
+            <thead>
+              <tr>
+                <th>Experiment</th>
+                <th>Archived</th>
+                <th class="right">Score</th>
+                <th class="right">Sharpe</th>
+                <th>Gate</th>
+                <th>Tier</th>
+                <th>Integrity</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${archives.map(function(row) { return `
+                <tr class="row clickable" data-exp-id="${esc(row.experiment_id)}">
+                  <td>
+                    <div class="id">${esc(shortId(row.experiment_id, 24))}</div>
+                    <div class="id-sub">${esc(row.git_sha ? shortId(row.git_sha, 12) : "no git sha")}</div>
+                  </td>
+                  <td class="mono muted">${esc(row.created_at ? row.created_at.slice(0, 19).replace("T", " ") : "n/a")}</td>
+                  <td class="right mono" style="color:var(--fg-0)">${fmt.num(row.hardscore, 1)}</td>
+                  <td class="right mono ${Number(row.sharpe) >= 0 ? "metric-value pass" : "metric-value fail"}">${fmt.signed(row.sharpe)}</td>
+                  <td>${statusBadge(row.gate_passed ? "pass" : "fail")}</td>
+                  <td><span class="badge ${row.risk_tier === 'full_pass' ? 'pass' : row.risk_tier === 'conditional_pass' ? 'warn' : ''}">${esc(row.risk_tier || "unknown")}</span></td>
+                  <td>${statusBadge(row.integrity === "valid" ? "pass" : row.integrity === "invalid" ? "fail" : "warn", row.integrity)}</td>
+                </tr>
+              `; }).join("")}
+            </tbody>
+          </table>
+        </div>
+      `, true)}
+    </div>
+  `;
+}
+
 function renderExperiments() {
   const rows = filteredExperiments();
   const families = uniq(app.data.experiments.map((row) => row.family));
@@ -1140,7 +1227,7 @@ function renderOptimizationHistory() {
 function renderDrawer() {
   const row = (app.detail && app.detail.row) || app.data.experiments.find((item) => item.experiment_id === app.selectedId) || {};
   if (app.loadingDetail) {
-    return `<div class="drawer-backdrop" data-action="close-detail"></div><aside class="drawer"><div class="drawer-body"><div class="empty">Loading detail...</div></div></aside>`;
+    return `<div class="drawer-backdrop" data-action="close-detail"></div><aside class="drawer"><div class="drawer-body"><div class="drawer-loading"><span class="spinner"></span><span>Loading experiment detail...</span></div></div></aside>`;
   }
   const detail = app.detail && app.detail.detail;
   const hyp = app.detail && app.detail.hypothesis ? app.detail.hypothesis : {};
@@ -1245,6 +1332,7 @@ function renderDetailPayload(detail) {
         ["trade_count", "Trades"],
       ])}
     </section>
+    ${exitSection(detail)}
   `;
 }
 
@@ -1267,6 +1355,42 @@ function formatGateScalar(value) {
     return Number(value.toFixed(6));
   }
   return value;
+}
+
+function exitSection(detail) {
+  const row = detail.row || {};
+  const exit = row.exit || {};
+  const keys = Object.keys(exit);
+  if (!keys.length) return "";
+  const rows = [{
+    param: "stop_loss_pct",
+    value: exit.stop_loss_pct != null ? fmt.pct(exit.stop_loss_pct) : "off",
+    desc: "Hard stop-loss"
+  }, {
+    param: "max_hold_bars",
+    value: exit.max_hold_bars ? fmt.int(exit.max_hold_bars) + " bars" : "off",
+    desc: "Max hold duration"
+  }, {
+    param: "tp_tiers",
+    value: (exit.tp_tiers || []).length
+      ? (exit.tp_tiers || []).map(function(t) { return fmt.pct(t[0]) + " → close " + fmt.pct(t[1] || 0); }).join(", ")
+      : "off",
+    desc: "Batch take-profit"
+  }, {
+    param: "trailing_stop_pct",
+    value: exit.trailing_stop_pct ? fmt.pct(exit.trailing_stop_pct) : "off",
+    desc: exit.trailing_after_first_tp ? "Trailing stop (after first TP)" : "Trailing stop (from entry)"
+  }];
+  return `
+    <section class="drawer-section">
+      <div class="label-eyebrow">Exit rules</div>
+      ${simpleTable(rows, [
+        ["param", ""],
+        ["value", "Value"],
+        ["desc", "Description"],
+      ])}
+    </section>
+  `;
 }
 
 function metric(label, value, tone = "") {
@@ -1421,8 +1545,12 @@ async function postAction(path) {
 document.addEventListener("click", (event) => {
   const tab = event.target.closest("[data-tab]");
   if (tab) {
+    saveScroll();
     app.activeTab = tab.dataset.tab;
     render();
+    if (app.activeTab === "archive") {
+      loadArchives().then(render);
+    }
     return;
   }
   const row = event.target.closest("[data-exp-id]");

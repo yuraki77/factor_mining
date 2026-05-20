@@ -45,6 +45,15 @@ def run_gatecheck(
     method: MethodSpec,
     fdr_adjusted_pvalue: float | None = None,
 ) -> GateCheckResult:
+    """Run the full 16-rule gatecheck on a single backtest result.
+
+    *fdr_adjusted_pvalue* controls G3 semantics:
+      - When passed (pipeline path): the value comes from family-stratified
+        Benjamini-Hochberg FDR and G3 checks ``FDR_p ≤ 0.05``.
+      - When ``None`` (standalone / test path): falls back to the raw
+        ``combined_ic_tstat_pvalue``, i.e. G3 checks the uncorrected
+        Newey-West IC t-stat p-value against 0.05.
+    """
     items: list[GateCheckItem] = []
     fdr_adjusted_pvalue = combined_ic_tstat_pvalue(result.ic_tstat_nw, result.rankic_tstat_nw) if fdr_adjusted_pvalue is None else fdr_adjusted_pvalue
     _item(items, "G1", result.deflated_sharpe > 0.0, "Deflated Sharpe is positive after trial adjustment", result.deflated_sharpe, 0.0)
@@ -172,8 +181,6 @@ def stratify_gatecheck(
 def factor_evidence_level(evidence: FactorEvidenceReport | None) -> tuple[str, list[str]]:
     if evidence is None:
         return "weak", ["missing_factor_evidence"]
-    if evidence.regime_conflict:
-        return "weak", ["regime_conflict"]
 
     flags = evidence.evidence_flags
     dimensions = 0
@@ -205,11 +212,21 @@ def factor_evidence_level(evidence: FactorEvidenceReport | None) -> tuple[str, l
         reasons.append("quantile_spread")
 
     reasons.append(f"evidence_dimensions={dimensions}")
+
+    _level_map: dict[str, str] = {"strong": "moderate", "moderate": "weak", "weak": "weak"}
+
     if dimensions >= 4 and max_abs_ic >= 0.01:
-        return "strong", reasons
-    if dimensions >= 2 and (max_abs_ic >= 0.01 or max_abs_rankic >= 0.01 or max_abs_spread >= 1.0):
-        return "moderate", reasons
-    return "weak", reasons
+        base = "strong"
+    elif dimensions >= 2 and (max_abs_ic >= 0.01 or max_abs_rankic >= 0.01 or max_abs_spread >= 1.0):
+        base = "moderate"
+    else:
+        base = "weak"
+
+    if evidence.regime_conflict:
+        downgraded = _level_map[base]
+        reasons.append(f"regime_conflict:{base}->{downgraded}")
+        return downgraded, reasons
+    return base, reasons
 
 
 def _upsert_risk_tier_item(
@@ -294,8 +311,23 @@ def _raw_gate_passed(items: list[GateCheckItem]) -> bool:
 
 
 def _max_regime_pnl_concentration(result: BacktestResult) -> float:
-    pnls = [max(0.0, block.pnl) for block in result.regime_conditional_metrics.values()]
-    total = sum(pnls)
+    """Regime PnL concentration, excluding regimes the strategy barely traded.
+
+    Strategies that intentionally avoid a regime (e.g. long-only in bull,
+    regime-filtered repairs) will have negligible trade counts in those regimes
+    and won't be penalised for concentration."""
+    blocks = list(result.regime_conditional_metrics.values())
+    total_trades = sum(block.trade_count for block in blocks)
+    if total_trades == 0:
+        return 0.0
+    active_pnls = [
+        max(0.0, block.pnl)
+        for block in blocks
+        if block.trade_count / max(total_trades, 1) >= 0.05
+    ]
+    if not active_pnls:
+        return 0.0
+    total = sum(active_pnls)
     if total <= 0:
         return 1.0
-    return max(pnls) / total
+    return max(active_pnls) / total

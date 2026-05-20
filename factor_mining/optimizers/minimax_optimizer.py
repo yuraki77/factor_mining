@@ -108,6 +108,16 @@ def build_optimization_context(
                 }
                 for regime, block in r.regime_conditional_metrics.items()
             },
+            "exit": _exit_params(c.params),
+            "exit_indicators": {
+                "max_dd": r.metrics_primary.max_drawdown,
+                "avg_holding_bars": r.avg_holding_period_bars,
+                "trade_count": r.metrics_primary.trade_count,
+                "cost_drag_sharpe": (
+                    r.metrics_gross.sharpe - r.metrics_primary.sharpe
+                    if r.metrics_gross is not None else None
+                ),
+            },
         }
         summary["survivor_reason"] = (
             ",".join(research_gate.reasons)
@@ -204,10 +214,13 @@ def minimax_optimize(
             "Return JSON: {\"adjustments\": [{\"candidate_id\": \"...\", \"param\": \"...\", "
             "\"current\": ..., \"suggested\": ..., \"rationale\": \"...\"}]}"
         )
-    else:  # full
+    elif mode == "exit_params":
+        task = _exit_optimization_task(context_json)
+    else:  # full — signal-side: combinations, signal-param adjustments, next hypotheses
         task = (
-            "Suggest both factor combinations AND hyperparameter adjustments AND new hypothesis "
-            "directions to explore.\n\n"
+            "Suggest factor combinations, signal-side parameter adjustments, and new hypothesis "
+            "directions. Do NOT suggest exit parameter changes here — exit optimization runs "
+            "in a separate pass.\n\n"
             f"Current state:\n{context_json}\n\n"
             "Return JSON: {\"combinations\": [...], \"adjustments\": [...], "
             "\"next_hypotheses\": [{\"family\": \"...\", \"mechanism\": \"...\", \"expected_ic\": ...}]}"
@@ -270,12 +283,30 @@ def _extract_json(content: str) -> dict:
     raise ValueError(f"Unable to extract valid JSON from MiniMax response: {content[:200]}...")
 
 
-def _fallback_optimization(context: dict, mode: str) -> dict:
-    """Deterministic fallback when MiniMax is unavailable.
+def _exit_optimization_task(context_json: str) -> str:
+    return (
+        "Optimise EXIT parameters (stop-loss, take-profit tiers, trailing stop, max-hold) "
+        "for each candidate. Use the 'exit' and 'exit_indicators' fields in each factor "
+        "to decide.\n\n"
+        "Guidance:\n"
+        "- High max_dd → consider tighter stop_loss_pct or add trailing_stop_pct\n"
+        "- High gross/net Sharpe gap (cost_drag_sharpe > 0.5) → add tp_tiers to lock profits before costs erode\n"
+        "- Very low turnover or very high avg_holding_bars → add max_hold_bars to force re-entry\n"
+        "- Low trade_count → loosen stop_loss_pct or remove max_hold_bars to give the strategy more room\n"
+        "- Regime-concentrated strategies may benefit from tighter trailing stops\n\n"
+        f"Current state:\n{context_json}\n\n"
+        "Return JSON: {\"exit_adjustments\": [{\"candidate_id\": \"...\", "
+        "\"stop_loss_pct\": -0.03, \"tp_tiers\": [[0.02, 0.50]], "
+        "\"trailing_stop_pct\": 0.02, \"max_hold_bars\": 500, "
+        "\"trailing_after_first_tp\": true, \"rationale\": \"...\"}]}\n\n"
+        "Only include fields that should change. Omitted fields keep their current value."
+    )
 
-    Uses simple rules: keep GateCheck-passing factors, drop failures,
-    equal-weight the survivors.
-    """
+
+def _fallback_optimization(context: dict, mode: str) -> dict:
+    """Deterministic fallback when MiniMax is unavailable."""
+    if mode == "exit_params":
+        return {"exit_adjustments": []}
     passed = [f for f in context["factors"] if f["gatecheck_passed"]]
     survivors = context.get("research_survivors") or []
     failed = [f for f in context["factors"] if not f["gatecheck_passed"]]
@@ -563,6 +594,53 @@ def apply_optimization_result(
     return new_candidates, summary
 
 
+def apply_exit_adjustments(
+    optimization: dict,
+    candidates: list[CandidateStrategySpec],
+    settings: Settings,
+) -> list[CandidateStrategySpec]:
+    """Apply exit parameter adjustments from MiniMax onto existing candidates.
+
+    Deduplicates by (parent_id, exit_params) signature so MiniMax cannot
+    inflate the candidate pool with near-identical exit variants.
+    """
+    import json as _json, uuid as _uuid
+    bounds = settings.exit_bounds
+    exit_adjustments = optimization.get("exit_adjustments", [])
+    if not exit_adjustments:
+        return candidates
+    candidate_by_id = {c.candidate_id: c for c in candidates}
+    new_candidates = list(candidates)
+    seen: set[tuple] = set()
+    for adj in exit_adjustments:
+        cid = adj.get("candidate_id", "")
+        target = candidate_by_id.get(cid)
+        if target is None:
+            continue
+        clamped = _clamp_exit_params(adj, bounds)
+        if not clamped:
+            continue
+        sig = (
+            cid,
+            clamped.get("stop_loss_pct"),
+            _json.dumps(clamped.get("tp_tiers", []), sort_keys=True),
+            clamped.get("trailing_stop_pct"),
+            clamped.get("max_hold_bars"),
+            clamped.get("trailing_after_first_tp"),
+        )
+        if sig in seen:
+            continue
+        seen.add(sig)
+        new_c = target.model_copy(deep=True)
+        new_c.candidate_id = f"c_exit_{_uuid.uuid4().hex[:12]}"
+        new_c.params.update(clamped)
+        new_c.params["parent_id"] = cid
+        new_c.params["generated_by"] = "minimax_exit_adjustment"
+        new_c.params["exit_rationale"] = adj.get("rationale", "")
+        new_candidates.append(new_c)
+    return new_candidates
+
+
 def _combo_turnover_controls(combo: dict, components: list[dict], result_by_candidate: dict[str, BacktestResult]) -> dict:
     component_ids = [item.get("candidate_id") for item in components]
     component_results = [result_by_candidate[cid] for cid in component_ids if cid in result_by_candidate]
@@ -668,6 +746,42 @@ def _combo_float(combo: dict, key: str, *, default: float) -> float:
         return max(0.0, float(combo.get(key, default)))
     except (TypeError, ValueError):
         return default
+
+
+_EXIT_PARAM_KEYS = {"stop_loss_pct", "max_hold_bars", "tp_tiers", "trailing_stop_pct", "trailing_after_first_tp"}
+
+
+def _exit_params(params: dict) -> dict:
+    return {key: params.get(key) for key in _EXIT_PARAM_KEYS if key in params}
+
+
+def _clamp_exit_params(params: dict, bounds) -> dict:
+    """Clamp exit parameters to allowed ranges from ExitBoundsConfig."""
+    clamped: dict[str, object] = {}
+    if "stop_loss_pct" in params:
+        sl = float(params["stop_loss_pct"])
+        if sl >= 0.0:
+            sl = bounds.stop_loss_pct_max
+        clamped["stop_loss_pct"] = float(max(bounds.stop_loss_pct_min, min(bounds.stop_loss_pct_max, sl)))
+    if "max_hold_bars" in params:
+        mh = int(params["max_hold_bars"])
+        clamped["max_hold_bars"] = int(max(bounds.max_hold_bars_min, min(bounds.max_hold_bars_max, mh)))
+    if "tp_tiers" in params:
+        raw = params["tp_tiers"]
+        if isinstance(raw, list):
+            clamped_tiers: list[list[float]] = []
+            for tier in raw[:bounds.max_tp_tiers]:
+                if isinstance(tier, list | tuple) and len(tier) >= 2:
+                    pct = max(bounds.tp_tier_pct_min, min(bounds.tp_tier_pct_max, float(tier[0])))
+                    frac = max(bounds.tp_tier_fraction_min, min(bounds.tp_tier_fraction_max, float(tier[1])))
+                    clamped_tiers.append([pct, frac])
+            clamped["tp_tiers"] = clamped_tiers
+    if "trailing_stop_pct" in params:
+        tr = float(params["trailing_stop_pct"])
+        clamped["trailing_stop_pct"] = float(max(bounds.trailing_stop_pct_min, min(bounds.trailing_stop_pct_max, tr)))
+    if "trailing_after_first_tp" in params:
+        clamped["trailing_after_first_tp"] = bool(params["trailing_after_first_tp"])
+    return clamped
 
 
 def _expected_ic_mid(value) -> float:

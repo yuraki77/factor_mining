@@ -135,8 +135,8 @@ def test_near_miss_marks_statistically_underpowered_survivor() -> None:
         experiment_id=result.experiment_id,
         passed=False,
         items=[
-            GateCheckItem(rule_id="G3", status="warn", message="FDR", value=0.6284, threshold=0.05),
-            GateCheckItem(rule_id="G7", status="warn", message="trades", value=40, threshold=100),
+            GateCheckItem(rule_id="G3", status="fail", message="FDR", value=0.6284, threshold=0.05),
+            GateCheckItem(rule_id="G7", status="fail", message="trades", value=40, threshold=100),
         ],
     )
 
@@ -149,7 +149,7 @@ def test_near_miss_marks_statistically_underpowered_survivor() -> None:
             experiment_id=result.experiment_id,
             candidate_id=result.candidate_id,
             status="research_survivor",
-            production_gate_failures=[],
+            production_gate_failures=["G3", "G7"],
             reasons=["statistically_underpowered_survivor"],
         ),
     )

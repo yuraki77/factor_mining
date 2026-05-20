@@ -8,7 +8,7 @@ import pandas as pd
 
 from factor_mining.config import Settings
 from factor_mining.hypotheses.discovered import boundary_conditions
-from factor_mining.models import BacktestResult, CandidateStrategySpec, DataQualityNote, MetricsBlock
+from factor_mining.models import BacktestResult, CandidateStrategySpec, DataQualityNote, MetricsBlock, TrialRecord
 from factor_mining.stats.metrics import (
     _block_bootstrap_sharpes,
     annualization_factor,
@@ -25,7 +25,6 @@ from factor_mining.stats.metrics import (
 )
 from factor_mining.stats.regime import label_btc_regime
 from factor_mining.trial_ledger import TrialLedger
-from factor_mining.models import TrialRecord
 
 
 @dataclass(frozen=True)
@@ -102,6 +101,119 @@ def _apply_position_buffer(target_position: pd.Series, threshold: float = 0.10) 
     return pd.Series(actual, index=target_position.index)
 
 
+def _apply_exit_rules(
+    position: pd.Series,
+    open_returns: pd.Series,
+    *,
+    stop_loss_pct: float = 0.0,
+    max_hold_bars: int = 0,
+    tp_tiers: list[tuple[float, float]] | None = None,
+    trailing_stop_pct: float = 0.0,
+    trailing_after_first_tp: bool = True,
+) -> pd.Series:
+    """Apply exit overrides to *position*: stop-loss, max-hold, batch TP, trailing stop.
+
+    Called after position_buffer, before strategy_returns.
+
+    Layers (checked in order each bar):
+
+    1. **stop_loss** — cumulative PnL < *stop_loss_pct* → force flat.
+    2. **max_hold_bars** — bars held >= *max_hold_bars* → force flat.
+    3. **tp_tiers** — cumulative PnL crosses a tier threshold → reduce
+       position by the tier's close-fraction.  Tiers fire at most once per
+       trade cluster.  e.g. ``[(0.02, 0.50), (0.05, 0.30)]`` means close
+       50% at +2% PnL, then 30% of remaining at +5%.
+    4. **trailing_stop** — after first TP hit (or from entry if
+       *trailing_after_first_tp* is False), peak PnL drops by
+       *trailing_stop_pct* → force flat.
+
+    Sign-flips (long↔short) reset all state as a new trade cluster.
+    """
+    tiers = list(tp_tiers or [])
+    tiers.sort(key=lambda t: t[0])
+    any_active = stop_loss_pct < 0.0 or max_hold_bars > 0 or tiers or trailing_stop_pct > 0.0
+    if not any_active:
+        return position
+    pos = position.to_numpy(dtype=float)
+    ret = open_returns.to_numpy(dtype=float)
+    result = pos.copy()
+    n = len(pos)
+    in_position = False
+    cum_pnl_pct = 0.0       # actual PnL on scaled position (for stop/trailing)
+    cum_pnl_full = 0.0      # PnL on original position (for TP thresholds)
+    bars_held = 0
+    peak_pnl_pct = 0.0      # peak actual PnL (for trailing stop)
+    trailing_active = False
+    tier_hit_mask = 0
+    position_scale = 1.0
+    for i in range(n):
+        if in_position and i > 0:
+            prev_ret = ret[i - 1]
+            if np.isfinite(prev_ret):
+                pnl_bar = float(result[i - 1] * prev_ret)
+                full_bar = float(pos[i - 1] * prev_ret)
+                cum_pnl_pct += pnl_bar
+                cum_pnl_full += full_bar
+                bars_held += 1
+                if cum_pnl_pct > peak_pnl_pct:
+                    peak_pnl_pct = cum_pnl_pct
+            stopped = False
+            if 0 < max_hold_bars <= bars_held:
+                stopped = True
+            if stop_loss_pct < 0.0 and cum_pnl_pct < stop_loss_pct:
+                stopped = True
+            if trailing_active and trailing_stop_pct > 0.0:
+                if cum_pnl_pct < peak_pnl_pct - trailing_stop_pct:
+                    stopped = True
+            if stopped:
+                result[i] = 0.0
+                in_position = False
+                position_scale = 1.0
+                continue
+            for tier_idx, (threshold, fraction) in enumerate(tiers):
+                if (tier_hit_mask >> tier_idx) & 1:
+                    continue
+                if cum_pnl_full >= threshold:
+                    position_scale *= 1.0 - float(fraction)
+                    tier_hit_mask |= 1 << tier_idx
+                    if trailing_after_first_tp and not trailing_active:
+                        trailing_active = True
+                        peak_pnl_pct = cum_pnl_pct
+            result[i] = pos[i] * position_scale
+            prev_sign = 1.0 if result[i - 1] > 0 else -1.0 if result[i - 1] < 0 else 0.0
+            curr_sign = 1.0 if pos[i] * position_scale > 0 else -1.0 if pos[i] * position_scale < 0 else 0.0
+            if prev_sign != 0.0 and curr_sign != 0.0 and prev_sign != curr_sign:
+                in_position = False
+                position_scale = 1.0
+        if not in_position and abs(pos[i]) > 1e-8:
+            in_position = True
+            cum_pnl_pct = 0.0
+            cum_pnl_full = 0.0
+            bars_held = 0
+            peak_pnl_pct = 0.0
+            trailing_active = not trailing_after_first_tp
+            tier_hit_mask = 0
+            position_scale = 1.0
+            result[i] = pos[i]
+    return pd.Series(result, index=position.index)
+
+
+def _resolve_exit_params(
+    candidate: CandidateStrategySpec, settings: Settings,
+) -> tuple[float, int, list[tuple[float, float]], float, bool]:
+    """Return (stop_loss_pct, max_hold_bars, tp_tiers, trailing_stop_pct, trailing_after_first_tp)."""
+    ex = settings.exit
+    sl = float(candidate.params.get("stop_loss_pct", ex.stop_loss_pct))
+    mh = int(candidate.params.get("max_hold_bars", ex.max_hold_bars))
+    raw_tiers = candidate.params.get("tp_tiers", ex.tp_tiers)
+    if raw_tiers is None:
+        raw_tiers = []
+    tiers = [tuple(float(v) for v in t[:2]) for t in raw_tiers if len(t) >= 2]
+    tr = float(candidate.params.get("trailing_stop_pct", ex.trailing_stop_pct))
+    ta = bool(candidate.params.get("trailing_after_first_tp", ex.trailing_after_first_tp))
+    return sl, mh, tiers, tr, ta
+
+
 def evaluate_strategy_path(
     frame: pd.DataFrame,
     signals: pd.Series,
@@ -129,9 +241,22 @@ def evaluate_strategy_path(
     raw_vol_target = (executable_signal * leverage).fillna(0.0)
     position_buffer = _position_buffer_threshold(candidate)
     vol_target_position = _apply_position_buffer(raw_vol_target, threshold=position_buffer)
-    
+
     raw_fixed = executable_signal.fillna(0.0)
     fixed_position = _apply_position_buffer(raw_fixed, threshold=position_buffer)
+
+    sl_pct, max_hold, tiers, tr_pct, tr_after_tp = _resolve_exit_params(candidate, settings)
+    if sl_pct < 0.0 or max_hold > 0 or tiers or tr_pct > 0.0:
+        vol_target_position = _apply_exit_rules(
+            vol_target_position, open_returns,
+            stop_loss_pct=sl_pct, max_hold_bars=max_hold,
+            tp_tiers=tiers, trailing_stop_pct=tr_pct, trailing_after_first_tp=tr_after_tp,
+        )
+        fixed_position = _apply_exit_rules(
+            fixed_position, open_returns,
+            stop_loss_pct=sl_pct, max_hold_bars=max_hold,
+            tp_tiers=tiers, trailing_stop_pct=tr_pct, trailing_after_first_tp=tr_after_tp,
+        )
 
     primary_returns, primary_cost_bps, avg_participation = _strategy_returns(
         frame,
