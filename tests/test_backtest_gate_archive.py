@@ -2,7 +2,7 @@ import pandas as pd
 import pytest
 
 from factor_mining.archive import archive_experiment, reproduce_archive
-from factor_mining.backtest.engine import evaluate_strategy_path, run_backtest
+from factor_mining.backtest.engine import _apply_exit_rules, evaluate_strategy_path, run_backtest
 from factor_mining.config import BootstrapConfig, DataConfig, GateCheckConfig, PermutationTestConfig, PositionSizingConfig, Settings
 from factor_mining.models import BacktestResult, CandidateStrategySpec, DataQualityNote, FactorEvidenceReport, MetricsBlock
 from factor_mining.registry import get_method
@@ -34,6 +34,33 @@ def make_frame(n: int = 400) -> pd.DataFrame:
             "quote_volume": [1_000_000.0] * n,
         }
     )
+
+
+def test_exit_rules_reset_take_profit_after_natural_flat() -> None:
+    position = pd.Series([1.0, 1.0, 0.0, 0.0, 1.0, 1.0])
+    open_returns = pd.Series([0.03, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+    adjusted = _apply_exit_rules(position, open_returns, tp_tiers=[(0.02, 0.50)])
+
+    assert adjusted.tolist() == pytest.approx([1.0, 0.5, 0.0, 0.0, 1.0, 1.0])
+
+
+def test_exit_rules_stop_blocks_reentry_until_signal_resets() -> None:
+    position = pd.Series([1.0, 1.0, 1.0, 0.0, 1.0, 1.0])
+    open_returns = pd.Series([-0.06, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+    adjusted = _apply_exit_rules(position, open_returns, stop_loss_pct=-0.05)
+
+    assert adjusted.tolist() == pytest.approx([1.0, 0.0, 0.0, 0.0, 1.0, 1.0])
+
+
+def test_exit_rules_max_hold_allows_reentry_on_continuous_signal() -> None:
+    position = pd.Series([1.0, 1.0, 1.0, 1.0])
+    open_returns = pd.Series([0.0, 0.0, 0.0, 0.0])
+
+    adjusted = _apply_exit_rules(position, open_returns, max_hold_bars=2)
+
+    assert adjusted.tolist() == pytest.approx([1.0, 1.0, 0.0, 1.0])
 
 
 def test_backtest_uses_next_bar_execution_and_records_trial(tmp_path) -> None:

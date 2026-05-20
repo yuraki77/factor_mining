@@ -146,7 +146,32 @@ def _apply_exit_rules(
     trailing_active = False
     tier_hit_mask = 0
     position_scale = 1.0
+    active_sign = 0.0
+    blocked_sign = 0.0
+
+    def reset_trade() -> None:
+        nonlocal in_position, cum_pnl_pct, cum_pnl_full, bars_held
+        nonlocal peak_pnl_pct, trailing_active, tier_hit_mask, position_scale, active_sign
+        in_position = False
+        cum_pnl_pct = 0.0
+        cum_pnl_full = 0.0
+        bars_held = 0
+        peak_pnl_pct = 0.0
+        trailing_active = False
+        tier_hit_mask = 0
+        position_scale = 1.0
+        active_sign = 0.0
+
     for i in range(n):
+        desired_sign = 1.0 if pos[i] > 0 else -1.0 if pos[i] < 0 else 0.0
+        if blocked_sign != 0.0:
+            if desired_sign == 0.0:
+                blocked_sign = 0.0
+            elif desired_sign == blocked_sign:
+                result[i] = 0.0
+                continue
+            else:
+                blocked_sign = 0.0
         if in_position and i > 0:
             prev_ret = ret[i - 1]
             if np.isfinite(prev_ret):
@@ -158,18 +183,29 @@ def _apply_exit_rules(
                 if cum_pnl_pct > peak_pnl_pct:
                     peak_pnl_pct = cum_pnl_pct
             stopped = False
+            block_reentry = False
             if 0 < max_hold_bars <= bars_held:
                 stopped = True
             if stop_loss_pct < 0.0 and cum_pnl_pct < stop_loss_pct:
                 stopped = True
+                block_reentry = True
             if trailing_active and trailing_stop_pct > 0.0:
                 if cum_pnl_pct < peak_pnl_pct - trailing_stop_pct:
                     stopped = True
+                    block_reentry = True
             if stopped:
                 result[i] = 0.0
-                in_position = False
-                position_scale = 1.0
+                stopped_sign = active_sign
+                reset_trade()
+                if block_reentry and desired_sign == stopped_sign:
+                    blocked_sign = stopped_sign
                 continue
+            if desired_sign == 0.0:
+                result[i] = 0.0
+                reset_trade()
+                continue
+            if active_sign != 0.0 and desired_sign != active_sign:
+                reset_trade()
             for tier_idx, (threshold, fraction) in enumerate(tiers):
                 if (tier_hit_mask >> tier_idx) & 1:
                     continue
@@ -179,12 +215,8 @@ def _apply_exit_rules(
                     if trailing_after_first_tp and not trailing_active:
                         trailing_active = True
                         peak_pnl_pct = cum_pnl_pct
-            result[i] = pos[i] * position_scale
-            prev_sign = 1.0 if result[i - 1] > 0 else -1.0 if result[i - 1] < 0 else 0.0
-            curr_sign = 1.0 if pos[i] * position_scale > 0 else -1.0 if pos[i] * position_scale < 0 else 0.0
-            if prev_sign != 0.0 and curr_sign != 0.0 and prev_sign != curr_sign:
-                in_position = False
-                position_scale = 1.0
+            if in_position:
+                result[i] = pos[i] * position_scale
         if not in_position and abs(pos[i]) > 1e-8:
             in_position = True
             cum_pnl_pct = 0.0
@@ -194,6 +226,7 @@ def _apply_exit_rules(
             trailing_active = not trailing_after_first_tp
             tier_hit_mask = 0
             position_scale = 1.0
+            active_sign = desired_sign
             result[i] = pos[i]
     return pd.Series(result, index=position.index)
 
