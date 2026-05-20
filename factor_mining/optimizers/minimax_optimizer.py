@@ -471,7 +471,13 @@ def apply_optimization_result(
     Returns (new_candidates, optimization_summary).
     """
     new_candidates: list[CandidateStrategySpec] = []
-    summary = {"combinations_created": 0, "adjustments_applied": 0, "repairs_created": 0, "hypotheses_suggested": 0}
+    summary = {
+        "combinations_created": 0,
+        "adjustments_applied": 0,
+        "repairs_created": 0,
+        "hypotheses_suggested": 0,
+        "status_adjustments_recorded": 0,
+    }
 
     # Create new candidates from suggested combinations
     base_candidate = candidates[0] if candidates else None
@@ -514,14 +520,13 @@ def apply_optimization_result(
             summary["combinations_created"] += 1
 
     # Apply parameter adjustments to spawn new candidates
-    import copy
     import uuid
     for adj in optimization.get("adjustments", []):
         cid, param_name, suggested = _normalized_adjustment(adj)
         for c in candidates:
             if c.candidate_id == cid and param_name and suggested is not None:
                 if param_name == "status":
-                    c.params["status"] = str(suggested)
+                    summary["status_adjustments_recorded"] += 1
                 elif param_name == "turnover_controls" and isinstance(suggested, dict):
                     new_c = c.model_copy(deep=True)
                     new_c.candidate_id = f"c_adj_{uuid.uuid4().hex[:12]}"

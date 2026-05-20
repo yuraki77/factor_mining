@@ -10,6 +10,7 @@ from factor_mining.pipeline import (
     _build_data_split_plan,
     _build_pre_gate_repair_candidates,
     _build_signal_for,
+    _build_tasks,
     _check_mining_boundaries,
     _cscv_splits,
     _filter_candidates_by_mining_boundaries,
@@ -175,6 +176,57 @@ def test_optimization_result_accepts_minimax_schema_variants() -> None:
     assert adjusted.params["smooth_span"] == 48
     assert repaired.params["search_variant"] == "repair_optimizer_repair"
     assert repaired.params["regime_filter"] == ["sideways", "unknown"]
+
+
+def test_status_adjustment_does_not_mutate_source_candidate() -> None:
+    candidate = CandidateStrategySpec(
+        candidate_id="c_failed",
+        hypothesis_id="h1",
+        method_id="factor_scoring",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+        market="um_futures",
+    )
+
+    new_candidates, summary = apply_optimization_result(
+        {
+            "adjustments": [{
+                "candidate_id": "c_failed",
+                "param": "status",
+                "suggested": "paused",
+            }]
+        },
+        [candidate],
+        [],
+    )
+
+    assert new_candidates == []
+    assert "status" not in candidate.params
+    assert summary["status_adjustments_recorded"] == 1
+    assert summary["adjustments_applied"] == 0
+
+
+def test_build_tasks_skips_unknown_legacy_family_without_fallback_features(capsys) -> None:
+    frame = _frame(40)
+    candidate = CandidateStrategySpec(
+        candidate_id="c_unknown_family",
+        hypothesis_id="h1",
+        method_id="factor_scoring",
+        hypothesis_family="unknown_llm_family",
+        symbol="BTCUSDT",
+        market="um_futures",
+    )
+
+    tasks = _build_tasks(
+        [candidate],
+        frame,
+        pd.DataFrame(index=frame.index),
+        {},
+        pd.Series("unknown", index=frame.index),
+    )
+
+    assert tasks == []
+    assert "SKIP signal" in capsys.readouterr().out
 
 
 def test_exit_adjustments_can_disable_exit_rules() -> None:

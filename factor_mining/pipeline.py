@@ -2443,7 +2443,11 @@ def _build_tasks(
     tasks = []
     note_dicts = [note.model_dump(mode="json") for note in (data_quality_notes or [])]
     for i, c in enumerate(candidates):
-        signal_arr = _build_signal_for(c, frame, features_df, feature_meta, i, forward_regimes, funding_rate)
+        try:
+            signal_arr = _build_signal_for(c, frame, features_df, feature_meta, i, forward_regimes, funding_rate)
+        except ValueError as exc:
+            _log(f"[{i + 1}/{len(candidates)}] {c.candidate_id[:16]}... SKIP signal: {exc}")
+            continue
         trial_counts = (trial_counts_by_candidate or {}).get(
             c.candidate_id,
             {
@@ -2634,6 +2638,11 @@ def _build_signal_for(
             col for col, m in feature_meta.items()
             if m.get("family", "") in ("trend_following", "mean_reversion", "volatility_regime", "volume_confirmation")
         ]
+    if not family_features:
+        raise ValueError(
+            f"Candidate {candidate.candidate_id} has unknown hypothesis_family "
+            f"'{candidate.hypothesis_family}' and no engineered fallback features."
+        )
     feature_col = family_features[index % len(family_features)]
     signal = features_df[feature_col].fillna(0).clip(-3, 3)
     signal = _apply_candidate_filters(signal, candidate.params, forward_regimes, funding_rate)
