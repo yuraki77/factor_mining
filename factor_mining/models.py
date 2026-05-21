@@ -33,6 +33,8 @@ class CandidateStrategySpec(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
     max_feature_lookback_bars: int = 288
     is_ml: bool = False
+    candidate_type: Literal["original", "repair", "composite", "optimizer"] = "original"
+    parent_candidate_id: str | None = None
 
 
 class MetricsBlock(BaseModel):
@@ -44,6 +46,29 @@ class MetricsBlock(BaseModel):
     calmar: float = 0.0
     trade_count: int = 0
     pnl: float = 0.0
+
+
+class OOSWindowMetrics(BaseModel):
+    """Metrics for a single chronological sub-window of the final OOS period."""
+    window_index: int
+    start_bar: int
+    end_bar: int
+    sharpe: float = 0.0
+    total_return: float = 0.0
+    max_drawdown: float = 0.0
+    trade_count: int = 0
+    ic_tstat: float | None = None
+
+
+class WindowStabilityDiagnostics(BaseModel):
+    """Aggregate stability metrics across OOS sub-windows (diagnostic-only, not a GateCheck rule)."""
+    n_windows: int = 0
+    window_sharpe_mean: float = 0.0
+    window_sharpe_std: float = 0.0
+    window_positive_rate: float = 0.0  # fraction of windows with Sharpe > 0
+    window_trade_coverage: float = 0.0  # fraction of windows with at least 1 trade
+    stability_score: float = 0.0  # composite 0-1 score; higher = more consistent
+    per_window: list[OOSWindowMetrics] = Field(default_factory=list)
 
 
 class DataQualityNote(BaseModel):
@@ -88,6 +113,8 @@ class BacktestResult(BaseModel):
     oos_trade_count: int = 0
     actual_cost_bps: float = 0.0
     prior_posterior_ic_ratio: float = 1.0
+    window_stability: WindowStabilityDiagnostics | None = None
+    trial_diagnostics: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     @computed_field
@@ -201,6 +228,7 @@ class GateCheckItem(BaseModel):
 
 class GateCheckResult(BaseModel):
     experiment_id: str
+    candidate_id: str = ""
     passed: bool
     items: list[GateCheckItem]
     raw_passed: bool | None = None

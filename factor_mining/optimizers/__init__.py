@@ -1,1 +1,1 @@
-"""Strategy optimization — MiniMax LLM-driven factor combination and hyperparameter tuning."""
+"""Strategy optimization — deterministic factor combination and bounded parameter tuning."""

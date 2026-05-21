@@ -9,6 +9,7 @@ from factor_mining.factors.engineering import generate_features, INDICATOR_META
 from factor_mining.mining import (
     build_indicator_candidates,
     default_hypotheses,
+    factor_signal,
     normalize_family,
     _direction_sign,
 )
@@ -94,8 +95,9 @@ def test_normalize_family_llm_names():
     assert normalize_family("Basis Carry") == "funding_basis"
     assert normalize_family("Volume-Price Divergence") == "volume_confirmation"
     assert normalize_family("Basis Arbitrage") == "funding_basis"
-    assert normalize_family("Funding Rate Momentum") == "funding_basis"
-    assert normalize_family("Basis Volatility") == "funding_basis"
+    assert normalize_family("Basis") is None
+    assert normalize_family("Funding Rate Momentum") is None
+    assert normalize_family("Basis Volatility") is None
 
 
 def test_normalize_family_unknown():
@@ -196,6 +198,39 @@ def test_funding_basis_hypotheses_can_use_supplemental_features():
     assert feature_candidates
     assert {c.params["indicator_name"] for c in feature_candidates} == {"premium_index_z_288"}
     assert {c.params["direction"] for c in feature_candidates} == {-1, 1}
+
+
+def test_close_position_base_candidate_is_mean_reversion_direction():
+    hypothesis = HypothesisSpec(
+        hypothesis_id="h_close_position_test",
+        hypothesis_family="mean_reversion",
+        economic_mechanism="Closes near candle extremes can exhaust short-horizon flow.",
+        testable_prediction="High close position predicts lower next-bar returns.",
+        null_hypothesis="Close position has zero predictive IC.",
+        expected_ic_range=(0.003, 0.02),
+        expected_decay_halflife_bars=8,
+    )
+    candidates = build_indicator_candidates(
+        [hypothesis],
+        symbols=["BTCUSDT"],
+        feature_meta={"close_position": INDICATOR_META["close_position"]},
+    )
+
+    by_variant = {c.params["search_variant"]: c.params["direction"] for c in candidates if c.params.get("signal_source") == "feature"}
+
+    assert by_variant["base"] == -1
+    assert by_variant["low_turnover"] == -1
+    assert by_variant["inverse"] == 1
+
+
+def test_funding_basis_factor_signal_requires_nonzero_funding_rate():
+    frame = _make_frame(120)
+
+    with pytest.raises(ValueError, match="funding_basis factor_signal requires non-zero funding_rate"):
+        factor_signal(frame, family="funding_basis", lookback=12, funding_rate=None)
+
+    with pytest.raises(ValueError, match="funding_basis factor_signal requires non-zero funding_rate"):
+        factor_signal(frame, family="funding_basis", lookback=12, funding_rate=pd.Series(0.0, index=frame.index))
 
 
 def test_default_hypotheses_are_twenty_and_mappable():

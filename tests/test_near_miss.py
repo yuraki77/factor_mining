@@ -13,7 +13,7 @@ from factor_mining.models import (
     ResearchGateResult,
 )
 from factor_mining.near_miss import analyze_near_miss, repair_adjustments_from_near_misses
-from factor_mining.optimizers.minimax_optimizer import apply_optimization_result, build_optimization_context, _fallback_optimization
+from factor_mining.optimizers.traditional_optimizer import apply_optimization_result, build_optimization_context, optimize_traditionally
 from factor_mining.pipeline import _build_signal_for
 
 
@@ -88,6 +88,76 @@ def test_near_miss_classifies_cost_and_turnover_repairs() -> None:
     assert miss.actionable is True
     assert miss.suggested_params["smooth_span"] == 48
     assert miss.suggested_params["signal_threshold"] == 0.30
+
+
+def test_near_miss_ladder_advances_instead_of_repeating_same_turnover_repair() -> None:
+    candidate = CandidateStrategySpec(
+        candidate_id="cand-near",
+        hypothesis_id="hyp-1",
+        method_id="factor_scoring",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+        params={
+            "signal_source": "factor_signal",
+            "factor_family": "momentum",
+            "factor_lookback": 12,
+            "smooth_span": 48,
+            "signal_threshold": 0.30,
+            "position_buffer": 0.25,
+        },
+    )
+    gate = GateCheckResult(
+        experiment_id="exp-near",
+        passed=False,
+        items=[GateCheckItem(rule_id="G8", status="fail", message="cost")],
+    )
+
+    miss = analyze_near_miss(
+        candidate=candidate,
+        result=_result(),
+        gatecheck=gate,
+        evidence=None,
+        research_gate=None,
+    )
+
+    assert miss.actionable is True
+    assert miss.suggested_params["smooth_span"] == 96
+    assert miss.suggested_params["signal_threshold"] == 0.40
+
+
+def test_near_miss_marks_turnover_repair_saturated_as_not_actionable() -> None:
+    candidate = CandidateStrategySpec(
+        candidate_id="cand-near",
+        hypothesis_id="hyp-1",
+        method_id="factor_scoring",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+        params={
+            "signal_source": "factor_signal",
+            "factor_family": "momentum",
+            "factor_lookback": 12,
+            "smooth_span": 96,
+            "signal_threshold": 0.40,
+            "position_buffer": 0.30,
+        },
+    )
+    gate = GateCheckResult(
+        experiment_id="exp-near",
+        passed=False,
+        items=[GateCheckItem(rule_id="G8", status="fail", message="cost")],
+    )
+
+    miss = analyze_near_miss(
+        candidate=candidate,
+        result=_result(),
+        gatecheck=gate,
+        evidence=None,
+        research_gate=None,
+    )
+
+    assert "turnover_repair_saturated" in miss.reasons
+    assert miss.actionable is False
+    assert miss.suggested_params == {}
 
 
 def test_near_miss_uses_raw_gatecheck_when_research_gate_is_missing() -> None:
@@ -188,7 +258,7 @@ def test_optimizer_turns_near_miss_into_repair_candidate() -> None:
     )
 
     ctx = build_optimization_context([candidate], [result], [gate], 0, research_gates=[research], near_misses=[miss])
-    optimization = _fallback_optimization(ctx, "full")
+    optimization = optimize_traditionally(ctx, "full")
     new_candidates, summary = apply_optimization_result(optimization, [candidate], [result])
 
     repair_candidates = [item for item in new_candidates if item.params.get("generated_by") == "near_miss_repair"]
@@ -197,6 +267,36 @@ def test_optimizer_turns_near_miss_into_repair_candidate() -> None:
     assert repair_candidates
     assert repair_candidates[0].params["near_miss_reason"] == "cost_destroyed_edge"
     assert repair_candidates[0].params["search_variant"] == "repair_cost_destroyed_edge"
+
+
+def test_optimizer_dedupes_equivalent_near_miss_repair_adjustments() -> None:
+    candidate = CandidateStrategySpec(
+        candidate_id="cand-near",
+        hypothesis_id="hyp-1",
+        method_id="factor_scoring",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+        params={"signal_source": "factor_signal", "factor_family": "momentum", "factor_lookback": 12},
+    )
+    result = _result()
+    suggested = {
+        "smooth_span": 48,
+        "signal_threshold": 0.30,
+        "position_buffer": 0.25,
+        "near_miss_reason": "cost_destroyed_edge",
+    }
+    optimization = {
+        "adjustments": [
+            {"candidate_id": "cand-near", "param": "repair_params", "suggested": suggested},
+            {"candidate_id": "cand-near", "param": "repair_params", "suggested": dict(suggested)},
+        ]
+    }
+
+    new_candidates, summary = apply_optimization_result(optimization, [candidate], [result])
+
+    repair_candidates = [item for item in new_candidates if item.params.get("generated_by") == "near_miss_repair"]
+    assert len(repair_candidates) == 1
+    assert summary["repairs_created"] == 1
 
 
 def test_side_mode_and_filters_affect_generated_signals() -> None:
@@ -255,7 +355,7 @@ def test_repair_adjustments_from_near_misses_limits_to_actionable() -> None:
         research_gate=None,
     )
 
-    adjustments = repair_adjustments_from_near_misses([actionable, passed])
+    adjustments = repair_adjustments_from_near_misses([actionable, actionable, passed])
 
     assert len(adjustments) == 1
     assert adjustments[0]["param"] == "repair_params"

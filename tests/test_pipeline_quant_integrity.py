@@ -3,7 +3,7 @@ import pandas as pd
 
 from factor_mining.config import BootstrapConfig, CPCVConfig, DataConfig, PermutationTestConfig, Settings
 from factor_mining.models import BacktestResult, CandidateStrategySpec, FactorEvidenceReport, GateCheckItem, GateCheckResult, MetricsBlock
-from factor_mining.optimizers.minimax_optimizer import apply_exit_adjustments, apply_optimization_result, build_optimization_context, _fallback_optimization
+from factor_mining.optimizers.traditional_optimizer import apply_exit_adjustments, apply_optimization_result, build_optimization_context, optimize_traditionally
 from factor_mining.pipeline import (
     _apply_batch_pbo,
     _apply_merge_pool_trial_penalty,
@@ -12,13 +12,19 @@ from factor_mining.pipeline import (
     _build_signal_for,
     _build_tasks,
     _check_mining_boundaries,
+    _filter_unfunded_factor_signal_candidates,
     _cscv_splits,
     _filter_candidates_by_mining_boundaries,
     _gatecheck_diagnostics,
     _run_backtests_parallel,
+    _sample_frame_blocks,
     _select_repair_merge_pool,
+    _checkpoint_fingerprint,
+    _save_stage_checkpoint,
+    _load_stage_checkpoint,
 )
 from factor_mining.registry import get_method
+from factor_mining.storage import MetadataStore
 
 
 def _frame(n: int = 160) -> pd.DataFrame:
@@ -51,6 +57,71 @@ def _result(experiment_id: str, candidate_id: str, *, pbo: float, sharpe: float)
         metrics_gross=MetricsBlock(sharpe=sharpe),
         pbo=pbo,
     )
+
+
+def test_block_sampling_is_deterministic_chronological_and_sized() -> None:
+    frame = _frame(500)
+
+    first = _sample_frame_blocks(frame, sample_bars=120, interval_ms=300_000, seed=7)
+    second = _sample_frame_blocks(frame, sample_bars=120, interval_ms=300_000, seed=7)
+
+    assert len(first) == 120
+    assert first["open_time"].is_monotonic_increasing
+    assert first["open_time"].is_unique
+    assert first["open_time"].tolist() == second["open_time"].tolist()
+
+
+def test_stage_checkpoint_round_trips_and_rejects_mismatch(tmp_path) -> None:
+    settings = Settings(data=DataConfig(sqlite_path=tmp_path / "meta.sqlite3"))
+    store = MetadataStore(settings.data.sqlite_path)
+    frame = _frame(40)
+    run_args = {"tail": None, "sample_bars": 40, "sample_mode": "block", "seed": 42}
+    fingerprint = _checkpoint_fingerprint(
+        settings,
+        run_args=run_args,
+        symbol="BTCUSDT",
+        market="um_futures",
+        frame=frame,
+    )
+
+    _save_stage_checkpoint(
+        store,
+        "run-a",
+        round_num=1,
+        symbol="BTCUSDT",
+        market="um_futures",
+        stage="discovery_backtests",
+        fingerprint=fingerprint,
+        payload={"items": [{"candidate_id": "c1"}]},
+    )
+
+    loaded = _load_stage_checkpoint(
+        store,
+        "run-a",
+        round_num=1,
+        symbol="BTCUSDT",
+        market="um_futures",
+        stage="discovery_backtests",
+        fingerprint=fingerprint,
+    )
+    assert loaded == {"items": [{"candidate_id": "c1"}]}
+
+    mismatched = dict(fingerprint)
+    mismatched["row_count"] = 999
+    try:
+        _load_stage_checkpoint(
+            store,
+            "run-a",
+            round_num=1,
+            symbol="BTCUSDT",
+            market="um_futures",
+            stage="discovery_backtests",
+            fingerprint=mismatched,
+        )
+    except ValueError as exc:
+        assert "fingerprint mismatch" in str(exc)
+    else:
+        raise AssertionError("checkpoint mismatch should fail loud")
 
 
 def test_composite_signal_is_weighted_component_signal() -> None:
@@ -125,15 +196,17 @@ def test_optimization_result_creates_schedulable_next_candidates() -> None:
     assert summary["hypotheses_suggested"] == 1
     assert any(c.hypothesis_family == "composite" for c in new_candidates)
     assert all(get_method(c.method_id).v1_schedulable for c in new_candidates)
+    assert next(c for c in new_candidates if c.hypothesis_family == "composite").candidate_type == "composite"
     next_hypothesis_candidates = [
         c for c in new_candidates
-        if c.params.get("generated_by") == "minimax_next_hypothesis"
+        if c.params.get("generated_by") == "traditional_next_hypothesis"
     ]
     assert next_hypothesis_candidates
+    assert {c.candidate_type for c in next_hypothesis_candidates} == {"optimizer"}
     assert {c.params["factor_family"] for c in next_hypothesis_candidates} == {"funding_basis"}
 
 
-def test_optimization_result_accepts_minimax_schema_variants() -> None:
+def test_optimization_result_accepts_compact_schema_variants() -> None:
     base_a = CandidateStrategySpec(
         candidate_id="c_a",
         hypothesis_id="h1",
@@ -157,8 +230,8 @@ def test_optimization_result_accepts_minimax_schema_variants() -> None:
             "turnover_control": {"smooth_span": 48, "signal_threshold": 0.12, "position_buffer": 0.08},
         }],
         "adjustments": [
-            {"candidate_id": "c_a", "suggested_param": "smooth_span: 48", "rationale": "LLM shorthand"},
-            {"candidate_id": "c_b", "suggested": {"regime_filter": ["sideways", "unknown"]}, "rationale": "LLM bulk repair"},
+            {"candidate_id": "c_a", "suggested_param": "smooth_span: 48", "rationale": "compact shorthand"},
+            {"candidate_id": "c_b", "suggested": {"regime_filter": ["sideways", "unknown"]}, "rationale": "bulk repair"},
         ],
     }
 
@@ -174,6 +247,10 @@ def test_optimization_result_accepts_minimax_schema_variants() -> None:
     assert combo.params["signal_threshold"] == 0.12
     assert combo.params["position_buffer"] == 0.08
     assert adjusted.params["smooth_span"] == 48
+    assert adjusted.candidate_type == "optimizer"
+    assert adjusted.parent_candidate_id == "c_a"
+    assert repaired.candidate_type == "repair"
+    assert repaired.parent_candidate_id == "c_b"
     assert repaired.params["search_variant"] == "repair_optimizer_repair"
     assert repaired.params["regime_filter"] == ["sideways", "unknown"]
 
@@ -310,7 +387,7 @@ def test_exit_adjustments_dedupe_within_parent_not_across_candidates() -> None:
         Settings(),
     )
 
-    generated = [c for c in candidates if c.params.get("generated_by") == "minimax_exit_adjustment"]
+    generated = [c for c in candidates if c.params.get("generated_by") == "traditional_exit_adjustment"]
     assert len(generated) == 2
     assert {c.params["parent_id"] for c in generated} == {"c_first", "c_second"}
 
@@ -379,7 +456,7 @@ def test_optimizer_uses_research_survivors_when_gatecheck_has_no_passes() -> Non
     ]
 
     ctx = build_optimization_context([base_a, base_b], results, gates, iteration=0)
-    optimization = _fallback_optimization(ctx, "full")
+    optimization = optimize_traditionally(ctx, "full")
     new_candidates, summary = apply_optimization_result(optimization, [base_a, base_b], results)
 
     assert ctx["num_gatecheck_passed"] == 0
@@ -421,7 +498,7 @@ def test_single_research_survivor_generates_low_turnover_variant() -> None:
     )
 
     ctx = build_optimization_context([candidate], [result], [gate], iteration=0)
-    optimization = _fallback_optimization(ctx, "full")
+    optimization = optimize_traditionally(ctx, "full")
     new_candidates, summary = apply_optimization_result(optimization, [candidate], [result])
 
     assert ctx["num_research_survivors"] == 1
@@ -460,7 +537,7 @@ def test_mining_boundaries_prune_exhausted_new_hypotheses_but_keep_survivor_repa
         method_id="factor_scoring",
         hypothesis_family="funding_basis",
         symbol="BTCUSDT",
-        params={"generated_by": "minimax_next_hypothesis"},
+        params={"generated_by": "traditional_next_hypothesis"},
     )
     repair = CandidateStrategySpec(
         candidate_id="c_rep",
@@ -682,6 +759,51 @@ def test_merge_pool_trial_penalty_counts_original_and_repair_trials() -> None:
     assert result.effective_trials_at_eval == 50
     assert result.global_trials_at_eval == 50
     assert result.deflated_sharpe < result.metrics_primary.sharpe
+
+
+def test_unfunded_filter_skips_only_funding_factor_signal_candidates() -> None:
+    candidates = [
+        CandidateStrategySpec(
+            candidate_id="c_feature",
+            hypothesis_id="h1",
+            method_id="factor_scoring",
+            hypothesis_family="funding_basis",
+            symbol="BTCUSDT",
+            params={"signal_source": "feature", "indicator_name": "premium_index_z_288"},
+        ),
+        CandidateStrategySpec(
+            candidate_id="c_factor",
+            hypothesis_id="h1",
+            method_id="factor_scoring",
+            hypothesis_family="funding_basis",
+            symbol="BTCUSDT",
+            params={"signal_source": "factor_signal", "factor_family": "funding_basis"},
+        ),
+        CandidateStrategySpec(
+            candidate_id="c_legacy",
+            hypothesis_id="h1",
+            method_id="factor_scoring",
+            hypothesis_family="funding_basis",
+            symbol="BTCUSDT",
+        ),
+        CandidateStrategySpec(
+            candidate_id="c_momentum",
+            hypothesis_id="h2",
+            method_id="factor_scoring",
+            hypothesis_family="momentum",
+            symbol="BTCUSDT",
+            params={"signal_source": "factor_signal", "factor_family": "momentum"},
+        ),
+    ]
+
+    filtered, skipped = _filter_unfunded_factor_signal_candidates(candidates, pd.Series([0.0, 0.0]))
+
+    assert skipped == 2
+    assert {candidate.candidate_id for candidate in filtered} == {"c_feature", "c_momentum"}
+
+    funded, funded_skipped = _filter_unfunded_factor_signal_candidates(candidates, pd.Series([0.0, 1.0]))
+    assert funded_skipped == 0
+    assert funded == candidates
 
 
 def test_batch_pbo_is_computed_from_candidate_returns(tmp_path) -> None:

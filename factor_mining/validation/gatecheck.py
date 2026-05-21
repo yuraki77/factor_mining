@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from factor_mining.config import Settings
 from factor_mining.models import BacktestResult, FactorEvidenceReport, GateCheckItem, GateCheckResult
 from factor_mining.registry import MethodSpec
+from factor_mining.stats.cross_sectional import romano_wolf_step_down
 from factor_mining.stats.metrics import benjamini_hochberg, combined_ic_tstat_pvalue
+
+if TYPE_CHECKING:
+    from factor_mining.backtest.cross_sectional import CrossSectionalBacktestResult
 
 
 _FULL_ALLOCATION = 1.0
@@ -90,6 +96,7 @@ def run_gatecheck(
     raw_passed = _raw_gate_passed(items)
     return GateCheckResult(
         experiment_id=result.experiment_id,
+        candidate_id=result.candidate_id,
         passed=raw_passed,
         raw_passed=raw_passed,
         risk_tier="full_pass" if raw_passed else "fail",
@@ -304,6 +311,66 @@ def _data_quality_item(items: list[GateCheckItem], result: BacktestResult, setti
             threshold=f"warn>{warn_threshold:.2f};block>{block_threshold:.2f}",
         )
     )
+
+
+def apply_fdr_cross_sectional(
+    results: list["CrossSectionalBacktestResult"],
+    settings: Settings,
+    *,
+    n_resamples: int | None = None,
+    block_length: int | None = None,
+) -> dict[str, float]:
+    """FWE-controlled adjusted p-values for a panel of cross-sectional factors.
+
+    Note: intentionally not wired into the main pipeline yet. For the current
+    BTC/ETH-only scope, cross-sectional + Romano-Wolf has limited practical
+    value; revisit when the universe expands.
+
+    Unlike ``apply_fdr`` (which runs BH on combined-IC p-values of
+    asset×factor pairs), this groups factors by ``hypothesis_family`` and
+    applies Romano–Wolf step-down on the joint matrix of factor PnL series.
+    Romano–Wolf controls family-wise error rate under arbitrary dependence,
+    which BH does not — and cross-sectional factor PnLs are typically very
+    correlated within a family (e.g. multiple momentum specs).
+
+    Returns:
+        ``factor_id → adjusted_p``.  Reject H_0 (zero mean return) iff
+        ``adjusted_p[factor_id] <= settings.gatecheck.fdr_q``.
+    """
+    from factor_mining.backtest.cross_sectional import returns_matrix
+
+    adjusted: dict[str, float] = {}
+    by_family: dict[str, list] = {}
+    for result in results:
+        by_family.setdefault(result.hypothesis_family, []).append(result)
+    n_boot = settings.bootstrap.n_resamples if n_resamples is None else int(n_resamples)
+    for family_results in by_family.values():
+        if not family_results:
+            continue
+        matrix, factor_ids = returns_matrix(family_results)
+        if matrix.empty:
+            adjusted.update({fid: 1.0 for fid in (r.factor_id for r in family_results)})
+            continue
+        # Block length: use 2x the longest rebalance interval in the family,
+        # capped at the bootstrap config floor. This matches the engine's CI
+        # bootstrap and preserves serial correlation in slow-rebalance factors.
+        if block_length is None:
+            longest_rebalance = max(r.rebalance_bars for r in family_results)
+            block_len = max(
+                settings.bootstrap.min_block_length_bars, 2 * longest_rebalance
+            )
+        else:
+            block_len = int(block_length)
+        adj_p = romano_wolf_step_down(
+            matrix.to_numpy(dtype=float),
+            n_resamples=n_boot,
+            block_length=block_len,
+            seed=42,
+            alternative="greater",
+        )
+        for factor_id, p in zip(factor_ids, adj_p, strict=True):
+            adjusted[factor_id] = float(p)
+    return adjusted
 
 
 def _raw_gate_passed(items: list[GateCheckItem]) -> bool:

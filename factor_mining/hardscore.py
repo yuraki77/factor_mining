@@ -27,7 +27,6 @@ def hardscore(
     score = _score(
         result,
         gatecheck_passed=gatecheck.passed,
-        haircut_sharpe_value=haircut,
         fdr_adjusted_pvalue=fdr_adjusted_pvalue,
         settings=settings,
     ) * allocation
@@ -49,7 +48,6 @@ def _score(
     result: BacktestResult,
     *,
     gatecheck_passed: bool,
-    haircut_sharpe_value: float,
     fdr_adjusted_pvalue: float,
     settings: Settings,
 ) -> float:
@@ -58,17 +56,16 @@ def _score(
     pbo = 1.0 if result.pbo is None else float(result.pbo)
     ratio = float(result.prior_posterior_ic_ratio)
     autocorr_scale = max(settings.gatecheck.return_autocorr_warn_abs * 2.0, 1e-12)
+    ic_strength = max(float(result.ic_tstat_nw), float(result.rankic_tstat_nw))
     raw = (
-        20.0 * _clip(result.deflated_sharpe)
-        + 15.0 * _clip(haircut_sharpe_value / 3.0)
-        + 15.0 * _clip(1.0 - pbo)
-        + 15.0 * _clip(result.probabilistic_sharpe)
-        + 10.0 * math.tanh(max(0.0, result.ic_tstat_nw, result.rankic_tstat_nw) / 4.0)
-        + 7.0 * _clip(1.0 - float(fdr_adjusted_pvalue) / max(settings.gatecheck.fdr_q, 1e-12))
-        + 6.0 * math.sqrt(_clip(result.oos_trade_count / max(settings.gatecheck.min_oos_trades, 1)))
-        + 5.0 * _regime_diversity_bonus(result)
-        + 4.0 * _calibration_score(ratio)
-        + 3.0 * _clip(1.0 - abs(result.return_autocorr_lag1) / autocorr_scale)
+        25.0 * _smooth_positive(result.deflated_sharpe, scale=2.0)
+        + 20.0 * _clip(1.0 - pbo)
+        + 15.0 * _smooth_positive(ic_strength, scale=4.0)
+        + 10.0 * _clip(1.0 - float(fdr_adjusted_pvalue) / max(settings.gatecheck.fdr_q, 1e-12))
+        + 10.0 * math.sqrt(_clip(result.oos_trade_count / max(settings.gatecheck.min_oos_trades, 1)))
+        + 8.0 * _regime_diversity_bonus(result)
+        + 7.0 * _calibration_score(ratio)
+        + 5.0 * _clip(1.0 - abs(result.return_autocorr_lag1) / autocorr_scale)
     )
     return float(round(raw, 4))
 
@@ -78,6 +75,13 @@ def _clip(value: float) -> float:
     if not math.isfinite(value):
         return 0.0
     return float(max(0.0, min(1.0, value)))
+
+
+def _smooth_positive(value: float, *, scale: float) -> float:
+    value = float(value)
+    if not math.isfinite(value):
+        return 0.0
+    return float(math.tanh(max(0.0, value) / max(scale, 1e-12)))
 
 
 def _calibration_score(ratio: float) -> float:

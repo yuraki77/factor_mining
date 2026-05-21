@@ -1,12 +1,14 @@
-"""Full pipeline orchestrator: DeepSeek → backtest → gatecheck → hardscore → optimize → archive.
+"""Full pipeline orchestrator: DeepSeek/default hypotheses → backtest → gatecheck → hardscore → optimize → archive.
 
-Supports iterative optimization: MiniMax suggestions are backtested in subsequent rounds
-until convergence or max_iterations.
+Supports iterative optimization: deterministic optimizer suggestions are backtested
+in subsequent rounds until convergence or max_iterations.
 """
 
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 import threading
 import time
 from collections import Counter
@@ -129,7 +131,9 @@ _worker_frame: pd.DataFrame | None = None
 _worker_settings: Settings | None = None
 _worker_funding: pd.DataFrame | None = None
 _EVENT_SINK: Callable[[str, str, str, dict[str, Any] | None], None] | None = None
+_RUN_ID: str | None = None
 
+_CHECKPOINT_SCHEMA_VERSION = 1
 _PRE_GATE_REPAIR_LIMIT = 96
 _PRE_GATE_REPAIR_MAX_PER_PARENT = 4
 _PRE_GATE_MIN_ABS_IC = 0.01
@@ -254,18 +258,161 @@ def _annotate_candidates_for_direction_scope(
     ]
 
 
+def _run_checkpoint_args(**kwargs: Any) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in kwargs.items()
+        if value is not None
+    }
+
+
+def _settings_hash(settings: Settings) -> str:
+    payload = json.dumps(settings.model_dump(mode="json"), sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _args_hash(run_args: dict[str, Any]) -> str:
+    payload = json.dumps(run_args, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _run_checkpoint_id(run_id: str, name: str) -> str:
+    return f"checkpoint:{run_id}:{name}"
+
+
+def _stage_checkpoint_id(run_id: str, *, round_num: int, symbol: str, market: str, stage: str) -> str:
+    return f"checkpoint:{run_id}:round{round_num}:{symbol}:{market}:{stage}"
+
+
+def _base_checkpoint_meta(settings: Settings, run_args: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": _CHECKPOINT_SCHEMA_VERSION,
+        "settings_hash": _settings_hash(settings),
+        "args_hash": _args_hash(run_args),
+    }
+
+
+def _checkpoint_fingerprint(
+    settings: Settings,
+    *,
+    run_args: dict[str, Any],
+    symbol: str,
+    market: str,
+    frame: pd.DataFrame,
+) -> dict[str, Any]:
+    return {
+        **_base_checkpoint_meta(settings, run_args),
+        "symbol": symbol,
+        "market": market,
+        "row_count": int(len(frame)),
+        "open_time_min": None if frame.empty else int(frame["open_time"].min()),
+        "open_time_max": None if frame.empty else int(frame["open_time"].max()),
+    }
+
+
+def _save_run_checkpoint_payload(
+    store: MetadataStore | None,
+    run_id: str | None,
+    name: str,
+    *,
+    settings: Settings,
+    run_args: dict[str, Any],
+    payload: dict[str, Any],
+) -> None:
+    if store is None or not run_id:
+        return
+    store.save_artifact(
+        _run_checkpoint_id(run_id, name),
+        "pipeline_checkpoint",
+        {
+            "fingerprint": _base_checkpoint_meta(settings, run_args),
+            "payload": payload,
+        },
+    )
+
+
+def _load_run_checkpoint_payload(
+    store: MetadataStore | None,
+    run_id: str | None,
+    name: str,
+    *,
+    settings: Settings,
+    run_args: dict[str, Any],
+) -> dict[str, Any] | None:
+    if store is None or not run_id:
+        return None
+    artifact = store.load_artifact(_run_checkpoint_id(run_id, name))
+    if artifact is None:
+        return None
+    expected = _base_checkpoint_meta(settings, run_args)
+    if artifact.get("fingerprint") != expected:
+        raise ValueError(f"Checkpoint {name} fingerprint mismatch for run {run_id}")
+    payload = artifact.get("payload")
+    return payload if isinstance(payload, dict) else None
+
+
+def _save_stage_checkpoint(
+    store: MetadataStore | None,
+    run_id: str | None,
+    *,
+    round_num: int,
+    symbol: str,
+    market: str,
+    stage: str,
+    fingerprint: dict[str, Any],
+    payload: dict[str, Any],
+) -> None:
+    if store is None or not run_id:
+        return
+    store.save_artifact(
+        _stage_checkpoint_id(run_id, round_num=round_num, symbol=symbol, market=market, stage=stage),
+        "pipeline_checkpoint",
+        {
+            "fingerprint": fingerprint,
+            "payload": payload,
+        },
+    )
+
+
+def _load_stage_checkpoint(
+    store: MetadataStore | None,
+    run_id: str | None,
+    *,
+    round_num: int,
+    symbol: str,
+    market: str,
+    stage: str,
+    fingerprint: dict[str, Any],
+) -> dict[str, Any] | None:
+    if store is None or not run_id:
+        return None
+    artifact_id = _stage_checkpoint_id(run_id, round_num=round_num, symbol=symbol, market=market, stage=stage)
+    artifact = store.load_artifact(artifact_id)
+    if artifact is None:
+        return None
+    if artifact.get("fingerprint") != fingerprint:
+        raise ValueError(f"Checkpoint {artifact_id} fingerprint mismatch")
+    payload = artifact.get("payload")
+    return payload if isinstance(payload, dict) else None
+
+
 def run_pipeline(
     settings: Settings,
     *,
     use_llm: bool = True,
     max_workers: int | None = None,
     tail: int | None = None,
+    sample_bars: int | None = None,
+    sample_mode: str = "block",
+    seed: int = 42,
     archive_top: int = 3,
     research_brief: str | None = None,
     hypothesis_count: int = 5,
     iterations: int = 1,
     store: MetadataStore | None = None,
     event_sink: Callable[[str, str, str, dict[str, Any] | None], None] | None = None,
+    run_id: str | None = None,
+    resume_run_id: str | None = None,
     seed_hypotheses: list[HypothesisSpec] | None = None,
     direction_scope: dict[str, Any] | None = None,
     stop_event: threading.Event | None = None,
@@ -276,14 +423,21 @@ def run_pipeline(
       1. Hypothesis generation (DeepSeek or defaults)
       2. Build initial candidates + load data + generate features
       3-6. Mining round(s): backtest → gatecheck → hardscore → optimize
-         Each round backtests new candidates from the previous round's MiniMax output.
+         Each round backtests new candidates from the previous round's optimizer output.
 
     Args:
         iterations: Maximum number of mining rounds (1 = single pass, >1 = iterative).
     """
-    global _EVENT_SINK
+    if tail is not None and sample_bars is not None:
+        raise ValueError("--tail and --sample-bars are mutually exclusive")
+    if sample_bars is not None and sample_mode != "block":
+        raise ValueError("sample_mode must be 'block'")
+
+    global _EVENT_SINK, _RUN_ID
     previous_sink = _EVENT_SINK
+    previous_run_id = _RUN_ID
     _EVENT_SINK = event_sink
+    _RUN_ID = run_id
     t_start = time.perf_counter()
     result = PipelineResult()
     normalized_scope = _normalize_direction_scope(direction_scope)
@@ -295,6 +449,9 @@ def run_pipeline(
             use_llm=use_llm,
             max_workers=max_workers,
             tail=tail,
+            sample_bars=sample_bars,
+            sample_mode=sample_mode,
+            seed=seed,
             archive_top=archive_top,
             research_brief=effective_research_brief,
             hypothesis_count=hypothesis_count,
@@ -302,12 +459,15 @@ def run_pipeline(
             store=store,
             result=result,
             t_start=t_start,
+            run_id=run_id,
+            resume_run_id=resume_run_id,
             seed_hypotheses=seed_hypotheses,
             direction_scope=normalized_scope,
             stop_event=stop_event,
         )
     finally:
         _EVENT_SINK = previous_sink
+        _RUN_ID = previous_run_id
 
 
 def _run_pipeline_impl(
@@ -316,6 +476,9 @@ def _run_pipeline_impl(
     use_llm: bool,
     max_workers: int | None,
     tail: int | None,
+    sample_bars: int | None,
+    sample_mode: str,
+    seed: int,
     archive_top: int,
     research_brief: str | None,
     hypothesis_count: int,
@@ -323,10 +486,26 @@ def _run_pipeline_impl(
     store: MetadataStore | None,
     result: PipelineResult,
     t_start: float,
+    run_id: str | None,
+    resume_run_id: str | None,
     seed_hypotheses: list[HypothesisSpec] | None,
     direction_scope: dict[str, Any] | None,
     stop_event: threading.Event | None = None,
 ) -> PipelineResult:
+    run_args = _run_checkpoint_args(
+        use_llm=use_llm,
+        max_workers=max_workers,
+        tail=tail,
+        sample_bars=sample_bars,
+        sample_mode=sample_mode,
+        seed=seed,
+        archive_top=archive_top,
+        research_brief=research_brief,
+        hypothesis_count=hypothesis_count,
+        iterations=iterations,
+        direction_scope=direction_scope,
+    )
+    checkpoint_source_run_id = resume_run_id or run_id
     active_survivor_records = store.list_research_survivors(status="active") if store else []
     survivor_seed_candidates = _survivor_seed_candidates(active_survivor_records, result.errors)
     survivor_candidate_ids = {candidate.candidate_id for candidate in survivor_seed_candidates}
@@ -352,7 +531,20 @@ def _run_pipeline_impl(
     _step_header(1, header)
     t0 = time.perf_counter()
 
-    if seed_hypotheses is not None:
+    hypotheses_checkpoint = _load_run_checkpoint_payload(
+        store,
+        checkpoint_source_run_id if resume_run_id else None,
+        "hypotheses",
+        settings=settings,
+        run_args=run_args,
+    )
+    if hypotheses_checkpoint is not None:
+        result.hypotheses = [
+            HypothesisSpec.model_validate(item)
+            for item in hypotheses_checkpoint.get("items", [])
+        ]
+        _log(f"Resumed {len(result.hypotheses)} hypotheses from {resume_run_id}")
+    elif seed_hypotheses is not None:
         result.hypotheses = list(seed_hypotheses)
         _log(f"Using {len(result.hypotheses)} seeded hypotheses")
     elif use_llm:
@@ -378,50 +570,92 @@ def _run_pipeline_impl(
         store.save_artifact("latest_hypotheses", "hypotheses", {
             "items": [h.model_dump(mode="json") for h in result.hypotheses],
         })
+        if run_id:
+            _save_run_checkpoint_payload(
+                store,
+                run_id,
+                "hypotheses",
+                settings=settings,
+                run_args=run_args,
+                payload={"items": [h.model_dump(mode="json") for h in result.hypotheses]},
+            )
 
     # ── Step 2: Candidates + Data (once) ────────────────────────────
     _step_header(2, "Building candidates and loading data")
     t0 = time.perf_counter()
 
-    initial_candidates = build_v1_candidates(
-        result.hypotheses, symbols=settings.data.symbols, interval=settings.data.default_interval,
+    initial_checkpoint = _load_run_checkpoint_payload(
+        store,
+        checkpoint_source_run_id if resume_run_id else None,
+        "initial_candidates",
+        settings=settings,
+        run_args=run_args,
     )
-    initial_candidates = _annotate_candidates_for_direction_scope(initial_candidates, direction_scope)
-    if survivor_seed_candidates:
-        initial_candidates = _dedupe_candidates(survivor_seed_candidates + initial_candidates)
-    _log(f"{len(initial_candidates)} initial candidates ({len(result.hypotheses)} hypotheses × {len(settings.data.symbols)} symbols × methods)")
+    if initial_checkpoint is not None:
+        initial_candidates = [
+            CandidateStrategySpec.model_validate(item)
+            for item in initial_checkpoint.get("items", [])
+        ]
+        _log(f"Resumed {len(initial_candidates)} initial candidates from {resume_run_id}")
+        data_contexts = _load_data_contexts(
+            initial_candidates,
+            settings,
+            tail=tail,
+            sample_bars=sample_bars,
+            sample_mode=sample_mode,
+            seed=seed,
+        )
+        survivor_seed_candidates = [
+            c for c in survivor_seed_candidates
+            if _data_key(c) in data_contexts
+        ]
+    else:
+        initial_candidates = build_v1_candidates(
+            result.hypotheses, symbols=settings.data.symbols, interval=settings.data.default_interval,
+        )
+        initial_candidates = _annotate_candidates_for_direction_scope(initial_candidates, direction_scope)
+        if survivor_seed_candidates:
+            initial_candidates = _dedupe_candidates(survivor_seed_candidates + initial_candidates)
+        _log(f"{len(initial_candidates)} initial candidates ({len(result.hypotheses)} hypotheses × {len(settings.data.symbols)} symbols × methods)")
 
-    data_contexts = _load_data_contexts(initial_candidates, settings, tail=tail)
-    survivor_seed_candidates = [
-        c for c in survivor_seed_candidates
-        if _data_key(c) in data_contexts
-    ]
-    initial_candidates = [
-        c for c in initial_candidates
-        if _data_key(c) in data_contexts
-    ]
-    survivor_candidate_ids = {
-        candidate.candidate_id
-        for candidate in initial_candidates
-        if candidate.candidate_id in survivor_candidate_ids
-    }
-    _log(f"Runnable legacy candidates: {len(initial_candidates)}")
+        data_contexts = _load_data_contexts(
+            initial_candidates,
+            settings,
+            tail=tail,
+            sample_bars=sample_bars,
+            sample_mode=sample_mode,
+            seed=seed,
+        )
+        survivor_seed_candidates = [
+            c for c in survivor_seed_candidates
+            if _data_key(c) in data_contexts
+        ]
+        initial_candidates = [
+            c for c in initial_candidates
+            if _data_key(c) in data_contexts
+        ]
+        survivor_candidate_ids = {
+            candidate.candidate_id
+            for candidate in initial_candidates
+            if candidate.candidate_id in survivor_candidate_ids
+        }
+        _log(f"Runnable legacy candidates: {len(initial_candidates)}")
 
-    # Expand using explicit indicator parameterization (primary path)
-    any_context = next(iter(data_contexts.values()))
-    indicator_candidates = build_indicator_candidates(
-        result.hypotheses,
-        symbols=settings.data.symbols,
-        feature_meta=any_context.feature_meta,
-        interval=settings.data.default_interval,
-    )
-    indicator_candidates = _annotate_candidates_for_direction_scope(indicator_candidates, direction_scope)
-    indicator_candidates = [
-        c for c in indicator_candidates
-        if _data_key(c) in data_contexts
-    ]
-    _log(f"Indicator candidates: {len(indicator_candidates)} (replaces {len(initial_candidates)} legacy)")
-    initial_candidates = _dedupe_candidates(survivor_seed_candidates + indicator_candidates) if survivor_seed_candidates else indicator_candidates
+        # Expand using explicit indicator parameterization (primary path)
+        any_context = next(iter(data_contexts.values()))
+        indicator_candidates = build_indicator_candidates(
+            result.hypotheses,
+            symbols=settings.data.symbols,
+            feature_meta=any_context.feature_meta,
+            interval=settings.data.default_interval,
+        )
+        indicator_candidates = _annotate_candidates_for_direction_scope(indicator_candidates, direction_scope)
+        indicator_candidates = [
+            c for c in indicator_candidates
+            if _data_key(c) in data_contexts
+        ]
+        _log(f"Indicator candidates: {len(indicator_candidates)} (replaces {len(initial_candidates)} legacy)")
+        initial_candidates = _dedupe_candidates(survivor_seed_candidates + indicator_candidates) if survivor_seed_candidates else indicator_candidates
     survivor_candidate_ids = {
         candidate.candidate_id
         for candidate in initial_candidates
@@ -434,6 +668,15 @@ def _run_pipeline_impl(
         store.save_artifact("initial_candidates", "candidates", {
             "items": [c.model_dump(mode="json") for c in initial_candidates],
         })
+        if run_id:
+            _save_run_checkpoint_payload(
+                store,
+                run_id,
+                "initial_candidates",
+                settings=settings,
+                run_args=run_args,
+                payload={"items": [c.model_dump(mode="json") for c in initial_candidates]},
+            )
 
     _log(f"Step 2 done in {time.perf_counter() - t0:.0f}s")
 
@@ -487,6 +730,9 @@ def _run_pipeline_impl(
                 cumulative_trial_counts=cumulative_trial_counts,
                 survivor_candidate_ids=survivor_candidate_ids,
                 previous_actions=list(result.optimization_history),
+                run_id=run_id,
+                resume_run_id=resume_run_id,
+                run_args=run_args,
                 stop_event=stop_event,
             )
 
@@ -600,7 +846,7 @@ def _run_pipeline_impl(
     _log(f"  Archived:     {archived}")
     if result.optimization_history:
         combos = result.last_optimization.get("combinations", [])
-        _log(f"  MiniMax combos: {len(combos)}")
+        _log(f"  Optimizer combos: {len(combos)}")
         for combo in combos[:3]:
             _log(f"    {combo.get('factor_ids', [])} weights={combo.get('weights', [])}")
     if result.errors:
@@ -618,6 +864,180 @@ def _check_stop(stop_event: threading.Event | None) -> None:
 
 class _PipelineCancelled(BaseException):
     pass
+
+
+def verify_research_survivors(
+    settings: Settings,
+    *,
+    store: MetadataStore,
+    max_workers: int | None = None,
+    tail: int | None = None,
+    sample_bars: int | None = None,
+    sample_mode: str = "block",
+    seed: int = 42,
+    event_sink: Callable[[str, str, str, dict[str, Any] | None], None] | None = None,
+    run_id: str | None = None,
+) -> PipelineResult:
+    """Re-evaluate active research survivors without running discovery or optimization."""
+    if tail is not None and sample_bars is not None:
+        raise ValueError("--tail and --sample-bars are mutually exclusive")
+    if sample_bars is not None and sample_mode != "block":
+        raise ValueError("sample_mode must be 'block'")
+
+    global _EVENT_SINK, _RUN_ID
+    previous_sink = _EVENT_SINK
+    previous_run_id = _RUN_ID
+    _EVENT_SINK = event_sink
+    _RUN_ID = run_id
+    t_start = time.perf_counter()
+    result = PipelineResult()
+    try:
+        _step_header(1, "Verifying active Research Survivors")
+        records = store.list_research_survivors(status="active")
+        candidates = _survivor_seed_candidates(records, result.errors)
+        if not candidates:
+            _log("No active research survivors with valid candidate payloads.")
+            result.elapsed_s = time.perf_counter() - t_start
+            return result
+
+        _log(f"Loaded {len(candidates)} survivor candidates")
+        data_contexts = _load_data_contexts(
+            candidates,
+            settings,
+            tail=tail,
+            sample_bars=sample_bars,
+            sample_mode=sample_mode,
+            seed=seed,
+        )
+
+        all_candidates: list[CandidateStrategySpec] = []
+        all_backtests: list[BacktestResult] = []
+        all_gatechecks: list[GateCheckResult] = []
+        all_factor_evidence: list[FactorEvidenceReport] = []
+        all_research_gates: list[ResearchGateResult] = []
+        all_research_survivors: list[dict[str, Any]] = []
+
+        for key, symbol_candidates in _group_candidates_by_data(candidates).items():
+            context = data_contexts.get(key)
+            if context is None:
+                _log(f"  Skip {key[0]}/{key[1]}: no local parquet data")
+                continue
+            _log(f"  {context.symbol}/{context.market}: verifying {len(symbol_candidates)} survivors")
+            split_plan = _build_data_split_plan(context.frame, regimes=context.forward_regimes)
+            final_frame = _masked_frame(context.frame, split_plan.final_oos_mask)
+            final_regimes = _masked_series(context.forward_regimes, split_plan.final_oos_mask)
+            final_funding_rate = _masked_series(context.funding_rate, split_plan.final_oos_mask)
+            symbol_candidates, skipped_funding = _filter_unfunded_factor_signal_candidates(
+                symbol_candidates,
+                context.funding_rate,
+            )
+            if skipped_funding:
+                _log(f"  Funding survivor candidates skipped: {skipped_funding}")
+            trial_counts = _candidate_trial_count_snapshots(symbol_candidates, store, settings)
+            full_tasks = _build_tasks(
+                symbol_candidates,
+                context.frame,
+                context.features_df,
+                context.feature_meta,
+                context.forward_regimes,
+                context.funding_rate,
+                trial_counts_by_candidate=trial_counts,
+                data_quality_notes=context.data_quality_notes,
+            )
+            final_tasks = _slice_tasks(full_tasks, split_plan.final_oos_mask)
+            round_backtests = _run_backtests_parallel(
+                final_tasks,
+                final_frame,
+                settings,
+                max_workers,
+                context.funding_df,
+            )
+            if round_backtests:
+                _apply_batch_pbo(final_frame, final_tasks, round_backtests, settings, context.funding_df)
+
+            result_ids = {item.candidate_id for item in round_backtests}
+            round_candidates = [
+                candidate for candidate in symbol_candidates
+                if candidate.candidate_id in result_ids
+            ]
+            round_evidence = build_factor_evidence_reports(
+                frame=final_frame,
+                tasks=final_tasks,
+                candidates=round_candidates,
+                results=round_backtests,
+                settings=settings,
+                forward_regimes=final_regimes,
+                funding_rate=final_funding_rate,
+                funding_df=context.funding_df,
+            )
+
+            from factor_mining.registry import get_method
+            from factor_mining.validation.gatecheck import apply_fdr, apply_risk_stratified_gatechecks, run_gatecheck
+
+            fdr_map = apply_fdr(round_backtests, settings)
+            methods_map = {method.method_id: method for method in METHOD_REGISTRY}
+            round_gatechecks: list[GateCheckResult] = []
+            for backtest in round_backtests:
+                method = methods_map.get(backtest.method_id) or get_method(backtest.method_id)
+                fdr_p = fdr_map.get(
+                    backtest.experiment_id,
+                    combined_ic_tstat_pvalue(backtest.ic_tstat_nw, backtest.rankic_tstat_nw),
+                )
+                round_gatechecks.append(run_gatecheck(backtest, settings, method=method, fdr_adjusted_pvalue=fdr_p))
+            apply_risk_stratified_gatechecks(round_backtests, round_gatechecks, round_evidence, settings)
+            round_research_gates = apply_research_gate(round_backtests, round_gatechecks, round_evidence)
+            persistent_records = build_research_survivor_records(
+                candidates_by_id={candidate.candidate_id: candidate for candidate in round_candidates},
+                results=round_backtests,
+                research_gates=round_research_gates,
+                fdr_map=fdr_map,
+                settings=settings,
+            )
+            survivor_payloads = research_survivor_payloads(
+                {candidate.candidate_id: candidate for candidate in round_candidates},
+                round_backtests,
+                round_research_gates,
+            )
+            _augment_research_survivor_payloads(survivor_payloads, persistent_records)
+            _update_research_survivor_store(
+                store=store,
+                records=persistent_records,
+                rechecked_candidate_ids={candidate.candidate_id for candidate in round_candidates},
+                research_gates=round_research_gates,
+                results=round_backtests,
+                fdr_map=fdr_map,
+                settings=settings,
+            )
+
+            all_candidates.extend(round_candidates)
+            all_backtests.extend(round_backtests)
+            all_gatechecks.extend(round_gatechecks)
+            all_factor_evidence.extend(round_evidence)
+            all_research_gates.extend(round_research_gates)
+            all_research_survivors.extend(survivor_payloads)
+            _log(f"  Verified {len(round_backtests)} survivors for {context.symbol}/{context.market}")
+
+        result.candidates = all_candidates
+        result.backtests = all_backtests
+        result.gatechecks = all_gatechecks
+        result.factor_evidence = all_factor_evidence
+        result.research_gates = all_research_gates
+        result.n_gatecheck_passed = sum(1 for gate in all_gatechecks if gate.passed)
+        result.total_rounds = 1 if all_backtests else 0
+        result.elapsed_s = time.perf_counter() - t_start
+        artifact_id = f"survivor_verify_{run_id or uuid.uuid4().hex[:12]}"
+        store.save_artifact(artifact_id, "survivor_verify", {
+            "candidates": [candidate.model_dump(mode="json") for candidate in all_candidates],
+            "backtests": [backtest.model_dump(mode="json") for backtest in all_backtests],
+            "gatechecks": [gate.model_dump(mode="json") for gate in all_gatechecks],
+            "research_gate": [gate.model_dump(mode="json") for gate in all_research_gates],
+            "research_survivors": all_research_survivors,
+        })
+        _log(f"Survivor verification complete: {len(all_backtests)} evaluated")
+        return result
+    finally:
+        _EVENT_SINK = previous_sink
+        _RUN_ID = previous_run_id
 
 
 def _run_mining_round(
@@ -639,12 +1059,16 @@ def _run_mining_round(
     artifact_scope: str | None = None,
     survivor_candidate_ids: set[str] | None = None,
     previous_actions: list[dict] | None = None,
+    run_id: str | None = None,
+    resume_run_id: str | None = None,
+    run_args: dict[str, Any] | None = None,
     stop_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     """Execute one complete mining round: backtest → gatecheck → hardscore → optimize."""
     artifact_scope = artifact_scope or f"round{round_num}"
     _check_stop(stop_event)
     survivor_candidate_ids = survivor_candidate_ids or set()
+    run_args = run_args or {}
 
     # ── Backtest ────────────────────────────────────────────────────
     t0 = time.perf_counter()
@@ -664,6 +1088,23 @@ def _run_mining_round(
         f"(validation_start_idx={split_plan.repair_validation_start_idx}, "
         f"final_start_idx={split_plan.final_oos_start_idx})"
     )
+    checkpoint_symbol = current_candidates[0].symbol if current_candidates else "unknown"
+    checkpoint_market = current_candidates[0].market if current_candidates else "unknown"
+    checkpoint_source = resume_run_id or run_id
+    checkpoint_fingerprint = _checkpoint_fingerprint(
+        settings,
+        run_args=run_args,
+        symbol=checkpoint_symbol,
+        market=checkpoint_market,
+        frame=frame,
+    )
+
+    current_candidates, skipped_funding = _filter_unfunded_factor_signal_candidates(current_candidates, funding_rate)
+    if skipped_funding:
+        _log(
+            f"  Funding factor_signal candidates skipped: {skipped_funding}; "
+            "supplemental funding features still allowed"
+        )
 
     trial_counts_by_candidate = _record_candidate_trials(current_candidates, store, settings, cumulative_trial_counts)
     full_tasks = _build_tasks(
@@ -677,7 +1118,35 @@ def _run_mining_round(
         data_quality_notes=data_quality_notes,
     )
     discovery_tasks = _slice_tasks(full_tasks, split_plan.discovery_mask)
-    discovery_backtests = _run_backtests_parallel(discovery_tasks, discovery_frame, settings, max_workers, funding_df)
+    discovery_checkpoint = _load_stage_checkpoint(
+        store,
+        checkpoint_source if resume_run_id else None,
+        round_num=round_num,
+        symbol=checkpoint_symbol,
+        market=checkpoint_market,
+        stage="discovery_backtests",
+        fingerprint=checkpoint_fingerprint,
+    )
+    if discovery_checkpoint is not None:
+        discovery_backtests = [
+            BacktestResult.model_validate(item)
+            for item in discovery_checkpoint.get("items", [])
+        ]
+        _log(f"  Discovery backtests: resumed {len(discovery_backtests)} from checkpoint")
+    else:
+        discovery_backtests = _run_backtests_parallel(discovery_tasks, discovery_frame, settings, max_workers, funding_df)
+        if discovery_backtests:
+            _apply_batch_pbo(discovery_frame, discovery_tasks, discovery_backtests, settings, funding_df)
+        _save_stage_checkpoint(
+            store,
+            run_id,
+            round_num=round_num,
+            symbol=checkpoint_symbol,
+            market=checkpoint_market,
+            stage="discovery_backtests",
+            fingerprint=checkpoint_fingerprint,
+            payload={"items": [result.model_dump(mode="json") for result in discovery_backtests]},
+        )
 
     # Align candidates with successful backtests
     discovery_backtest_ids = {r.candidate_id for r in discovery_backtests}
@@ -688,7 +1157,6 @@ def _run_mining_round(
     _check_stop(stop_event)
 
     if discovery_backtests:
-        _apply_batch_pbo(discovery_frame, discovery_tasks, discovery_backtests, settings, funding_df)
         _check_stop(stop_event)
 
     if not discovery_backtests:
@@ -713,11 +1181,37 @@ def _run_mining_round(
         funding_df=funding_df,
     )
 
-    pre_gate_candidates = _build_pre_gate_repair_candidates(
-        discovery_candidates,
-        discovery_backtests,
-        initial_factor_evidence,
+    pre_gate_checkpoint = _load_stage_checkpoint(
+        store,
+        checkpoint_source if resume_run_id else None,
+        round_num=round_num,
+        symbol=checkpoint_symbol,
+        market=checkpoint_market,
+        stage="pre_gate_candidates",
+        fingerprint=checkpoint_fingerprint,
     )
+    if pre_gate_checkpoint is not None:
+        pre_gate_candidates = [
+            CandidateStrategySpec.model_validate(item)
+            for item in pre_gate_checkpoint.get("items", [])
+        ]
+        _log(f"  Pre-Gate repair candidates: resumed {len(pre_gate_candidates)} from checkpoint")
+    else:
+        pre_gate_candidates = _build_pre_gate_repair_candidates(
+            discovery_candidates,
+            discovery_backtests,
+            initial_factor_evidence,
+        )
+        _save_stage_checkpoint(
+            store,
+            run_id,
+            round_num=round_num,
+            symbol=checkpoint_symbol,
+            market=checkpoint_market,
+            stage="pre_gate_candidates",
+            fingerprint=checkpoint_fingerprint,
+            payload={"items": [candidate.model_dump(mode="json") for candidate in pre_gate_candidates]},
+        )
     pre_gate_generated = len(pre_gate_candidates)
     pre_gate_completed = 0
     pre_gate_merged = 0
@@ -750,17 +1244,43 @@ def _run_mining_round(
         )
 
     validation_tasks = _slice_tasks(validation_full_tasks, split_plan.repair_validation_mask)
-    validation_backtests = _run_backtests_parallel(
-        validation_tasks,
-        repair_validation_frame,
-        settings,
-        max_workers,
-        funding_df,
+    validation_checkpoint = _load_stage_checkpoint(
+        store,
+        checkpoint_source if resume_run_id else None,
+        round_num=round_num,
+        symbol=checkpoint_symbol,
+        market=checkpoint_market,
+        stage="validation_backtests",
+        fingerprint=checkpoint_fingerprint,
     )
+    if validation_checkpoint is not None:
+        validation_backtests = [
+            BacktestResult.model_validate(item)
+            for item in validation_checkpoint.get("items", [])
+        ]
+        _log(f"  Repair validation backtests: resumed {len(validation_backtests)} from checkpoint")
+    else:
+        validation_backtests = _run_backtests_parallel(
+            validation_tasks,
+            repair_validation_frame,
+            settings,
+            max_workers,
+            funding_df,
+        )
+        if validation_backtests:
+            _apply_batch_pbo(repair_validation_frame, validation_tasks, validation_backtests, settings, funding_df)
+        _save_stage_checkpoint(
+            store,
+            run_id,
+            round_num=round_num,
+            symbol=checkpoint_symbol,
+            market=checkpoint_market,
+            stage="validation_backtests",
+            fingerprint=checkpoint_fingerprint,
+            payload={"items": [result.model_dump(mode="json") for result in validation_backtests]},
+        )
     pre_gate_ids = {candidate.candidate_id for candidate in pre_gate_candidates}
     pre_gate_completed = sum(1 for result in validation_backtests if result.candidate_id in pre_gate_ids)
-    if validation_backtests:
-        _apply_batch_pbo(repair_validation_frame, validation_tasks, validation_backtests, settings, funding_df)
     _check_stop(stop_event)
 
     if not validation_backtests:
@@ -803,24 +1323,50 @@ def _run_mining_round(
     }
 
     final_tasks = _slice_tasks(merge_plan.full_tasks, split_plan.final_oos_mask)
-    final_backtests = _run_backtests_parallel(final_tasks, final_frame, settings, max_workers, funding_df)
-    for result in final_backtests:
-        validation_result = validation_result_by_candidate.get(result.candidate_id)
-        result.pbo = validation_result.pbo if validation_result is not None else 1.0
-        if validation_result is not None:
-            result.global_trials_at_eval = validation_result.global_trials_at_eval
-            result.effective_trials_at_eval = validation_result.effective_trials_at_eval
+    final_checkpoint = _load_stage_checkpoint(
+        store,
+        checkpoint_source if resume_run_id else None,
+        round_num=round_num,
+        symbol=checkpoint_symbol,
+        market=checkpoint_market,
+        stage="final_backtests",
+        fingerprint=checkpoint_fingerprint,
+    )
+    if final_checkpoint is not None:
+        final_backtests = [
+            BacktestResult.model_validate(item)
+            for item in final_checkpoint.get("items", [])
+        ]
+        _log(f"  Final OOS backtests: resumed {len(final_backtests)} from checkpoint")
+    else:
+        final_backtests = _run_backtests_parallel(final_tasks, final_frame, settings, max_workers, funding_df)
+        for result in final_backtests:
+            validation_result = validation_result_by_candidate.get(result.candidate_id)
+            result.pbo = validation_result.pbo if validation_result is not None else 1.0
+            if validation_result is not None:
+                result.global_trials_at_eval = validation_result.global_trials_at_eval
+                result.effective_trials_at_eval = validation_result.effective_trials_at_eval
 
-    merge_pool_trials = _merge_pool_effective_trials(
-        validation_backtests,
-        cumulative_trial_counts,
-        tested_candidates=len(validation_candidates),
-    )
-    _apply_merge_pool_trial_penalty(
-        final_backtests,
-        effective_trials_count=merge_pool_trials,
-        observations=len(final_frame),
-    )
+        merge_pool_trials = _merge_pool_effective_trials(
+            validation_backtests,
+            cumulative_trial_counts,
+            tested_candidates=len(validation_candidates),
+        )
+        _apply_merge_pool_trial_penalty(
+            final_backtests,
+            effective_trials_count=merge_pool_trials,
+            observations=len(final_frame),
+        )
+        _save_stage_checkpoint(
+            store,
+            run_id,
+            round_num=round_num,
+            symbol=checkpoint_symbol,
+            market=checkpoint_market,
+            stage="final_backtests",
+            fingerprint=checkpoint_fingerprint,
+            payload={"items": [result.model_dump(mode="json") for result in final_backtests]},
+        )
 
     final_backtest_ids = {result.candidate_id for result in final_backtests}
     round_candidates = [
@@ -1020,12 +1566,12 @@ def _run_mining_round(
     # ── Optimize: signal-side ───────────────────────────────────────
     _check_stop(stop_event)
     t0 = time.perf_counter()
-    from factor_mining.optimizers.minimax_optimizer import (
+    from factor_mining.optimizers.traditional_optimizer import (
         apply_exit_adjustments,
         apply_optimization_result,
         build_optimization_context,
-        minimax_optimize,
-        _fallback_optimization,
+        optimize_exits_traditionally,
+        optimize_traditionally,
     )
 
     ctx = build_optimization_context(
@@ -1044,12 +1590,8 @@ def _run_mining_round(
             f"grossSR={_format_optional_float(survivor.get('gross_sharpe'))} "
             f"reason={survivor.get('survivor_reason') or 'ranked'}"
         )
-    try:
-        optimization = minimax_optimize(ctx, settings, mode="full")
-        _log(f"  MiniMax signal: {optimization.get('action', 'unknown')}")
-    except Exception as exc:
-        _log(f"  MiniMax signal failed: {exc}, using fallback")
-        optimization = _fallback_optimization(ctx, "full")
+    optimization = optimize_traditionally(ctx, mode="full")
+    _log(f"  Traditional optimizer signal: {optimization.get('action', 'unknown')}")
 
     signal_candidates, opt_summary = apply_optimization_result(optimization, round_candidates, round_backtests)
     new_candidates = list(signal_candidates)
@@ -1059,13 +1601,9 @@ def _run_mining_round(
          f"{opt_summary['hypotheses_suggested']} new hypotheses")
 
     # ── Optimize: exit-side ──────────────────────────────────────────
-    try:
-        exit_opt = minimax_optimize(ctx, settings, mode="exit_params")
-        _log(f"  MiniMax exit: {len(exit_opt.get('exit_adjustments', []))} adjustments")
-        new_candidates = apply_exit_adjustments(exit_opt, new_candidates, settings)
-    except Exception as exc:
-        _log(f"  MiniMax exit failed: {exc}, skipping exit optimization")
-        exit_opt = {"exit_adjustments": []}
+    exit_opt = optimize_exits_traditionally(ctx)
+    _log(f"  Traditional optimizer exit: {len(exit_opt.get('exit_adjustments', []))} adjustments")
+    new_candidates = apply_exit_adjustments(exit_opt, new_candidates, settings)
 
     _log(f"  Total optimization: {len(new_candidates) - len(round_candidates)} new candidates "
          f"({time.perf_counter() - t0:.0f}s)")
@@ -1326,6 +1864,34 @@ def _record_candidate_trials(
     return counts_by_candidate
 
 
+def _candidate_trial_count_snapshots(
+    candidates: list[CandidateStrategySpec],
+    store: MetadataStore | None,
+    settings: Settings,
+) -> dict[str, dict[str, int]]:
+    ledger = TrialLedger(store, settings) if store is not None else None
+    counts_by_candidate: dict[str, dict[str, int]] = {}
+    for candidate in candidates:
+        complexity_score = _candidate_complexity_score(candidate)
+        candidate.params["complexity_score"] = complexity_score
+        if ledger is not None:
+            counts = ledger.counts_for(candidate.hypothesis_family)
+        else:
+            counts = {
+                "family_trials_count": 1,
+                "rolling_90d_trials_count": 1,
+                "effective_trials_count": 1,
+                "global_cumulative_trials_count": 1,
+            }
+        counts["complexity_score"] = complexity_score
+        counts["effective_trials_count"] = max(
+            int(counts["effective_trials_count"]),
+            int(counts["effective_trials_count"]) * max(1, complexity_score),
+        )
+        counts_by_candidate[candidate.candidate_id] = counts
+    return counts_by_candidate
+
+
 def _candidate_complexity_score(candidate: CandidateStrategySpec) -> int:
     params = candidate.params
     score = 1
@@ -1488,6 +2054,8 @@ def _spawn_pre_gate_repair(
 ) -> CandidateStrategySpec:
     repair = parent.model_copy(deep=True)
     repair.candidate_id = f"c_pre_{uuid.uuid4().hex[:12]}"
+    repair.candidate_type = "repair"
+    repair.parent_candidate_id = parent.candidate_id
     repair.params.update(params)
     repair.params["parent_id"] = parent.candidate_id
     repair.params["generated_by"] = "pre_gate_repair"
@@ -1876,17 +2444,19 @@ def _merge_pool_effective_trials(
     *,
     tested_candidates: int,
 ) -> int:
-    observed = [
-        int(result.effective_trials_at_eval)
-        for result in validation_results
-        if result.effective_trials_at_eval is not None
-    ]
-    return max(
-        1,
-        int(tested_candidates),
-        sum(int(value) for value in cumulative_trial_counts.values()),
-        max(observed, default=1),
-    )
+    """Compute the effective trial count for the final merge-pool DSR penalty.
+
+    Policy (explicit):
+    - `tested_candidates`  = actual distinct candidates that competed in the merge pool;
+      this is the primary measure of independent search paths.
+    - `sum(cumulative_trial_counts)` = conservative family-based floor; only used if it
+      exceeds `tested_candidates` (rare, happens when many families compete).
+    - We deliberately do NOT take max(observed_effective_trials) from validation results
+      because those already incorporate the same cumulative counts — taking that max would
+      double-apply the family-level penalty.
+    """
+    family_floor = sum(int(v) for v in cumulative_trial_counts.values())
+    return max(1, int(tested_candidates), family_floor)
 
 
 def _apply_merge_pool_trial_penalty(
@@ -1904,6 +2474,11 @@ def _apply_merge_pool_trial_penalty(
             observed_sr=result.metrics_primary.sharpe,
             trials_count=result.effective_trials_at_eval,
         )
+        # Write merge-pool trial count back to trial_diagnostics for artifact transparency.
+        result.trial_diagnostics["merge_pool_effective_trials"] = effective_trials_count
+        result.trial_diagnostics["effective_trials_at_eval"] = result.effective_trials_at_eval
+        result.trial_diagnostics["global_trials_at_eval"] = result.global_trials_at_eval
+        result.trial_diagnostics["dsr"] = float(result.deflated_sharpe)
 
 
 def _json_dumps_sorted(payload: dict[str, Any]) -> str:
@@ -2031,24 +2606,89 @@ def _group_candidates_by_data(
     return grouped
 
 
+def _sample_frame_blocks(
+    frame: pd.DataFrame,
+    *,
+    sample_bars: int,
+    interval_ms: int,
+    seed: int,
+) -> pd.DataFrame:
+    if sample_bars <= 0:
+        raise ValueError("sample_bars must be positive")
+    if sample_bars >= len(frame):
+        return frame.reset_index(drop=True)
+
+    block_len = max(1, int(round(7 * 86_400_000 / max(interval_ms, 1))))
+    block_len = min(block_len, len(frame))
+    rng = np.random.default_rng(seed)
+    pieces: list[pd.DataFrame] = []
+    max_start = max(0, len(frame) - block_len)
+    # Oversample blocks, then de-duplicate and trim after chronological sort.
+    sampled = pd.DataFrame()
+    attempts = 0
+    while len(sampled) < sample_bars and attempts < max(16, len(frame) // max(block_len, 1) * 8):
+        start = int(rng.integers(0, max_start + 1)) if max_start > 0 else 0
+        end = min(len(frame), start + block_len)
+        piece = frame.iloc[start:end]
+        pieces.append(piece)
+        sampled = pd.concat(pieces, ignore_index=False).sort_values("open_time").drop_duplicates("open_time")
+        attempts += 1
+    if len(sampled) < sample_bars:
+        sampled = (
+            pd.concat([sampled, frame], ignore_index=False)
+            .sort_values("open_time")
+            .drop_duplicates("open_time")
+        )
+    sampled = sampled.head(sample_bars).reset_index(drop=True)
+    return sampled
+
+
 def _load_data_contexts(
     candidates: list[CandidateStrategySpec],
     settings: Settings,
     *,
     tail: int | None,
+    sample_bars: int | None = None,
+    sample_mode: str = "block",
+    seed: int = 42,
 ) -> dict[tuple[str, str], MarketDataContext]:
+    if tail is not None and sample_bars is not None:
+        raise ValueError("--tail and --sample-bars are mutually exclusive")
+    if sample_bars is not None and sample_mode != "block":
+        raise ValueError("sample_mode must be 'block'")
+
     contexts: dict[tuple[str, str], MarketDataContext] = {}
     for symbol, market in sorted({(c.symbol, c.market) for c in candidates}):
         try:
-            frame = load_frame(settings, symbol=symbol, market=market, tail=tail)
+            full_frame = load_frame(
+                settings,
+                symbol=symbol,
+                market=market,
+                tail=None if sample_bars is not None else tail,
+            )
         except FileNotFoundError as exc:
             _log(f"Skip {symbol}/{market}: {exc}")
             continue
 
+        quality_frame = full_frame
+        if sample_bars is not None:
+            frame = _sample_frame_blocks(
+                full_frame,
+                sample_bars=sample_bars,
+                interval_ms=interval_to_ms(settings.data.default_interval),
+                seed=seed,
+            )
+            _log(
+                f"Data sample {symbol}/{market}: {len(frame):,}/{len(full_frame):,} rows "
+                f"from full coverage {full_frame['open_time'].min()} → {full_frame['open_time'].max()}"
+            )
+        else:
+            frame = full_frame
+
         n_rows = len(frame)
         _log(f"Data {symbol}/{market}: {n_rows:,} rows, {frame['open_time'].min()} → {frame['open_time'].max()}")
         quality_notes = kline_quality_notes(
-            frame,
+            quality_frame,
             interval_ms=interval_to_ms(settings.data.default_interval),
             scope=f"{market}:{symbol}:{settings.data.default_interval}",
         )
@@ -2078,7 +2718,7 @@ def _load_data_contexts(
                 f"event-z range [{funding_rate.min():+.3f}, {funding_rate.max():+.3f}]"
             )
         else:
-            _log(f"Funding {symbol}: not available, using price-based proxy")
+            _log(f"Funding {symbol}: not available; funding factor_signal candidates skipped, supplemental funding features still allowed")
 
         forward_regimes = _fit_regime_model(frame, tail, _log)
         _log(f"Regime {symbol}/{market}: {dict(forward_regimes.value_counts())}")
@@ -2457,6 +3097,48 @@ def _build_tasks(
         )
         tasks.append((signal_arr, c.model_dump(mode="json"), i, trial_counts, note_dicts))
     return tasks
+
+
+def _filter_unfunded_factor_signal_candidates(
+    candidates: list[CandidateStrategySpec],
+    funding_rate: pd.Series | None,
+) -> tuple[list[CandidateStrategySpec], int]:
+    if _has_usable_funding_rate(funding_rate):
+        return candidates, 0
+    filtered = [candidate for candidate in candidates if not _candidate_requires_funding_rate(candidate)]
+    return filtered, len(candidates) - len(filtered)
+
+
+def _has_usable_funding_rate(funding_rate: pd.Series | None) -> bool:
+    if funding_rate is None:
+        return False
+    values = pd.Series(funding_rate).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return float(values.abs().sum()) > 1e-12
+
+
+def _candidate_requires_funding_rate(candidate: CandidateStrategySpec, *, depth: int = 0) -> bool:
+    return _params_require_funding_rate(candidate.hypothesis_family, candidate.params, depth=depth)
+
+
+def _params_require_funding_rate(hypothesis_family: str, params: dict, *, depth: int = 0) -> bool:
+    if depth > 4:
+        return False
+    signal_source = params.get("signal_source")
+    if signal_source == "feature":
+        return False
+    if signal_source == "factor_signal":
+        return params.get("factor_family") == "funding_basis"
+    components = params.get("components")
+    if isinstance(components, list):
+        for payload in components:
+            try:
+                component = CandidateStrategySpec.model_validate(payload)
+            except (TypeError, ValueError):
+                continue
+            if _candidate_requires_funding_rate(component, depth=depth + 1):
+                return True
+        return False
+    return signal_source is None and _normalize_family(hypothesis_family) == "funding_basis"
 
 
 # ── signal construction ─────────────────────────────────────────────
@@ -2866,8 +3548,8 @@ def _is_repair_candidate(candidate: CandidateStrategySpec) -> bool:
         "pre_gate_repair",
         "near_miss_repair",
         "optimizer_repair",
-        "minimax_survivor_adjustment",
-        "minimax_survivor_composite",
+        "traditional_survivor_adjustment",
+        "traditional_survivor_composite",
     } or variant.startswith("repair_")
 
 
@@ -2906,6 +3588,9 @@ def _log(msg: str) -> None:
 def _emit_event(phase: str, level: str, message: str, payload: dict[str, Any] | None = None) -> None:
     if _EVENT_SINK is not None:
         try:
-            _EVENT_SINK(phase, level, message, payload)
+            event_payload = dict(payload or {})
+            if _RUN_ID is not None:
+                event_payload.setdefault("run_id", _RUN_ID)
+            _EVENT_SINK(phase, level, message, event_payload)
         except Exception:
             pass

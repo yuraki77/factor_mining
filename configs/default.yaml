@@ -87,10 +87,6 @@ llm:
     api_key_env: "DEEPSEEK_API_KEY"
     hypothesis_model: "deepseek-chat"
     hardscore_model: "deepseek-chat"
-  minimax:
-    base_url: "https://api.minimaxi.com/v1"
-    api_key_env: "MINIMAX_API_KEY"
-    optimizer_model: "MiniMax-M2.7"
 
 gatecheck:
   fdr_q: 0.05

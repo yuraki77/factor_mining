@@ -8,7 +8,15 @@ import pandas as pd
 
 from factor_mining.config import Settings
 from factor_mining.hypotheses.discovered import boundary_conditions
-from factor_mining.models import BacktestResult, CandidateStrategySpec, DataQualityNote, MetricsBlock, TrialRecord
+from factor_mining.models import (
+    BacktestResult,
+    CandidateStrategySpec,
+    DataQualityNote,
+    MetricsBlock,
+    OOSWindowMetrics,
+    TrialRecord,
+    WindowStabilityDiagnostics,
+)
 from factor_mining.stats.metrics import (
     _block_bootstrap_sharpes,
     annualization_factor,
@@ -75,6 +83,89 @@ def _avg_holding_period(position: pd.Series) -> float:
     if current:
         lengths.append(current)
     return float(np.mean(lengths)) if lengths else 0.0
+
+
+def compute_oos_window_diagnostics(
+    returns: pd.Series,
+    position: pd.Series,
+    interval: str,
+    *,
+    n_windows: int = 4,
+    ic_series: pd.Series | None = None,
+) -> WindowStabilityDiagnostics:
+    """Split the OOS period into chronological windows and compute stability metrics.
+
+    Args:
+        returns: Strategy net returns for the final OOS period.
+        position: Position series (same length/index as returns).
+        interval: Bar interval string used to determine annualization.
+        n_windows: How many chronological windows to split into (minimum 2).
+        ic_series: Optional per-bar rolling IC; used to compute per-window IC t-stat.
+
+    Returns:
+        WindowStabilityDiagnostics with per-window details and aggregate scores.
+    """
+    n_windows = max(2, n_windows)
+    periods = annualization_factor(interval)
+    n = len(returns)
+    if n < n_windows:
+        # Not enough bars — return a degenerate but valid diagnostics object.
+        return WindowStabilityDiagnostics(n_windows=0)
+
+    per_window: list[OOSWindowMetrics] = []
+    window_size = n // n_windows
+    for i in range(n_windows):
+        start = i * window_size
+        end = n if i == n_windows - 1 else (i + 1) * window_size
+        w_ret = returns.iloc[start:end].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        w_pos = position.iloc[start:end]
+        trade_mask = w_pos.diff().abs().fillna(w_pos.abs()) > 1e-12
+        w_trade_count = int(trade_mask.sum())
+        if len(w_ret) < 2 or w_ret.std() < 1e-12:
+            w_sharpe = 0.0
+        else:
+            w_sharpe = sharpe_ratio(w_ret, periods_per_year=periods)
+        equity = (1.0 + w_ret).cumprod()
+        w_total_return = float(equity.iloc[-1] - 1.0) if not equity.empty else 0.0
+        w_mdd = max_drawdown(equity)
+        w_ic_tstat: float | None = None
+        if ic_series is not None:
+            w_ic = ic_series.iloc[start:end].dropna()
+            if len(w_ic) >= 4:
+                w_ic_tstat = float(newey_west_tstat(w_ic))
+        per_window.append(OOSWindowMetrics(
+            window_index=i,
+            start_bar=start,
+            end_bar=end,
+            sharpe=w_sharpe,
+            total_return=w_total_return,
+            max_drawdown=w_mdd,
+            trade_count=w_trade_count,
+            ic_tstat=w_ic_tstat,
+        ))
+
+    sharpes = np.array([w.sharpe for w in per_window], dtype=float)
+    positive_rate = float(np.mean(sharpes > 0))
+    trade_coverage = float(np.mean([w.trade_count > 0 for w in per_window]))
+    sharpe_mean = float(np.mean(sharpes))
+    sharpe_std = float(np.std(sharpes, ddof=1)) if len(sharpes) > 1 else 0.0
+    # Stability score: [0,1]. Penalises high std and low positive rate.
+    # score = positive_rate * clip(sharpe_mean / (1 + sharpe_std), 0, 1)
+    if sharpe_mean <= 0:
+        stability_score = 0.0
+    else:
+        norm = sharpe_mean / (1.0 + sharpe_std)
+        stability_score = float(np.clip(positive_rate * norm, 0.0, 1.0))
+
+    return WindowStabilityDiagnostics(
+        n_windows=len(per_window),
+        window_sharpe_mean=sharpe_mean,
+        window_sharpe_std=sharpe_std,
+        window_positive_rate=positive_rate,
+        window_trade_coverage=trade_coverage,
+        stability_score=stability_score,
+        per_window=per_window,
+    )
 
 
 def _apply_funding(position: pd.Series, frame: pd.DataFrame, funding: pd.DataFrame | None) -> pd.Series:
@@ -426,6 +517,21 @@ def run_backtest(
     break_even_cost_bps = _break_even_cost_bps(primary_returns, vol_target_position)
     expected_ic_mid = abs(float(candidate.params.get("expected_ic_mid", 0.02))) or 0.02
     observed_ic = abs(float(ic_series.mean(skipna=True))) if not ic_series.dropna().empty else 0.0
+    window_stability = compute_oos_window_diagnostics(
+        primary_returns,
+        vol_target_position,
+        candidate.interval,
+        n_windows=4,
+        ic_series=ic_series,
+    )
+    trial_diagnostics = {
+        "candidate_type": candidate.candidate_type,
+        "parent_candidate_id": candidate.parent_candidate_id,
+        "effective_trials_at_eval": counts["effective_trials_count"],
+        "global_trials_at_eval": counts["global_cumulative_trials_count"],
+        "complexity_score": int(candidate.params.get("complexity_score", 1)),
+        "dsr": float(dsr),
+    }
     return BacktestResult(
         experiment_id=str(uuid.uuid4()),
         candidate_id=candidate.candidate_id,
@@ -457,6 +563,8 @@ def run_backtest(
         oos_trade_count=_oos_trade_count(vol_target_position, frame, settings, candidate),
         actual_cost_bps=path.avg_cost_bps,
         prior_posterior_ic_ratio=observed_ic / expected_ic_mid if expected_ic_mid > 0 else 1.0,
+        window_stability=window_stability,
+        trial_diagnostics=trial_diagnostics,
     )
 
 
@@ -548,7 +656,7 @@ def walk_forward_oos_mask(frame: pd.DataFrame, settings: Settings, candidate: Ca
     while start < n_rows:
         end = min(n_rows, start + test_bars)
         mask.iloc[start:end] = True
-        start = end + embargo_bars
+        start = end + embargo_bars + purge_bars
 
     if not bool(mask.any()):
         mask.iloc[int(n_rows * 0.75):] = True

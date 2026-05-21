@@ -420,7 +420,7 @@ function renderPipeline() {
       <div class="grid-4">
         ${kpiTile("Gate accepted", `${k.gates.accepted}/${data.experiments.length}`, `${k.gates.warn} diagnostic · ${k.gates.fail} fail`, "pass")}
         ${kpiTile("Top HardScore", fmt.num(k.topScore, 1), `Sharpe ${fmt.signed(k.top.sharpe || 0)}`, "info")}
-        ${kpiTile("Research survivors", data.bundle.research_survivors.length, "optimizer fallback pool", "violet")}
+        ${kpiTile("Research survivors", data.bundle.research_survivors.length, "optimizer candidate pool", "violet")}
         ${kpiTile("Latest run", latest ? latest.status : "idle", latest ? shortId(latest.run_id, 18) : "no run")}
       </div>
       <div class="two-col">
@@ -431,7 +431,7 @@ function renderPipeline() {
       ${panel("Top experiments", "Ranked by HardScore (DSR-adjusted, haircut, NW-FDR-aware)", renderExperimentTable(data.experiments.slice(0, 12), true), true)}
       <div class="two-col">
         ${panel("Activity by hypothesis family", "Trials and survivors in this run", renderFamilyActivity())}
-        ${panel("MiniMax optimization history", `${data.bundle.optimization_history.length} rounds`, renderOptimizationHistory(), true)}
+        ${panel("Optimization history", `${data.bundle.optimization_history.length} rounds`, renderOptimizationHistory(), true)}
       </div>
     </div>
   `;

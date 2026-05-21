@@ -354,7 +354,7 @@ INDICATOR_META: dict[str, dict] = {
     "trade_density_z":{"family": "volume_confirmation","direction":"positive",          "regime": "any"},
     "log_ret":       {"family": "trend_following",   "direction": "positive",           "regime": "trending"},
     "hl_ratio":      {"family": "volatility_regime", "direction": "neutral",            "regime": "any"},
-    "close_position":{"family": "mean_reversion",    "direction": "positive",           "regime": "range_bound"},
+    "close_position":{"family": "mean_reversion",    "direction": "negative_when_high", "regime": "range_bound"},
     "gap":           {"family": "mean_reversion",    "direction": "negative",           "regime": "range_bound"},
     "intraday_range":{"family": "volatility_regime", "direction": "neutral",            "regime": "any"},
     "eff_ratio":     {"family": "trend_following",   "direction": "positive",           "regime": "trending"},

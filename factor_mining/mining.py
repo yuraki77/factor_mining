@@ -36,13 +36,8 @@ FAMILY_ALIASES: dict[str, str] = {
     "funding basis": "funding_basis",
     "funding rate mean reversion": "funding_basis",
     "funding rate reversal": "funding_basis",
-    "funding rate momentum": "funding_basis",
-    "funding momentum": "funding_basis",
     "funding rate": "funding_basis",
     "basis arbitrage": "funding_basis",
-    "basis momentum": "funding_basis",
-    "basis volatility": "funding_basis",
-    "basis": "funding_basis",
     "basis carry": "funding_basis",
     "volume_confirmation": "volume_confirmation",
     "volume confirmation": "volume_confirmation",
@@ -466,17 +461,16 @@ def factor_signal(
         z = ((vol - vol_median) / vol_iqr).replace([np.inf, -np.inf], np.nan).fillna(0.0)
         return np.tanh(z / 2.0)
     if family == "funding_basis":
-        if funding_rate is not None and funding_rate.abs().sum() > 1e-12:
-            # funding_rate is an 8h-event z-score aligned to this 5m frame.
-            fr = pd.Series(funding_rate.to_numpy(dtype=float), index=frame.index)
-            z = fr.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-6, 6)
-            # Negative: high funding → short; Positive: low funding → long
-            return -np.tanh(z / 2.0)
-        # Fallback: price-based basis proxy
-        ret = close.pct_change(lookback)
-        rolling_std = ret.rolling(lookback * 4, min_periods=lookback).std()
-        z = (ret / rolling_std.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        return np.tanh(z / 2.0)
+        if funding_rate is None:
+            raise ValueError("funding_basis factor_signal requires non-zero funding_rate data")
+        # funding_rate is an 8h-event z-score aligned to this 5m frame.
+        fr = pd.Series(funding_rate.to_numpy(dtype=float), index=frame.index)
+        fr = fr.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        if fr.abs().sum() <= 1e-12:
+            raise ValueError("funding_basis factor_signal requires non-zero funding_rate data")
+        z = fr.clip(-6, 6)
+        # Negative: high funding -> short; Positive: low funding -> long.
+        return -np.tanh(z / 2.0)
     # Default: VWAP deviation
     vwap_proxy = (close * volume).rolling(lookback).sum() / volume.rolling(lookback).sum()
     deviation = (close / vwap_proxy.replace(0, np.nan) - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from factor_mining.models import (
@@ -66,13 +67,17 @@ def analyze_near_miss(
 
     if _cost_destroyed_edge(diagnostics):
         reasons.append("cost_destroyed_edge")
-        suggested.update(_low_turnover_params(result))
-        actions.append("reduce_turnover")
+        if _suggest_low_turnover_params(candidate, result, suggested):
+            actions.append("reduce_turnover")
+        else:
+            reasons.append("turnover_repair_saturated")
 
     if _excess_turnover(diagnostics):
         reasons.append("excess_turnover")
-        suggested.update(_low_turnover_params(result))
-        actions.append("reduce_turnover")
+        if _suggest_low_turnover_params(candidate, result, suggested):
+            actions.append("reduce_turnover")
+        else:
+            reasons.append("turnover_repair_saturated")
 
     best_horizon = diagnostics.get("best_horizon_bars")
     current_lookback = diagnostics.get("current_lookback")
@@ -141,9 +146,14 @@ def analyze_near_miss(
 
 def repair_adjustments_from_near_misses(near_misses: list[NearMissAnalysis], *, limit: int = 16) -> list[dict]:
     adjustments: list[dict] = []
+    seen: set[tuple[str, str]] = set()
     for miss in near_misses:
         if not miss.actionable:
             continue
+        signature = (miss.candidate_id, _params_signature(miss.suggested_params))
+        if signature in seen:
+            continue
+        seen.add(signature)
         adjustments.append({
             "candidate_id": miss.candidate_id,
             "param": "repair_params",
@@ -262,15 +272,57 @@ def _side_asymmetry(diagnostics: dict) -> bool:
     return best >= 0.4 and best - net >= 0.5
 
 
-def _low_turnover_params(result: BacktestResult) -> dict[str, float | int]:
-    smooth_span = 48 if result.factor_turnover >= 0.20 else 24
-    signal_threshold = 0.30 if result.factor_turnover >= 0.20 else 0.20
-    position_buffer = 0.25 if result.factor_turnover >= 0.20 else 0.15
-    return {
-        "smooth_span": smooth_span,
-        "signal_threshold": signal_threshold,
-        "position_buffer": position_buffer,
-    }
+_LOW_TURNOVER_LADDER: tuple[dict[str, float | int], ...] = (
+    {"smooth_span": 24, "signal_threshold": 0.20, "position_buffer": 0.15},
+    {"smooth_span": 48, "signal_threshold": 0.30, "position_buffer": 0.25},
+    {"smooth_span": 96, "signal_threshold": 0.40, "position_buffer": 0.30},
+)
+
+
+def _suggest_low_turnover_params(
+    candidate: CandidateStrategySpec | None,
+    result: BacktestResult,
+    suggested: dict[str, Any],
+) -> bool:
+    params = _low_turnover_params(candidate, result)
+    if params is None:
+        return False
+    suggested.update(params)
+    return True
+
+
+def _low_turnover_params(
+    candidate: CandidateStrategySpec | None,
+    result: BacktestResult,
+) -> dict[str, float | int] | None:
+    current_idx = _current_low_turnover_ladder_index(candidate.params if candidate is not None else {})
+    target_idx = 1 if result.factor_turnover >= 0.20 else 0
+    next_idx = max(current_idx + 1, target_idx)
+    if next_idx >= len(_LOW_TURNOVER_LADDER):
+        return None
+    return dict(_LOW_TURNOVER_LADDER[next_idx])
+
+
+def _current_low_turnover_ladder_index(params: dict[str, Any]) -> int:
+    try:
+        smooth_span = int(params.get("smooth_span", 1))
+        signal_threshold = float(params.get("signal_threshold", 0.0))
+        position_buffer = float(params.get("position_buffer", 0.05))
+    except (TypeError, ValueError):
+        return -1
+    current_idx = -1
+    for idx, rung in enumerate(_LOW_TURNOVER_LADDER):
+        if (
+            smooth_span >= int(rung["smooth_span"])
+            and signal_threshold >= float(rung["signal_threshold"])
+            and position_buffer >= float(rung["position_buffer"])
+        ):
+            current_idx = idx
+    return current_idx
+
+
+def _params_signature(params: dict[str, Any]) -> str:
+    return json.dumps(params, sort_keys=True, default=str, separators=(",", ":"))
 
 
 def _best_abs(values: dict[str, float]) -> tuple[float, str | None]:

@@ -2,9 +2,9 @@ import pandas as pd
 import pytest
 
 from factor_mining.archive import archive_experiment, reproduce_archive
-from factor_mining.backtest.engine import _apply_exit_rules, evaluate_strategy_path, run_backtest
-from factor_mining.config import BootstrapConfig, DataConfig, GateCheckConfig, PermutationTestConfig, PositionSizingConfig, Settings
-from factor_mining.models import BacktestResult, CandidateStrategySpec, DataQualityNote, FactorEvidenceReport, MetricsBlock
+from factor_mining.backtest.engine import _apply_exit_rules, evaluate_strategy_path, run_backtest, walk_forward_oos_mask
+from factor_mining.config import BootstrapConfig, DataConfig, GateCheckConfig, PermutationTestConfig, PositionSizingConfig, Settings, WalkForwardConfig
+from factor_mining.models import BacktestResult, CandidateStrategySpec, DataQualityNote, FactorEvidenceReport, GateCheckResult, MetricsBlock
 from factor_mining.registry import get_method
 from factor_mining.storage import MetadataStore
 from factor_mining.trial_ledger import TrialLedger
@@ -34,6 +34,58 @@ def make_frame(n: int = 400) -> pd.DataFrame:
             "quote_volume": [1_000_000.0] * n,
         }
     )
+
+
+def test_walk_forward_oos_mask_purges_between_test_windows() -> None:
+    month_ms = 30 * 86_400_000
+    frame = pd.DataFrame({"open_time": [1_700_000_000_000 + idx * month_ms for idx in range(15)]})
+    settings = Settings(
+        walk_forward=WalkForwardConfig(
+            train_months=0,
+            validation_months=0,
+            test_months=2,
+            purge_bars_floor=2,
+            embargo_bars=3,
+        )
+    )
+    candidate = CandidateStrategySpec(
+        candidate_id="c-wf",
+        hypothesis_id="h1",
+        method_id="factor_scoring",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+        max_feature_lookback_bars=1,
+    )
+
+    mask = walk_forward_oos_mask(frame, settings, candidate)
+    oos_indices = list(mask[mask].index)
+
+    assert oos_indices[:4] == [2, 3, 9, 10]
+    assert oos_indices[2] - oos_indices[1] - 1 == 5
+
+
+def test_gatecheck_result_carries_candidate_id() -> None:
+    result = BacktestResult(
+        experiment_id="exp-gate",
+        candidate_id="cand-gate",
+        hypothesis_family="momentum",
+        method_id="factor_scoring",
+        symbol="BTCUSDT",
+        market="um_futures",
+        interval="5m",
+        metrics_primary=MetricsBlock(sharpe=1.0, trade_count=100),
+        metrics_gross=MetricsBlock(sharpe=1.2),
+        deflated_sharpe=1.0,
+        pbo=0.1,
+        oos_trade_count=100,
+        estimated_capacity_usd=1_000_000.0,
+        break_even_cost_bps=10.0,
+        actual_cost_bps=1.0,
+    )
+
+    gate = run_gatecheck(result, Settings(), method=get_method("factor_scoring"), fdr_adjusted_pvalue=0.01)
+
+    assert gate.candidate_id == "cand-gate"
 
 
 def test_exit_rules_reset_take_profit_after_natural_flat() -> None:
@@ -283,6 +335,53 @@ def test_conditional_pass_hardscore_is_scaled_by_allocation() -> None:
 
     assert score.score > 0.0
     assert score.allocation_multiplier == 0.25
+
+
+def test_hardscore_distinguishes_strong_dsr_without_hard_saturation() -> None:
+    low = _gate_ready_result(experiment_id="exp-low", pbo=0.20).model_copy(update={"deflated_sharpe": 1.0})
+    high = _gate_ready_result(experiment_id="exp-high", pbo=0.20).model_copy(update={"deflated_sharpe": 3.0})
+    low_gate = GateCheckResult(experiment_id=low.experiment_id, passed=True, items=[], allocation_multiplier=1.0)
+    high_gate = GateCheckResult(experiment_id=high.experiment_id, passed=True, items=[], allocation_multiplier=1.0)
+
+    low_score = hardscore(low, low_gate, fdr_adjusted_pvalue=0.01, settings=Settings())
+    high_score = hardscore(high, high_gate, fdr_adjusted_pvalue=0.01, settings=Settings())
+
+    assert high_score.score > low_score.score
+
+
+def test_hardscore_distinguishes_strong_ic_without_hard_saturation() -> None:
+    low = _gate_ready_result(experiment_id="exp-low", pbo=0.20).model_copy(update={"ic_tstat_nw": 4.0, "rankic_tstat_nw": 4.0})
+    high = _gate_ready_result(experiment_id="exp-high", pbo=0.20).model_copy(update={"ic_tstat_nw": 8.0, "rankic_tstat_nw": 8.0})
+    low_gate = GateCheckResult(experiment_id=low.experiment_id, passed=True, items=[], allocation_multiplier=1.0)
+    high_gate = GateCheckResult(experiment_id=high.experiment_id, passed=True, items=[], allocation_multiplier=1.0)
+
+    low_score = hardscore(low, low_gate, fdr_adjusted_pvalue=0.01, settings=Settings())
+    high_score = hardscore(high, high_gate, fdr_adjusted_pvalue=0.01, settings=Settings())
+
+    assert high_score.score > low_score.score
+
+
+def test_hardscore_score_does_not_depend_on_haircut_or_psr_components() -> None:
+    low = _gate_ready_result(experiment_id="exp-low", pbo=0.20).model_copy(
+        update={
+            "metrics_primary": MetricsBlock(sharpe=0.5, trade_count=200, pnl=100.0),
+            "probabilistic_sharpe": 0.10,
+        }
+    )
+    high = _gate_ready_result(experiment_id="exp-high", pbo=0.20).model_copy(
+        update={
+            "metrics_primary": MetricsBlock(sharpe=5.0, trade_count=200, pnl=100.0),
+            "probabilistic_sharpe": 0.99,
+        }
+    )
+    low_gate = GateCheckResult(experiment_id=low.experiment_id, passed=True, items=[], allocation_multiplier=1.0)
+    high_gate = GateCheckResult(experiment_id=high.experiment_id, passed=True, items=[], allocation_multiplier=1.0)
+
+    low_score = hardscore(low, low_gate, fdr_adjusted_pvalue=0.01, settings=Settings())
+    high_score = hardscore(high, high_gate, fdr_adjusted_pvalue=0.01, settings=Settings())
+
+    assert high_score.haircut_sharpe > low_score.haircut_sharpe
+    assert high_score.score == low_score.score
 
 
 def test_archive_reproduce_validates_hash(tmp_path) -> None:

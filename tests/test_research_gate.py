@@ -6,7 +6,7 @@ from factor_mining.models import (
     MetricsBlock,
     ResearchGateResult,
 )
-from factor_mining.optimizers.minimax_optimizer import build_optimization_context
+from factor_mining.optimizers.traditional_optimizer import build_optimization_context
 from factor_mining.models import CandidateStrategySpec
 from factor_mining.config import Settings
 from factor_mining.research_gate import apply_research_gate, build_research_survivor_records, evaluate_research_gate, research_survivor_payloads

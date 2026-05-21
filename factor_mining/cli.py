@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from pathlib import Path
+import uuid
 
 import typer
 
@@ -78,12 +79,16 @@ def mine_run(
     universe: str | None = typer.Option(None, help="Universe preset, e.g. um_liquid_30."),
     max_workers: int | None = typer.Option(None, "--workers", help="Number of parallel backtest workers."),
     tail: int | None = typer.Option(None, "--tail", help="Use only last N rows of data (faster dev runs)."),
+    sample_bars: int | None = typer.Option(None, "--sample-bars", help="Use deterministic chronological block sample of N bars."),
+    sample_mode: str = typer.Option("block", "--sample-mode", help="Sampling mode. Only 'block' is supported."),
+    seed: int = typer.Option(42, "--seed", help="Deterministic seed for block sampling."),
+    resume: str | None = typer.Option(None, "--resume", help="Resume from checkpoints saved under a previous run id."),
     archive_top: int = typer.Option(3, "--archive", help="Number of top experiments to archive."),
-    iterations: int = typer.Option(1, "--iterations", help="Max mining rounds (1=single pass, >1=iterative MiniMax optimization)."),
+    iterations: int = typer.Option(1, "--iterations", help="Max mining rounds (1=single pass, >1=iterative traditional optimization)."),
 ) -> None:
     """Run the full factor mining pipeline: hypotheses → backtest → gatecheck → hardscore → optimize.
 
-    With --iterations > 1, MiniMax suggestions are backtested in subsequent rounds
+    With --iterations > 1, deterministic optimizer suggestions are backtested in subsequent rounds
     until convergence or the iteration limit is reached.
     """
     from factor_mining.pipeline import run_pipeline
@@ -93,26 +98,147 @@ def mine_run(
     if run_symbols is not None:
         settings = settings.model_copy(update={"data": settings.data.model_copy(update={"symbols": run_symbols})})
     store = MetadataStore(settings.data.sqlite_path)
+    if tail is not None and sample_bars is not None:
+        raise typer.BadParameter("--tail and --sample-bars are mutually exclusive")
+    if sample_bars is not None and sample_mode != "block":
+        raise typer.BadParameter("--sample-mode must be 'block'")
 
-    result = run_pipeline(
-        settings,
-        use_llm=use_llm,
-        max_workers=max_workers,
-        tail=tail,
-        archive_top=archive_top,
-        research_brief=research_brief,
-        hypothesis_count=hypothesis_count,
-        iterations=iterations,
-        store=store,
-    )
+    run_args = {
+        "use_llm": use_llm,
+        "hypothesis_count": hypothesis_count,
+        "research_brief": research_brief,
+        "symbols": run_symbols,
+        "max_workers": max_workers,
+        "tail": tail,
+        "sample_bars": sample_bars,
+        "sample_mode": sample_mode,
+        "seed": seed,
+        "archive_top": archive_top,
+        "iterations": iterations,
+        "mode": "cli",
+    }
+    resume_run_id = resume
+    if resume_run_id:
+        previous = store.pipeline_run(resume_run_id)
+        if previous is None:
+            typer.echo(f"No pipeline run found for --resume {resume_run_id}.")
+            raise typer.Exit(code=1)
+        previous_args = dict(previous.get("args") or {})
+        run_args.update({
+            key: previous_args.get(key, run_args.get(key))
+            for key in (
+                "use_llm", "hypothesis_count", "research_brief", "symbols", "max_workers",
+                "tail", "sample_bars", "sample_mode", "seed", "archive_top", "iterations",
+            )
+        })
+        if run_args.get("symbols") is not None:
+            settings = settings.model_copy(update={"data": settings.data.model_copy(update={"symbols": list(run_args["symbols"])})})
+
+    run_id = f"cli_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    store.create_pipeline_run(run_id, {**run_args, "resume_run_id": resume_run_id})
+    store.append_pipeline_event(run_id, phase="cli", level="info", message="CLI run started.", payload=run_args)
+
+    def sink(phase: str, level: str, message: str, payload: dict | None = None) -> None:
+        store.append_pipeline_event(run_id, phase=phase, level=level, message=message, payload=payload)
+
+    try:
+        result = run_pipeline(
+            settings,
+            use_llm=bool(run_args["use_llm"]),
+            max_workers=run_args.get("max_workers"),
+            tail=run_args.get("tail"),
+            sample_bars=run_args.get("sample_bars"),
+            sample_mode=str(run_args.get("sample_mode") or "block"),
+            seed=int(run_args.get("seed") or 42),
+            archive_top=int(run_args["archive_top"]),
+            research_brief=run_args.get("research_brief"),
+            hypothesis_count=int(run_args["hypothesis_count"]),
+            iterations=int(run_args["iterations"]),
+            store=store,
+            event_sink=sink,
+            run_id=run_id,
+            resume_run_id=resume_run_id,
+        )
+    except Exception as exc:
+        store.append_pipeline_event(run_id, phase="cli", level="error", message=str(exc))
+        store.update_pipeline_run(run_id, "failed", error=str(exc))
+        raise
 
     if result.errors:
-        typer.echo(f"\n⚠  {len(result.errors)} error(s) during pipeline run (see above).")
+        store.update_pipeline_run(run_id, "failed", error=f"{len(result.errors)} pipeline error(s)")
+        typer.echo(f"\n⚠  {len(result.errors)} error(s) during pipeline run (see above). Run id: {run_id}")
         raise typer.Exit(code=1)
 
+    store.append_pipeline_event(run_id, phase="cli", level="info", message="CLI run completed.")
+    store.update_pipeline_run(run_id, "completed")
     typer.echo(f"\n✓ Pipeline complete in {result.elapsed_s:.0f}s. "
                f"{result.n_gatecheck_passed}/{len(result.gatechecks)} gatecheck passed. "
-               f"Top score: {result.top_candidates[0][2].score:.1f}" if result.top_candidates else "")
+               f"Run id: {run_id}. "
+               f"Top score: {result.top_candidates[0][2].score:.1f}" if result.top_candidates else f"\n✓ Pipeline complete. Run id: {run_id}.")
+
+
+@mine_app.command("verify-survivors")
+def mine_verify_survivors(
+    symbols: str | None = typer.Option(None, help="Comma-separated symbol override, e.g. BTCUSDT,ETHUSDT."),
+    universe: str | None = typer.Option(None, help="Universe preset, e.g. um_liquid_30."),
+    max_workers: int | None = typer.Option(None, "--workers", help="Number of parallel backtest workers."),
+    tail: int | None = typer.Option(None, "--tail", help="Use only last N rows of data."),
+    sample_bars: int | None = typer.Option(None, "--sample-bars", help="Use deterministic chronological block sample of N bars."),
+    sample_mode: str = typer.Option("block", "--sample-mode", help="Sampling mode. Only 'block' is supported."),
+    seed: int = typer.Option(42, "--seed", help="Deterministic seed for block sampling."),
+) -> None:
+    """Re-evaluate active Research Survivors without generating new candidates."""
+    from factor_mining.pipeline import verify_research_survivors
+
+    if tail is not None and sample_bars is not None:
+        raise typer.BadParameter("--tail and --sample-bars are mutually exclusive")
+    if sample_bars is not None and sample_mode != "block":
+        raise typer.BadParameter("--sample-mode must be 'block'")
+
+    settings = load_settings()
+    run_symbols = _resolve_cli_symbols(symbols, universe)
+    if run_symbols is not None:
+        settings = settings.model_copy(update={"data": settings.data.model_copy(update={"symbols": run_symbols})})
+    store = MetadataStore(settings.data.sqlite_path)
+    run_id = f"verify_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    args = {
+        "mode": "verify_survivors",
+        "symbols": run_symbols,
+        "max_workers": max_workers,
+        "tail": tail,
+        "sample_bars": sample_bars,
+        "sample_mode": sample_mode,
+        "seed": seed,
+    }
+    store.create_pipeline_run(run_id, args)
+    store.append_pipeline_event(run_id, phase="cli", level="info", message="Survivor verification started.", payload=args)
+
+    def sink(phase: str, level: str, message: str, payload: dict | None = None) -> None:
+        store.append_pipeline_event(run_id, phase=phase, level=level, message=message, payload=payload)
+
+    try:
+        result = verify_research_survivors(
+            settings,
+            store=store,
+            max_workers=max_workers,
+            tail=tail,
+            sample_bars=sample_bars,
+            sample_mode=sample_mode,
+            seed=seed,
+            event_sink=sink,
+            run_id=run_id,
+        )
+    except Exception as exc:
+        store.append_pipeline_event(run_id, phase="cli", level="error", message=str(exc))
+        store.update_pipeline_run(run_id, "failed", error=str(exc))
+        raise
+
+    store.append_pipeline_event(run_id, phase="cli", level="info", message="Survivor verification completed.")
+    store.update_pipeline_run(run_id, "completed")
+    typer.echo(
+        f"✓ Survivor verification complete. Run id: {run_id}. "
+        f"{len(result.backtests)} evaluated, {result.n_gatecheck_passed} production gate passed."
+    )
 
 
 @gate_app.command("run")
@@ -201,14 +327,10 @@ def worker_run() -> None:
 def llm_check() -> None:
     settings = load_settings()
     deepseek = provider_from_settings("deepseek", settings)
-    minimax = provider_from_settings("minimax", settings)
     typer.echo(f"DeepSeek: {'configured' if deepseek.is_configured else 'missing'} ({deepseek.api_key_env})")
     typer.echo(f"  base_url={settings.llm.deepseek.base_url}")
     typer.echo(f"  hypothesis_model={settings.llm.deepseek.hypothesis_model}")
     typer.echo(f"  hardscore_model={settings.llm.deepseek.hardscore_model}")
-    typer.echo(f"MiniMax: {'configured' if minimax.is_configured else 'missing'} ({minimax.api_key_env})")
-    typer.echo(f"  base_url={settings.llm.minimax.base_url}")
-    typer.echo(f"  optimizer_model={settings.llm.minimax.optimizer_model}")
 
 
 @app.command("ui")

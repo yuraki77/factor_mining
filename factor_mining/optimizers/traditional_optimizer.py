@@ -1,27 +1,16 @@
 """
-MiniMax LLM Strategy Optimizer.
+Deterministic strategy optimizer.
 
-MiniMax reads:
-  - Current factor pool and their metrics (IC, Sharpe, turnover, regime performance)
-  - Previous optimization iteration results
-  - GateCheck pass/fail details
-
-MiniMax outputs:
-  - New factor combination weights
-  - Adjusted hyperparameters
-  - Suggested new factor candidates to mine
-
-The loop:
-  mine → backtest → gatecheck → MiniMax optimize → mine (with new params) → ...
+The optimizer reads candidate diagnostics, Research Gate classifications, and
+near-miss repair hints, then produces bounded candidate mutations for the next
+round. It deliberately avoids model-generated tuning so optimization remains
+reproducible and auditable.
 """
 from __future__ import annotations
 
 import json
 
-import numpy as np
-
 from factor_mining.config import Settings
-from factor_mining.llm.providers import provider_from_settings
 from factor_mining.mining import normalize_family
 from factor_mining.models import BacktestResult, CandidateStrategySpec, GateCheckResult, NearMissAnalysis, ResearchGateResult
 from factor_mining.near_miss import repair_adjustments_from_near_misses
@@ -45,7 +34,7 @@ def build_optimization_context(
     research_gates: list[ResearchGateResult] | None = None,
     near_misses: list[NearMissAnalysis] | None = None,
 ) -> dict:
-    """Build the context object MiniMax needs to understand the current state."""
+    """Build the context object the optimizer needs to understand the current state."""
     factor_summaries = []
     research_gate_by_experiment = {
         gate.experiment_id: gate
@@ -153,160 +142,10 @@ def build_optimization_context(
         "previous_actions": previous_actions or [],
     }
 
-
-def minimax_optimize(
-    context: dict,
-    settings: Settings,
-    *,
-    mode: str = "combination",
-    temperature: float = 0.3,
-) -> dict:
-    """Call MiniMax to suggest factor combinations and hyperparameters.
-
-    Args:
-        context: Output from build_optimization_context().
-        settings: Factor mining settings (contains LLM config).
-        mode: "combination" (factor weights) or "hyperparameters" (param tuning)
-              or "full" (both).
-        temperature: LLM sampling temperature.
-
-    Returns:
-        dict with keys: action, reasoning, new_combinations, new_params, next_hypotheses.
-    """
-    provider = provider_from_settings("minimax", settings)
-    if not provider.is_configured:
-        return _fallback_optimization(context, mode)
-
-    system_prompt = (
-        "You are a quantitative finance optimizer specialized in BTC/ETH factor mining. "
-        "Given backtest results for candidate strategies, suggest improvements:\n"
-        "1. Factor combination weights (which factors to combine, with what weights)\n"
-        "2. Hyperparameter adjustments (lookback periods, thresholds, vol targeting)\n"
-        "3. New hypothesis directions (what to mine next)\n\n"
-        "Rules:\n"
-        "- Prefer sparse combinations (3-8 factors) over dense ones\n"
-        "- Penalize high turnover (>100% annual) unless Sharpe justifies it\n"
-        "- Short-biased strategies are DISABLED for funding_basis family\n"
-        "- GateCheck failures are final-strategy stops, not raw-factor discovery stops\n"
-        "- When no factor passes GateCheck, build combinations from research_survivors, not from all failed factors\n"
-        "- Every combination made from research_survivors must reduce turnover via smoothing, signal thresholds, or buffers\n"
-        "- Use near_misses and repair_adjustments to turn diagnosable failures into repaired candidates\n"
-        "- Prefer factors with IC stability (OOS/IS ratio > 0.5)\n"
-        "- Regime-conditional performance is a bonus when diversified; explicit regime filters are allowed\n"
-        "- Output valid JSON only."
-    )
-
-    context_json = json.dumps(context, default=str, indent=2)
-
-    if mode == "combination":
-        task = (
-            "Suggest new factor combinations. For each combination, provide weights (sum to 1), "
-            "target horizon, and rationale. Prioritize GateCheck-passing factors.\n\n"
-            f"Current state:\n{context_json}\n\n"
-            "Return JSON: {\"combinations\": [{\"factor_ids\": [...], \"weights\": [...], "
-            "\"horizon\": \"...\", \"rationale\": \"...\", \"expected_improvement\": \"...\"}]}"
-        )
-    elif mode == "hyperparameters":
-        task = (
-            "Suggest hyperparameter adjustments. For each adjustment, provide the parameter path, "
-            "current value, suggested value, and rationale.\n\n"
-            f"Current state:\n{context_json}\n\n"
-            "Return JSON: {\"adjustments\": [{\"candidate_id\": \"...\", \"param\": \"...\", "
-            "\"current\": ..., \"suggested\": ..., \"rationale\": \"...\"}]}"
-        )
-    elif mode == "exit_params":
-        task = _exit_optimization_task(context_json)
-    else:  # full — signal-side: combinations, signal-param adjustments, next hypotheses
-        task = (
-            "Suggest factor combinations, signal-side parameter adjustments, and new hypothesis "
-            "directions. Do NOT suggest exit parameter changes here — exit optimization runs "
-            "in a separate pass.\n\n"
-            f"Current state:\n{context_json}\n\n"
-            "Return JSON: {\"combinations\": [...], \"adjustments\": [...], "
-            "\"next_hypotheses\": [{\"family\": \"...\", \"mechanism\": \"...\", \"expected_ic\": ...}]}"
-        )
-
-    try:
-        response = provider.chat_json(
-            model=settings.llm.minimax.optimizer_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": task},
-            ],
-        )
-        content = response.get("choices", [{}])[0].get("message", {}).get("content")
-        if isinstance(content, dict):
-            return content
-        if isinstance(content, str):
-            return _extract_json(content)
-        return {"combinations": []}
-    except Exception as exc:
-        print(f"[MiniMax] Optimization failed: {exc}, using fallback")
-        return _fallback_optimization(context, mode)
-
-
-def _extract_json(content: str) -> dict:
-    """Extract valid JSON from LLM output with multiple fallback strategies."""
-    import re
-
-    # Strategy 1: direct parse (cleanest case)
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        pass
-
-    # Strategy 2: strip markdown fences and re-parse
-    cleaned = re.sub(r"```(?:json)?\s*", "", content)
-    cleaned = re.sub(r"```\s*$", "", cleaned).strip()
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
-
-    # Strategy 3: find the first { ... } or [ ... ] block
-    for pattern in [r"\{.*\}", r"\[.*\]"]:
-        match = re.search(pattern, cleaned, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(0))
-            except json.JSONDecodeError:
-                continue
-
-    # Strategy 4: try to fix common JSON issues (trailing commas, unquoted keys)
-    try:
-        fixed = re.sub(r",\s*}", "}", cleaned)
-        fixed = re.sub(r",\s*\]", "]", fixed)
-        return json.loads(fixed)
-    except json.JSONDecodeError:
-        pass
-
-    raise ValueError(f"Unable to extract valid JSON from MiniMax response: {content[:200]}...")
-
-
-def _exit_optimization_task(context_json: str) -> str:
-    return (
-        "Optimise EXIT parameters (stop-loss, take-profit tiers, trailing stop, max-hold) "
-        "for each candidate. Use the 'exit' and 'exit_indicators' fields in each factor "
-        "to decide.\n\n"
-        "Guidance:\n"
-        "- High max_dd → consider tighter stop_loss_pct or add trailing_stop_pct\n"
-        "- High gross/net Sharpe gap (cost_drag_sharpe > 0.5) → add tp_tiers to lock profits before costs erode\n"
-        "- Very low turnover or very high avg_holding_bars → add max_hold_bars to force re-entry\n"
-        "- Low trade_count → loosen stop_loss_pct or remove max_hold_bars to give the strategy more room\n"
-        "- Regime-concentrated strategies may benefit from tighter trailing stops\n\n"
-        f"Current state:\n{context_json}\n\n"
-        "Return JSON: {\"exit_adjustments\": [{\"candidate_id\": \"...\", "
-        "\"stop_loss_pct\": -0.03, \"tp_tiers\": [[0.02, 0.50]], "
-        "\"trailing_stop_pct\": 0.02, \"max_hold_bars\": 500, "
-        "\"trailing_after_first_tp\": true, \"rationale\": \"...\"}]}\n\n"
-        "Only include fields that should change. Omitted fields keep their current value."
-    )
-
-
-def _fallback_optimization(context: dict, mode: str) -> dict:
-    """Deterministic fallback when MiniMax is unavailable."""
+def optimize_traditionally(context: dict, mode: str = "full") -> dict:
+    """Produce deterministic, bounded optimizer suggestions."""
     if mode == "exit_params":
-        return {"exit_adjustments": []}
+        return optimize_exits_traditionally(context)
     passed = [f for f in context["factors"] if f["gatecheck_passed"]]
     survivors = context.get("research_survivors") or []
     failed = [f for f in context["factors"] if not f["gatecheck_passed"]]
@@ -316,14 +155,15 @@ def _fallback_optimization(context: dict, mode: str) -> dict:
         # so the next round can optimize costs/combination instead of stopping.
         passed = survivors or _select_research_survivors(failed, limit=3)
 
-    factor_ids = [f["candidate_id"] for f in passed[:8]]
+    selected = passed[:8]
+    factor_ids = [f["candidate_id"] for f in selected]
     n = len(factor_ids)
-    weights = [1.0 / n] * n if n > 0 else []
+    weights = _traditional_weights(selected)
     source = "GateCheck-passing factors" if context.get("num_gatecheck_passed", 0) else "research survivors"
 
     result = {
-        "action": "fallback_survivor_low_turnover_combo",
-        "reasoning": f"MiniMax unavailable. Equal-weighting {n} {source} with conservative turnover controls.",
+        "action": "traditional_survivor_low_turnover_combo",
+        "reasoning": f"Deterministic optimizer selected {n} {source} with conservative turnover controls.",
         "combinations": [{
             "factor_ids": factor_ids,
             "weights": weights,
@@ -365,6 +205,65 @@ def _fallback_optimization(context: dict, mode: str) -> dict:
         })
 
     return result
+
+
+def optimize_exits_traditionally(context: dict, *, limit: int = 3) -> dict:
+    """Suggest a small bounded exit grid from observed risk diagnostics."""
+    selected = context.get("research_survivors") or [f for f in context["factors"] if f["gatecheck_passed"]]
+    adjustments: list[dict] = []
+    for factor in selected[:limit]:
+        adjustment = _traditional_exit_adjustment(factor)
+        if adjustment:
+            adjustments.append(adjustment)
+    return {
+        "action": "traditional_exit_grid",
+        "reasoning": "Deterministic bounded exit adjustments from drawdown, holding-period, and cost-drag diagnostics.",
+        "exit_adjustments": adjustments,
+    }
+
+
+def _traditional_weights(factors: list[dict]) -> list[float]:
+    if not factors:
+        return []
+    raw: list[float] = []
+    for factor in factors:
+        ic_strength = max(abs(factor.get("ic_tstat") or 0.0), abs(factor.get("rankic_tstat") or 0.0))
+        evidence = max(0.25, min(4.0, ic_strength or factor.get("research_score") or factor.get("gross_sharpe") or 1.0))
+        turnover = factor.get("factor_turnover")
+        turnover_penalty = 1.0 / max(0.02, min(float(turnover) if turnover is not None else 0.10, 1.0))
+        raw.append(evidence * turnover_penalty)
+    total = sum(raw)
+    if total <= 0:
+        return [1.0 / len(factors)] * len(factors)
+    return [value / total for value in raw]
+
+
+def _traditional_exit_adjustment(factor: dict) -> dict | None:
+    cid = factor.get("candidate_id")
+    if not cid:
+        return None
+    adjustment: dict[str, object] = {"candidate_id": cid}
+    reasons: list[str] = []
+    max_dd = float(factor.get("max_dd") or 0.0)
+    avg_holding = factor.get("avg_holding_bars")
+    cost_drag = factor.get("cost_drag_sharpe")
+    trade_count = int(factor.get("trade_count") or 0)
+
+    if max_dd <= -0.12:
+        adjustment["stop_loss_pct"] = -0.03
+        adjustment["trailing_stop_pct"] = 0.02
+        reasons.append("drawdown_control")
+    if avg_holding is not None and float(avg_holding) > 500:
+        adjustment["max_hold_bars"] = 500
+        reasons.append("bounded_holding_period")
+    if cost_drag is not None and float(cost_drag) > 0.5 and trade_count >= 50:
+        adjustment["tp_tiers"] = [[0.02, 0.50]]
+        adjustment["trailing_after_first_tp"] = True
+        reasons.append("cost_drag_profit_lock")
+    if len(adjustment) == 1:
+        return None
+    adjustment["rationale"] = ",".join(reasons)
+    return adjustment
 
 
 def _select_research_survivors(factors: list[dict], *, limit: int = 8) -> list[dict]:
@@ -466,7 +365,7 @@ def apply_optimization_result(
     candidates: list[CandidateStrategySpec],
     results: list[BacktestResult],
 ) -> tuple[list[CandidateStrategySpec], dict]:
-    """Apply MiniMax's suggestions to create new candidate specs.
+    """Apply deterministic optimizer suggestions to create new candidate specs.
 
     Returns (new_candidates, optimization_summary).
     """
@@ -505,6 +404,7 @@ def apply_optimization_result(
                 symbol=base_candidate.symbol if base_candidate else "BTCUSDT",
                 market=base_candidate.market if base_candidate else "um_futures",
                 interval=base_candidate.interval if base_candidate else "5m",
+                candidate_type="composite",
                 params={
                     "factor_ids": factor_ids,
                     "weights": weights,
@@ -512,7 +412,7 @@ def apply_optimization_result(
                     "horizon": combo.get("horizon", "5m"),
                     "rationale": combo.get("rationale", ""),
                     "search_variant": "survivor_combo_low_turnover",
-                    "generated_by": "minimax_survivor_composite",
+                    "generated_by": "traditional_survivor_composite",
                     "turnover_objective": "reduce_churn_before_final_gate",
                     **turnover_controls,
                 },
@@ -521,6 +421,7 @@ def apply_optimization_result(
 
     # Apply parameter adjustments to spawn new candidates
     import uuid
+    repair_signatures: set[tuple[str, str]] = set()
     for adj in optimization.get("adjustments", []):
         cid, param_name, suggested = _normalized_adjustment(adj)
         for c in candidates:
@@ -530,18 +431,26 @@ def apply_optimization_result(
                 elif param_name == "turnover_controls" and isinstance(suggested, dict):
                     new_c = c.model_copy(deep=True)
                     new_c.candidate_id = f"c_adj_{uuid.uuid4().hex[:12]}"
+                    new_c.candidate_type = "optimizer"
+                    new_c.parent_candidate_id = cid
                     for key in ("smooth_span", "signal_threshold", "position_buffer"):
                         if key in suggested:
                             new_c.params[key] = suggested[key]
                     new_c.params["parent_id"] = cid
                     new_c.params["rationale"] = adj.get("rationale", "")
                     new_c.params["search_variant"] = "survivor_low_turnover"
-                    new_c.params["generated_by"] = "minimax_survivor_adjustment"
+                    new_c.params["generated_by"] = "traditional_survivor_adjustment"
                     new_candidates.append(new_c)
                     summary["adjustments_applied"] += 1
                 elif param_name == "repair_params" and isinstance(suggested, dict):
+                    signature = (cid, _params_signature(suggested))
+                    if signature in repair_signatures:
+                        continue
+                    repair_signatures.add(signature)
                     new_c = c.model_copy(deep=True)
                     new_c.candidate_id = f"c_rep_{uuid.uuid4().hex[:12]}"
+                    new_c.candidate_type = "repair"
+                    new_c.parent_candidate_id = cid
                     reason = suggested.get("near_miss_reason") or "optimizer_repair"
                     repair_meta = {
                         "parent_id": cid,
@@ -559,6 +468,8 @@ def apply_optimization_result(
                     # Spawn a new candidate with the tweaked parameter
                     new_c = c.model_copy(deep=True)
                     new_c.candidate_id = f"c_adj_{uuid.uuid4().hex[:12]}"
+                    new_c.candidate_type = "optimizer"
+                    new_c.parent_candidate_id = cid
                     new_c.params[param_name] = suggested
                     new_c.params["parent_id"] = cid
                     new_c.params["rationale"] = adj.get("rationale", "")
@@ -576,12 +487,13 @@ def apply_optimization_result(
         for lookback in _NEXT_HYPOTHESIS_LOOKBACKS.get(canonical, [12]):
             new_candidates.append(CandidateStrategySpec(
                 candidate_id=f"c_hyp_{uuid.uuid4().hex[:12]}",
-                hypothesis_id=f"h_minimax_{uuid.uuid4().hex[:8]}",
+                hypothesis_id=f"h_traditional_{uuid.uuid4().hex[:8]}",
                 method_id="factor_scoring",
                 hypothesis_family=canonical,
                 symbol=base_candidate.symbol,
                 market=base_candidate.market,
                 interval=base_candidate.interval,
+                candidate_type="optimizer",
                 params={
                     "signal_source": "factor_signal",
                     "factor_family": canonical,
@@ -590,7 +502,7 @@ def apply_optimization_result(
                     "expected_ic_mid": expected_ic,
                     "source_family": raw_family,
                     "mechanism": hypothesis.get("mechanism", ""),
-                    "generated_by": "minimax_next_hypothesis",
+                    "generated_by": "traditional_next_hypothesis",
                 },
             ))
 
@@ -604,9 +516,9 @@ def apply_exit_adjustments(
     candidates: list[CandidateStrategySpec],
     settings: Settings,
 ) -> list[CandidateStrategySpec]:
-    """Apply exit parameter adjustments from MiniMax onto existing candidates.
+    """Apply bounded exit parameter adjustments onto existing candidates.
 
-    Deduplicates by (parent_id, exit_params) signature so MiniMax cannot
+    Deduplicates by (parent_id, exit_params) signature so the optimizer cannot
     inflate the candidate pool with near-identical exit variants.
     """
     import uuid as _uuid
@@ -636,9 +548,11 @@ def apply_exit_adjustments(
         seen.add(sig)
         new_c = target.model_copy(deep=True)
         new_c.candidate_id = f"c_exit_{_uuid.uuid4().hex[:12]}"
+        new_c.candidate_type = "optimizer"
+        new_c.parent_candidate_id = cid
         new_c.params.update(clamped)
         new_c.params["parent_id"] = cid
-        new_c.params["generated_by"] = "minimax_exit_adjustment"
+        new_c.params["generated_by"] = "traditional_exit_adjustment"
         new_c.params["exit_rationale"] = adj.get("rationale", "")
         new_candidates.append(new_c)
     return new_candidates
@@ -713,9 +627,13 @@ def _normalized_adjustment(adj: dict) -> tuple[str | None, str | None, object | 
     if isinstance(suggested, dict):
         return cid, "repair_params", {
             **suggested,
-            "optimizer_repair_source": "llm_adjustment",
+            "optimizer_repair_source": "traditional_adjustment",
         }
     return cid, None, None
+
+
+def _params_signature(params: dict) -> str:
+    return json.dumps(params, sort_keys=True, default=str, separators=(",", ":"))
 
 
 def _parse_param_assignment(value: str) -> tuple[str, object] | None:
@@ -840,7 +758,6 @@ def optimization_loop(
     settings: Settings,
     *,
     max_iterations: int = 5,
-    use_llm: bool = True,
 ) -> list[dict]:
     """Run the full optimization loop.
 
@@ -851,7 +768,7 @@ def optimization_loop(
     history = []
     for i in range(max_iterations):
         context = build_optimization_context(candidates, results, gatechecks, i, history)
-        opt_result = minimax_optimize(context, settings, mode="full") if use_llm else _fallback_optimization(context, "full")
+        opt_result = optimize_traditionally(context, mode="full")
         new_candidates, summary = apply_optimization_result(opt_result, candidates, results)
 
         history.append({

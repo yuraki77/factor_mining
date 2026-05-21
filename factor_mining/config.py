@@ -116,15 +116,8 @@ class DeepSeekConfig(BaseModel):
     hardscore_model: str = "deepseek-chat"
 
 
-class MiniMaxConfig(BaseModel):
-    base_url: str = "https://api.minimaxi.com/v1"
-    api_key_env: str = "MINIMAX_API_KEY"
-    optimizer_model: str = "MiniMax-M2.7"
-
-
 class LLMConfig(BaseModel):
     deepseek: DeepSeekConfig = Field(default_factory=DeepSeekConfig)
-    minimax: MiniMaxConfig = Field(default_factory=MiniMaxConfig)
 
 
 class GateCheckConfig(BaseModel):

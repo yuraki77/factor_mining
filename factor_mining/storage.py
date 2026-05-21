@@ -214,6 +214,14 @@ class MetadataStore:
             ).fetchone()
         return None if row is None else str(row["status"])
 
+    def pipeline_run(self, run_id: str) -> dict[str, Any] | None:
+        with closing(self.connect()) as conn:
+            row = conn.execute(
+                "select * from pipeline_runs where run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return _run_row_to_dict(row)
+
     def request_pipeline_stop(self, run_id: str) -> None:
         self.update_pipeline_run(run_id, "stopping")
 

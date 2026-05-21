@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Literal
+from typing import Any
 
 import httpx
 
@@ -12,7 +12,7 @@ class OpenAICompatibleProvider:
     def __init__(
         self,
         *,
-        provider: Literal["deepseek", "minimax"],
+        provider: str,
         api_key: str | None = None,
         base_url: str | None = None,
         api_key_env: str | None = None,
@@ -20,7 +20,7 @@ class OpenAICompatibleProvider:
         self.provider = provider
         self.api_key_env = api_key_env or self._default_env_key(provider)
         self.api_key = api_key or os.getenv(self.api_key_env)
-        self.base_url = base_url or ("https://api.deepseek.com" if provider == "deepseek" else "https://api.minimaxi.com/v1")
+        self.base_url = base_url or "https://api.deepseek.com"
 
     def chat_json(self, *, model: str, messages: list[dict[str, str]], schema_hint: dict[str, Any] | None = None) -> dict[str, Any]:
         if not self.api_key:
@@ -43,20 +43,17 @@ class OpenAICompatibleProvider:
 
     @staticmethod
     def _default_env_key(provider: str) -> str:
-        if provider == "deepseek":
-            return "DEEPSEEK_API_KEY"
-        return "MINIMAX_API_KEY"
+        return "DEEPSEEK_API_KEY"
 
     @property
     def is_configured(self) -> bool:
         return bool(self.api_key)
 
 
-def provider_from_settings(provider: Literal["deepseek", "minimax"], settings: Settings) -> OpenAICompatibleProvider:
-    if provider == "deepseek":
-        cfg = settings.llm.deepseek
-    else:
-        cfg = settings.llm.minimax
+def provider_from_settings(provider: str, settings: Settings) -> OpenAICompatibleProvider:
+    if provider != "deepseek":
+        raise ValueError(f"Unsupported LLM provider: {provider}")
+    cfg = settings.llm.deepseek
     return OpenAICompatibleProvider(provider=provider, base_url=cfg.base_url, api_key_env=cfg.api_key_env)
 
 

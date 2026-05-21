@@ -1,5 +1,5 @@
 """
-Full pipeline: DeepSeek hypothesis → backtest → gatecheck → MiniMax optimize.
+Full pipeline: DeepSeek/default hypothesis → backtest → gatecheck → traditional optimize.
 
 Uses existing btc_5m_5y.parquet from parent project, adapted to factor_mining format.
 """
@@ -26,9 +26,8 @@ from factor_mining.factors.returns import forward_returns
 from factor_mining.backtest.engine import run_backtest
 from factor_mining.validation.gatecheck import run_gatecheck
 from factor_mining.hardscore import hardscore
-from factor_mining.optimizers.minimax_optimizer import (
-    build_optimization_context, minimax_optimize,
-    apply_optimization_result, _fallback_optimization,
+from factor_mining.optimizers.traditional_optimizer import (
+    build_optimization_context, optimize_traditionally,
 )
 from factor_mining.hypotheses.discovered import boundary_conditions, should_continue_mining
 
@@ -87,7 +86,7 @@ def main():
     settings = load_settings()
     store = MetadataStore(settings.data.sqlite_path)
     print("=" * 70)
-    print("FULL PIPELINE: DeepSeek → Backtest → GateCheck → HardScore → MiniMax")
+    print("FULL PIPELINE: DeepSeek → Backtest → GateCheck → HardScore → Traditional Optimizer")
     print("=" * 70)
 
     # ═══════════════════════════════════════════════════════
@@ -253,9 +252,9 @@ def main():
         print(f"  Top score: {top_scored[0].score:.1f}")
 
     # ═══════════════════════════════════════════════════════
-    # STEP 6: MiniMax Optimization
+    # STEP 6: Traditional Optimization
     # ═══════════════════════════════════════════════════════
-    print(f"\n[6/6] MiniMax optimization...")
+    print(f"\n[6/6] Traditional optimization...")
 
     # Filter to valid candidates/results/gatechecks
     valid_triples = [(c, r, g) for c, r, g in zip(candidates, results, gatechecks)]
@@ -265,19 +264,8 @@ def main():
     ctx = build_optimization_context(c_list, r_list, g_list, iteration=0)
     print(f"  Context: {ctx['num_candidates']} candidates, {ctx['num_gatecheck_passed']} passed")
 
-    # Skip MiniMax API when nothing passed gatecheck
-    if passed == 0:
-        print("  No GateCheck passes — skipping MiniMax API, using fallback.")
-        opt = _fallback_optimization(ctx, "full")
-        print(f"  Fallback: {opt['action']}")
-    else:
-        try:
-            opt = minimax_optimize(ctx, settings, mode="full")
-            print(f"  MiniMax action: {opt.get('action', 'llm')}")
-        except Exception as e:
-            print(f"  MiniMax failed: {e}, using fallback")
-            opt = _fallback_optimization(ctx, "full")
-            print(f"  Fallback: {opt['action']}")
+    opt = optimize_traditionally(ctx, "full")
+    print(f"  Optimizer action: {opt['action']}")
 
     # Show combinations
     for combo in opt.get("combinations", [])[:3]:
@@ -300,7 +288,7 @@ def main():
     print(f"  Backtests:     {len(results)}")
     print(f"  GateCheck OK:  {passed}/{len(gatechecks)}")
     print(f"  HardScore >0:  {sum(1 for s in scores if s.score > 0)}")
-    print(f"  MiniMax combos:{len(opt.get('combinations', []))}")
+    print(f"  Optimizer combos:{len(opt.get('combinations', []))}")
     print(f"  New hypotheses:{len(opt.get('next_hypotheses', []))}")
 
 

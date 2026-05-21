@@ -319,6 +319,7 @@ def _start_dashboard_run(settings: Settings, args: dict[str, Any]) -> tuple[bool
                 iterations=args["iterations"],
                 store=worker_store,
                 event_sink=sink,
+                run_id=run_id,
                 stop_event=stop_event,
             )
             if worker_store.pipeline_run_status(run_id) == "stopping":
@@ -396,6 +397,7 @@ def _start_hosted_run(settings: Settings, args: dict[str, Any]) -> tuple[bool, s
                     iterations=args["iterations"],
                     store=worker_store,
                     event_sink=sink,
+                    run_id=run_id,
                 )
                 if worker_store.pipeline_run_status(run_id) == "stopping":
                     worker_store.append_pipeline_event(

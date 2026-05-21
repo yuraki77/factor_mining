@@ -9,7 +9,7 @@ The project is intentionally conservative: rigorous validation is prioritized ov
 ```bash
 uv sync --extra dev --no-editable
 cp .env.example .env
-# Fill DEEPSEEK_API_KEY and MINIMAX_API_KEY in .env.
+# Fill DEEPSEEK_API_KEY in .env if you want LLM-generated hypotheses.
 uv run --no-editable fm llm check
 uv run --no-editable fm --help
 uv run --no-editable fm ui
@@ -33,7 +33,6 @@ Then edit `.env`:
 
 ```bash
 DEEPSEEK_API_KEY=...
-MINIMAX_API_KEY=...
 ```
 
 Model names and base URLs live in `configs/default.yaml` under `llm`.
