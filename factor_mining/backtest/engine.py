@@ -360,7 +360,7 @@ def evaluate_strategy_path(
     known_open_returns = frame["open"].pct_change().shift(1)
     realized_vol = known_open_returns.rolling(vol_window, min_periods=10).std() * np.sqrt(periods)
     leverage = (settings.position_sizing.target_annual_vol / realized_vol.replace(0, np.nan)).clip(
-        upper=settings.position_sizing.max_leverage
+        upper=settings.position_sizing.max_leverage_for(candidate.symbol)
     ).fillna(0.0)
     raw_vol_target = (executable_signal * leverage).fillna(0.0)
     position_buffer = _position_buffer_threshold(candidate)

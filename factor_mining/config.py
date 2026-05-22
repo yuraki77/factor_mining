@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Literal
 
@@ -79,7 +80,16 @@ class PositionSizingConfig(BaseModel):
     target_annual_vol: float = 0.15
     vol_window_days: int = 30
     max_leverage: float = 3.0
+    symbol_max_leverage: dict[str, float] = Field(default_factory=dict)
     fixed_notional_usd: float = 10_000.0
+
+    def max_leverage_for(self, symbol: str) -> float:
+        overrides = {str(key).upper(): float(value) for key, value in self.symbol_max_leverage.items()}
+        for key in _symbol_lookup_keys(symbol):
+            if key in overrides:
+                value = overrides[key]
+                return max(0.0, value) if math.isfinite(value) else self.max_leverage
+        return self.max_leverage
 
 
 class ExitConfig(BaseModel):
@@ -169,6 +179,45 @@ class Settings(BaseModel):
     exit_bounds: ExitBoundsConfig = Field(default_factory=ExitBoundsConfig)
 
 
+def apply_trade_overrides(
+    settings: Settings,
+    *,
+    btc_leverage: float | None = None,
+    eth_leverage: float | None = None,
+    taker_bps: float | None = None,
+    slippage_base_bps: float | None = None,
+    slippage_k: float | None = None,
+    slippage_gamma: float | None = None,
+) -> Settings:
+    """Return a settings copy with run-scoped leverage and execution-cost overrides."""
+    leverage = dict(settings.position_sizing.symbol_max_leverage)
+    if btc_leverage is not None:
+        leverage["BTCUSDT"] = _nonnegative_float(btc_leverage, "btc_leverage")
+    if eth_leverage is not None:
+        leverage["ETHUSDT"] = _nonnegative_float(eth_leverage, "eth_leverage")
+
+    position_updates = {}
+    if leverage != settings.position_sizing.symbol_max_leverage:
+        position_updates["symbol_max_leverage"] = leverage
+
+    cost_updates = {}
+    for key, value in {
+        "taker_bps": taker_bps,
+        "slippage_base_bps": slippage_base_bps,
+        "slippage_k": slippage_k,
+        "slippage_gamma": slippage_gamma,
+    }.items():
+        if value is not None:
+            cost_updates[key] = _nonnegative_float(value, key)
+
+    updates = {}
+    if position_updates:
+        updates["position_sizing"] = settings.position_sizing.model_copy(update=position_updates)
+    if cost_updates:
+        updates["costs"] = settings.costs.model_copy(update=cost_updates)
+    return settings.model_copy(update=updates) if updates else settings
+
+
 def load_settings(path: Path | None = None) -> Settings:
     load_dotenv(Path(".env"))
     if path is None:
@@ -193,3 +242,26 @@ def load_dotenv(path: Path) -> None:
         key = key.strip()
         value = value.strip().strip('"').strip("'")
         os.environ.setdefault(key, value)
+
+
+def _symbol_lookup_keys(symbol: str) -> list[str]:
+    normalized = str(symbol or "").upper().replace("/", "").replace("-", "")
+    keys = [normalized]
+    matched_suffix = False
+    for suffix in ("USDT", "USD", "BUSD"):
+        if normalized.endswith(suffix) and normalized != suffix:
+            base = normalized[: -len(suffix)]
+            if base:
+                keys.append(base)
+            matched_suffix = True
+            break
+    if normalized and not matched_suffix:
+        keys.extend([f"{normalized}USDT", f"{normalized}USD"])
+    return keys
+
+
+def _nonnegative_float(value: float, name: str) -> float:
+    number = float(value)
+    if not math.isfinite(number) or number < 0.0:
+        raise ValueError(f"{name} must be a non-negative finite number")
+    return number

@@ -15,7 +15,14 @@ const app = {
     tail: 50000,
     archive_top: 3,
     research_brief: "",
+    btc_leverage: 3,
+    eth_leverage: 3,
+    taker_bps: 5,
+    slippage_base_bps: 1,
+    slippage_k: 25,
+    slippage_gamma: 0.5,
   },
+  runArgsInitialized: false,
   toast: "",
   archives: null,
 };
@@ -121,14 +128,39 @@ async function getJson(url, options) {
 async function loadState() {
   try {
     app.data = await getJson("/api/state");
-    if (app.data.active_run && app.data.active_run.args) {
-      Object.assign(app.runArgs, app.data.active_run.args);
-    }
+    syncRunArgsFromState();
     loadArchives();
     render();
   } catch (error) {
     document.getElementById("app").innerHTML = `<div class="boot">Dashboard error: ${esc(error.message)}</div>`;
   }
+}
+
+function syncRunArgsFromState() {
+  if (app.data.active_run && app.data.active_run.args) {
+    Object.assign(app.runArgs, app.data.active_run.args);
+    app.runArgsInitialized = true;
+    return;
+  }
+  if (app.runArgsInitialized) return;
+  const sizing = (app.data.settings && app.data.settings.position_sizing) || {};
+  const symbolLeverage = sizing.symbol_max_leverage || {};
+  const costs = (app.data.settings && app.data.settings.costs) || {};
+  const globalLeverage = numberOr(sizing.max_leverage, 3);
+  Object.assign(app.runArgs, {
+    btc_leverage: numberOr(symbolLeverage.BTCUSDT, globalLeverage),
+    eth_leverage: numberOr(symbolLeverage.ETHUSDT, globalLeverage),
+    taker_bps: numberOr(costs.taker_bps, 5),
+    slippage_base_bps: numberOr(costs.slippage_base_bps, 1),
+    slippage_k: numberOr(costs.slippage_k, 25),
+    slippage_gamma: numberOr(costs.slippage_gamma, 0.5),
+  });
+  app.runArgsInitialized = true;
+}
+
+function numberOr(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
 }
 
 function setToast(message) {
@@ -292,6 +324,19 @@ function renderRail() {
               ${field("Archive top", "archive_top", "number", 0, 10, active)}
             </div>
             ${field("Tail bars", "tail", "number", 0, 2000000, active)}
+            <div class="field-row">
+              ${field("BTC lev", "btc_leverage", "number", 0, null, active, "0.1")}
+              ${field("ETH lev", "eth_leverage", "number", 0, null, active, "0.1")}
+            </div>
+            <div class="field-row">
+              ${field("Taker bps", "taker_bps", "number", 0, null, active, "0.1")}
+              ${field("Slip base", "slippage_base_bps", "number", 0, null, active, "0.1")}
+            </div>
+            <div class="field-row">
+              ${field("Slip k", "slippage_k", "number", 0, null, active, "0.1")}
+              ${field("Slip gamma", "slippage_gamma", "number", 0, null, active, "0.05")}
+            </div>
+            <div class="muted" style="font-size:10.5px;line-height:1.35">Run-scoped execution assumptions: taker fee plus participation-based slippage.</div>
             <div class="field">
               <label>Research brief</label>
               <textarea data-run-field="research_brief" ${active ? "disabled" : ""}>${esc(app.runArgs.research_brief)}</textarea>
@@ -339,11 +384,15 @@ function pipelineStep(label, value, iconName) {
   `;
 }
 
-function field(label, key, type, min, max, disabled) {
+function field(label, key, type, min, max, disabled, step = null) {
+  const minAttr = min == null ? "" : ` min="${esc(min)}"`;
+  const maxAttr = max == null ? "" : ` max="${esc(max)}"`;
+  const stepAttr = step == null ? "" : ` step="${esc(step)}"`;
+  const value = app.runArgs[key] == null ? "" : app.runArgs[key];
   return `
     <div class="field">
       <label>${esc(label)}</label>
-      <input data-run-field="${esc(key)}" type="${type}" min="${min}" max="${max}" value="${esc(app.runArgs[key])}" ${disabled ? "disabled" : ""}>
+      <input data-run-field="${esc(key)}" type="${type}"${minAttr}${maxAttr}${stepAttr} value="${esc(value)}" ${disabled ? "disabled" : ""}>
     </div>
   `;
 }
@@ -1605,7 +1654,7 @@ function updateRunField(field) {
   if (field.type === "checkbox") {
     app.runArgs[key] = field.checked;
   } else if (field.type === "number") {
-    app.runArgs[key] = Number(field.value || 0);
+    app.runArgs[key] = field.value === "" ? null : Number(field.value);
   } else {
     app.runArgs[key] = field.value;
   }

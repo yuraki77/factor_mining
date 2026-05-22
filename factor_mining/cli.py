@@ -7,7 +7,7 @@ import uuid
 import typer
 
 from factor_mining.archive import reproduce_archive
-from factor_mining.config import load_settings
+from factor_mining.config import Settings, apply_trade_overrides, load_settings
 from factor_mining.data.binance import BinanceArchiveClient
 from factor_mining.data.universe import resolve_universe
 from factor_mining.llm.providers import provider_from_settings
@@ -85,6 +85,12 @@ def mine_run(
     resume: str | None = typer.Option(None, "--resume", help="Resume from checkpoints saved under a previous run id."),
     archive_top: int = typer.Option(3, "--archive", help="Number of top experiments to archive."),
     iterations: int = typer.Option(1, "--iterations", help="Max mining rounds (1=single pass, >1=iterative traditional optimization)."),
+    btc_leverage: float | None = typer.Option(None, "--btc-leverage", help="Run-scoped BTCUSDT max leverage override."),
+    eth_leverage: float | None = typer.Option(None, "--eth-leverage", help="Run-scoped ETHUSDT max leverage override."),
+    taker_bps: float | None = typer.Option(None, "--taker-bps", help="Run-scoped taker fee assumption, in bps."),
+    slippage_base_bps: float | None = typer.Option(None, "--slippage-base-bps", help="Run-scoped base slippage assumption, in bps."),
+    slippage_k: float | None = typer.Option(None, "--slippage-k", help="Run-scoped participation slippage coefficient."),
+    slippage_gamma: float | None = typer.Option(None, "--slippage-gamma", help="Run-scoped participation slippage exponent."),
 ) -> None:
     """Run the full factor mining pipeline: hypotheses → backtest → gatecheck → hardscore → optimize.
 
@@ -115,6 +121,12 @@ def mine_run(
         "seed": seed,
         "archive_top": archive_top,
         "iterations": iterations,
+        "btc_leverage": btc_leverage,
+        "eth_leverage": eth_leverage,
+        "taker_bps": taker_bps,
+        "slippage_base_bps": slippage_base_bps,
+        "slippage_k": slippage_k,
+        "slippage_gamma": slippage_gamma,
         "mode": "cli",
     }
     resume_run_id = resume
@@ -129,10 +141,13 @@ def mine_run(
             for key in (
                 "use_llm", "hypothesis_count", "research_brief", "symbols", "max_workers",
                 "tail", "sample_bars", "sample_mode", "seed", "archive_top", "iterations",
+                "btc_leverage", "eth_leverage", "taker_bps",
+                "slippage_base_bps", "slippage_k", "slippage_gamma",
             )
         })
         if run_args.get("symbols") is not None:
             settings = settings.model_copy(update={"data": settings.data.model_copy(update={"symbols": list(run_args["symbols"])})})
+    settings = _apply_cli_trade_overrides(settings, run_args)
 
     run_id = f"cli_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     store.create_pipeline_run(run_id, {**run_args, "resume_run_id": resume_run_id})
@@ -374,6 +389,21 @@ def _parse_csv(value: str | None) -> list[str] | None:
     if value is None:
         return None
     return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _apply_cli_trade_overrides(settings: Settings, run_args: dict) -> Settings:
+    try:
+        return apply_trade_overrides(
+            settings,
+            btc_leverage=run_args.get("btc_leverage"),
+            eth_leverage=run_args.get("eth_leverage"),
+            taker_bps=run_args.get("taker_bps"),
+            slippage_base_bps=run_args.get("slippage_base_bps"),
+            slippage_k=run_args.get("slippage_k"),
+            slippage_gamma=run_args.get("slippage_gamma"),
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
 if __name__ == "__main__":
