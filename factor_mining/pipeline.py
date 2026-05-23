@@ -125,6 +125,80 @@ class RepairMergePlan:
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
 
 
+@dataclass
+class SignalBuildContext:
+    frame: pd.DataFrame
+    features_df: pd.DataFrame
+    feature_meta: dict
+    forward_regimes: pd.Series
+    funding_rate: pd.Series | None
+    factor_signal_cache: dict[tuple[str, int], pd.Series] = field(default_factory=dict)
+    feature_transform_cache: dict[str, pd.Series] = field(default_factory=dict)
+    filter_mask_cache: dict[tuple[str, tuple[str, ...]], np.ndarray] = field(default_factory=dict)
+    candidate_signal_cache: dict[str, np.ndarray] = field(default_factory=dict)
+    cache_hits: Counter[str] = field(default_factory=Counter)
+    cache_misses: Counter[str] = field(default_factory=Counter)
+    _lock: threading.RLock = field(default_factory=threading.RLock)
+    _in_flight: dict[tuple[str, Any], threading.Event] = field(default_factory=dict)
+    _cache_errors: dict[tuple[str, Any], Exception] = field(default_factory=dict)
+
+    def cached(self, cache_name: str, cache: dict, key: Any, compute: Callable[[], Any]) -> Any:
+        token = (cache_name, key)
+        while True:
+            with self._lock:
+                if key in cache:
+                    self.cache_hits[cache_name] += 1
+                    return cache[key]
+                if token in self._cache_errors:
+                    raise self._cache_errors[token]
+                event = self._in_flight.get(token)
+                if event is None:
+                    event = threading.Event()
+                    self._in_flight[token] = event
+                    self.cache_misses[cache_name] += 1
+                    break
+            event.wait()
+
+        try:
+            value = compute()
+        except Exception as exc:
+            with self._lock:
+                self._cache_errors[token] = exc
+                self._in_flight.pop(token, None)
+                event.set()
+            raise
+
+        with self._lock:
+            cache[key] = value
+            self._in_flight.pop(token, None)
+            event.set()
+        return value
+
+    def cached_filter_mask(self, kind: str, values: set[str]) -> np.ndarray:
+        normalized = tuple(sorted(str(item) for item in values))
+        key = (kind, normalized)
+
+        def compute() -> np.ndarray:
+            if kind == "regime":
+                labels = pd.Series(self.forward_regimes.to_numpy(), index=self.frame.index).astype(str)
+            elif kind == "funding_state":
+                labels = funding_state_labels(self.funding_rate, self.frame.index).astype(str)
+            elif kind == "funding_trend":
+                labels = funding_trend_labels(self.funding_rate, self.frame.index).astype(str)
+            else:
+                raise ValueError(f"Unknown filter mask kind: {kind}")
+            return labels.isin(set(normalized)).to_numpy(dtype=bool)
+
+        return self.cached("filter_mask", self.filter_mask_cache, key, compute)
+
+
+@dataclass(frozen=True)
+class SignalBuildSkip:
+    index: int
+    candidate_id: str
+    error: ValueError
+
+
 # ── multiprocessing worker state ────────────────────────────────────
 
 _worker_frame: pd.DataFrame | None = None
@@ -975,6 +1049,7 @@ def verify_research_survivors(
                 context.funding_rate,
                 trial_counts_by_candidate=trial_counts,
                 data_quality_notes=context.data_quality_notes,
+                max_workers=max_workers,
             )
             final_tasks = _slice_tasks(full_tasks, split_plan.final_oos_mask)
             round_backtests = _run_backtests_parallel(
@@ -1155,6 +1230,7 @@ def _run_mining_round(
         funding_rate,
         trial_counts_by_candidate=trial_counts_by_candidate,
         data_quality_notes=data_quality_notes,
+        max_workers=max_workers,
     )
     discovery_tasks = _slice_tasks(full_tasks, split_plan.discovery_mask)
     discovery_checkpoint = _load_stage_checkpoint(
@@ -1278,6 +1354,7 @@ def _run_mining_round(
             funding_rate,
             trial_counts_by_candidate=repair_counts,
             data_quality_notes=data_quality_notes,
+            max_workers=max_workers,
         )
         validation_full_tasks.extend(repair_full_tasks)
         validation_candidates.extend(pre_gate_candidates)
@@ -3140,27 +3217,81 @@ def _build_tasks(
     *,
     trial_counts_by_candidate: dict[str, dict[str, int]] | None = None,
     data_quality_notes: list[DataQualityNote] | None = None,
+    max_workers: int | None = None,
 ) -> list[tuple[np.ndarray, dict, int, dict[str, int], list[dict]]]:
     """Construct regime-conditional trading signals for each candidate.
 
     Returns list of (signal_array, candidate_dict, index, trial_counts, data_quality_notes).
     """
-    tasks = []
+    if not candidates:
+        return []
+
+    t0 = time.perf_counter()
+    context = SignalBuildContext(
+        frame=frame,
+        features_df=features_df,
+        feature_meta=feature_meta,
+        forward_regimes=forward_regimes,
+        funding_rate=funding_rate,
+    )
     note_dicts = [note.model_dump(mode="json") for note in (data_quality_notes or [])]
-    for i, c in enumerate(candidates):
+    worker_count = min(max(1, int(max_workers or os.cpu_count() or 4)), len(candidates))
+    trial_counts_by_candidate = trial_counts_by_candidate or {}
+
+    def build_one(i: int, c: CandidateStrategySpec) -> tuple[np.ndarray, dict, int, dict[str, int], list[dict]] | SignalBuildSkip:
         try:
-            signal_arr = _build_signal_for(c, frame, features_df, feature_meta, i, forward_regimes, funding_rate)
+            signal_arr = _build_signal_for(
+                c,
+                frame,
+                features_df,
+                feature_meta,
+                i,
+                forward_regimes,
+                funding_rate,
+                build_context=context,
+            )
         except ValueError as exc:
-            _log(f"[{i + 1}/{len(candidates)}] {c.candidate_id[:16]}... SKIP signal: {exc}")
-            continue
-        trial_counts = (trial_counts_by_candidate or {}).get(
+            return SignalBuildSkip(index=i, candidate_id=c.candidate_id, error=exc)
+        trial_counts = trial_counts_by_candidate.get(
             c.candidate_id,
             {
                 "effective_trials_count": 1,
                 "global_cumulative_trials_count": 1,
             },
         )
-        tasks.append((signal_arr, c.model_dump(mode="json"), i, trial_counts, note_dicts))
+        return (signal_arr, c.model_dump(mode="json"), i, trial_counts, note_dicts)
+
+    results: list[tuple[np.ndarray, dict, int, dict[str, int], list[dict]] | SignalBuildSkip] = []
+    if worker_count <= 1:
+        results = [build_one(i, c) for i, c in enumerate(candidates)]
+    else:
+        by_idx: dict[int, tuple[np.ndarray, dict, int, dict[str, int], list[dict]] | SignalBuildSkip] = {}
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_to_idx = {
+                executor.submit(build_one, i, c): i
+                for i, c in enumerate(candidates)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                by_idx[idx] = future.result()
+        results = [by_idx[i] for i in sorted(by_idx)]
+
+    tasks = []
+    skipped = 0
+    for item in results:
+        if isinstance(item, SignalBuildSkip):
+            skipped += 1
+            _log(f"[{item.index + 1}/{len(candidates)}] {item.candidate_id[:16]}... SKIP signal: {item.error}")
+            continue
+        tasks.append(item)
+
+    elapsed = time.perf_counter() - t0
+    _log(
+        "  Built signal tasks: "
+        f"{len(tasks)}/{len(candidates)} in {elapsed:.2f}s "
+        f"(workers={worker_count}, skipped={skipped}, "
+        f"cache_hits={dict(context.cache_hits)}, cache_misses={dict(context.cache_misses)})"
+    )
     return tasks
 
 
@@ -3272,22 +3403,32 @@ def _apply_candidate_filters(
     params: dict,
     forward_regimes: pd.Series,
     funding_rate: pd.Series | None,
+    build_context: SignalBuildContext | None = None,
 ) -> pd.Series:
     filtered = signal.copy()
     regime_filter = _filter_values(params.get("regime_filter"))
     if regime_filter:
-        regimes = pd.Series(forward_regimes.to_numpy(), index=filtered.index).astype(str)
-        filtered = filtered.where(regimes.isin(regime_filter), 0.0)
+        if build_context is not None and len(filtered) == len(build_context.frame):
+            filtered = filtered.where(build_context.cached_filter_mask("regime", regime_filter), 0.0)
+        else:
+            regimes = pd.Series(forward_regimes.to_numpy(), index=filtered.index).astype(str)
+            filtered = filtered.where(regimes.isin(regime_filter), 0.0)
 
     funding_state_filter = _filter_values(params.get("funding_state_filter"))
     if funding_state_filter:
-        states = funding_state_labels(funding_rate, filtered.index).astype(str)
-        filtered = filtered.where(states.isin(funding_state_filter), 0.0)
+        if build_context is not None and len(filtered) == len(build_context.frame):
+            filtered = filtered.where(build_context.cached_filter_mask("funding_state", funding_state_filter), 0.0)
+        else:
+            states = funding_state_labels(funding_rate, filtered.index).astype(str)
+            filtered = filtered.where(states.isin(funding_state_filter), 0.0)
 
     funding_trend_filter = _filter_values(params.get("funding_trend_filter"))
     if funding_trend_filter:
-        trends = funding_trend_labels(funding_rate, filtered.index).astype(str)
-        filtered = filtered.where(trends.isin(funding_trend_filter), 0.0)
+        if build_context is not None and len(filtered) == len(build_context.frame):
+            filtered = filtered.where(build_context.cached_filter_mask("funding_trend", funding_trend_filter), 0.0)
+        else:
+            trends = funding_trend_labels(funding_rate, filtered.index).astype(str)
+            filtered = filtered.where(trends.isin(funding_trend_filter), 0.0)
 
     return filtered.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-1, 1)
 
@@ -3302,6 +3443,68 @@ def _filter_values(value: Any) -> set[str]:
     return {str(value)}
 
 
+def _stable_signal_key(payload: Any) -> str:
+    return json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
+
+
+def _candidate_signal_cache_key(candidate: CandidateStrategySpec, index: int) -> str:
+    return _stable_signal_key({
+        "candidate": candidate.model_dump(mode="json"),
+        "index": index,
+    })
+
+
+def _feature_transform_cache_key(candidate: CandidateStrategySpec, indicator_name: str, direction: Any, transform: Any) -> str:
+    params = candidate.params
+    return _stable_signal_key({
+        "indicator_name": indicator_name,
+        "direction": direction,
+        "transform": transform,
+        "zscore_window": params.get("zscore_window", 288),
+        "tanh_scale": params.get("tanh_scale", 2.0),
+        "smooth_span": params.get("smooth_span", 1),
+        "signal_threshold": params.get("signal_threshold", 0.0),
+    })
+
+
+def _cached_factor_signal(
+    build_context: SignalBuildContext,
+    *,
+    family: str,
+    lookback: int,
+) -> pd.Series:
+    key = (str(family), int(lookback))
+    return build_context.cached(
+        "factor_signal",
+        build_context.factor_signal_cache,
+        key,
+        lambda: factor_signal(
+            build_context.frame,
+            family=family,
+            lookback=lookback,
+            funding_rate=build_context.funding_rate,
+        ),
+    )
+
+
+def _cached_feature_transform(
+    build_context: SignalBuildContext,
+    *,
+    candidate: CandidateStrategySpec,
+    indicator_name: str,
+    raw: pd.Series,
+    direction: Any,
+    transform: Any,
+) -> pd.Series:
+    key = _feature_transform_cache_key(candidate, indicator_name, direction, transform)
+    return build_context.cached(
+        "feature_transform",
+        build_context.feature_transform_cache,
+        key,
+        lambda: _apply_transform(raw, direction, transform, candidate.params),
+    )
+
+
 def _build_signal_for(
     candidate: CandidateStrategySpec,
     frame: pd.DataFrame,
@@ -3310,6 +3513,44 @@ def _build_signal_for(
     index: int,
     forward_regimes: pd.Series,
     funding_rate: pd.Series | None = None,
+    *,
+    build_context: SignalBuildContext | None = None,
+) -> np.ndarray:
+    context = build_context or SignalBuildContext(
+        frame=frame,
+        features_df=features_df,
+        feature_meta=feature_meta,
+        forward_regimes=forward_regimes,
+        funding_rate=funding_rate,
+    )
+    key = _candidate_signal_cache_key(candidate, index)
+    return context.cached(
+        "candidate_signal",
+        context.candidate_signal_cache,
+        key,
+        lambda: _build_signal_for_uncached(
+            candidate,
+            frame,
+            features_df,
+            feature_meta,
+            index,
+            forward_regimes,
+            funding_rate,
+            build_context=context,
+        ),
+    )
+
+
+def _build_signal_for_uncached(
+    candidate: CandidateStrategySpec,
+    frame: pd.DataFrame,
+    features_df: pd.DataFrame,
+    feature_meta: dict,
+    index: int,
+    forward_regimes: pd.Series,
+    funding_rate: pd.Series | None = None,
+    *,
+    build_context: SignalBuildContext,
 ) -> np.ndarray:
     """Construct a trading signal for a single candidate.
 
@@ -3334,11 +3575,18 @@ def _build_signal_for(
         raw = features_df[indicator_name]
         direction = candidate.params.get("direction", 1)
         transform = candidate.params.get("transform", "tanh_zscore")
-        signal = _apply_transform(raw, direction, transform, candidate.params)
+        signal = _cached_feature_transform(
+            build_context,
+            candidate=candidate,
+            indicator_name=indicator_name,
+            raw=raw,
+            direction=direction,
+            transform=transform,
+        )
         canonical = _normalize_family(candidate.hypothesis_family)
         if canonical:
             signal = _apply_regime_modulation(signal, forward_regimes, canonical)
-        signal = _apply_candidate_filters(signal, candidate.params, forward_regimes, funding_rate)
+        signal = _apply_candidate_filters(signal, candidate.params, forward_regimes, funding_rate, build_context)
         return signal.to_numpy(dtype=float)
 
     # ── Priority 2: explicit factor_signal ──────────────────────────
@@ -3350,18 +3598,27 @@ def _build_signal_for(
                 f"Candidate {candidate.candidate_id} has signal_source='factor_signal' "
                 f"but missing 'factor_family' in params."
             )
-        signal = factor_signal(frame, family=family, lookback=lookback, funding_rate=funding_rate)
+        signal = _cached_factor_signal(build_context, family=family, lookback=int(lookback))
         direction = int(candidate.params.get("direction", 1))
         signal = _apply_signal_controls(direction * signal.fillna(0), candidate.params).clip(-3, 3)
         canonical = _normalize_family(candidate.hypothesis_family)
         if canonical:
             signal = _apply_regime_modulation(signal, forward_regimes, canonical)
-        signal = _apply_candidate_filters(signal, candidate.params, forward_regimes, funding_rate)
+        signal = _apply_candidate_filters(signal, candidate.params, forward_regimes, funding_rate, build_context)
         return signal.to_numpy(dtype=float)
 
     # ── Composite ───────────────────────────────────────────────────
     if candidate.hypothesis_family == "composite" or candidate.params.get("components"):
-        return _build_composite_signal(candidate, frame, features_df, feature_meta, index, forward_regimes, funding_rate)
+        return _build_composite_signal(
+            candidate,
+            frame,
+            features_df,
+            feature_meta,
+            index,
+            forward_regimes,
+            funding_rate,
+            build_context=build_context,
+        )
 
     # ── Legacy fallback (no signal_source in params) ────────────────
     canonical = _normalize_family(candidate.hypothesis_family)
@@ -3369,10 +3626,10 @@ def _build_signal_for(
     if canonical is not None:
         lookbacks = _METHOD_LOOKBACKS.get(candidate.method_id, [12])
         lookback = lookbacks[index % len(lookbacks)]
-        signal = factor_signal(frame, family=canonical, lookback=lookback, funding_rate=funding_rate)
+        signal = _cached_factor_signal(build_context, family=canonical, lookback=int(lookback))
         signal = signal.fillna(0).clip(-3, 3)
         signal = _apply_regime_modulation(signal, forward_regimes, canonical)
-        signal = _apply_candidate_filters(signal, candidate.params, forward_regimes, funding_rate)
+        signal = _apply_candidate_filters(signal, candidate.params, forward_regimes, funding_rate, build_context)
         return signal.to_numpy(dtype=float)
 
     # Fallback: pick an engineered feature by family match
@@ -3392,7 +3649,7 @@ def _build_signal_for(
         )
     feature_col = family_features[index % len(family_features)]
     signal = features_df[feature_col].fillna(0).clip(-3, 3)
-    signal = _apply_candidate_filters(signal, candidate.params, forward_regimes, funding_rate)
+    signal = _apply_candidate_filters(signal, candidate.params, forward_regimes, funding_rate, build_context)
     return signal.to_numpy(dtype=float)
 
 
@@ -3404,6 +3661,8 @@ def _build_composite_signal(
     index: int,
     forward_regimes: pd.Series,
     funding_rate: pd.Series | None,
+    *,
+    build_context: SignalBuildContext,
 ) -> np.ndarray:
     components = candidate.params.get("components") or []
     weights = candidate.params.get("weights") or []
@@ -3428,6 +3687,7 @@ def _build_composite_signal(
             index + offset,
             forward_regimes,
             funding_rate,
+            build_context=build_context,
         )
         component_signals.append(signal)
         component_weights.append(weight)
@@ -3443,7 +3703,7 @@ def _build_composite_signal(
     for weight, signal in zip(weights_arr, component_signals, strict=True):
         combined += weight * signal
     controlled = _apply_signal_controls(pd.Series(combined, index=frame.index), candidate.params)
-    filtered = _apply_candidate_filters(controlled, candidate.params, forward_regimes, funding_rate)
+    filtered = _apply_candidate_filters(controlled, candidate.params, forward_regimes, funding_rate, build_context)
     return np.clip(filtered.to_numpy(dtype=float), -3.0, 3.0)
 
 
