@@ -1,6 +1,6 @@
 import os
 
-from factor_mining.config import BootstrapConfig, Settings, load_dotenv
+from factor_mining.config import BootstrapConfig, PositionSizingConfig, Settings, apply_trade_overrides, load_dotenv
 from factor_mining.mining import _extract_chat_json
 from factor_mining.registry import METHOD_REGISTRY, get_method, schedulable_methods
 
@@ -12,6 +12,25 @@ def test_config_defaults_encode_final_plan() -> None:
     assert settings.trial_ledger.partition == "family_and_rolling_window"
     assert settings.bootstrap.block_length_bars(1000) == 2000
     assert BootstrapConfig().block_length_bars(10) == 288
+
+
+def test_trade_overrides_are_run_scoped_and_symbol_specific() -> None:
+    settings = Settings(position_sizing=PositionSizingConfig(max_leverage=2.0))
+
+    updated = apply_trade_overrides(
+        settings,
+        btc_leverage=5.0,
+        eth_leverage=4.0,
+        taker_bps=6.5,
+        slippage_base_bps=1.25,
+    )
+
+    assert settings.position_sizing.symbol_max_leverage == {}
+    assert updated.position_sizing.max_leverage_for("BTCUSDT") == 5.0
+    assert updated.position_sizing.max_leverage_for("ETH") == 4.0
+    assert updated.position_sizing.max_leverage_for("SOLUSDT") == 2.0
+    assert updated.costs.taker_bps == 6.5
+    assert updated.costs.slippage_base_bps == 1.25
 
 
 def test_registry_keeps_84_method_blueprint_and_blocks_cross_section_for_n2() -> None:

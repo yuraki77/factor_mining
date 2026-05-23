@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from factor_mining.config import Settings, load_settings
+from factor_mining.config import Settings, apply_trade_overrides, load_settings
 from factor_mining.pipeline import _PipelineCancelled, run_pipeline
 from factor_mining.registry import METHOD_REGISTRY, schedulable_methods
 from factor_mining.storage import MetadataStore
@@ -133,6 +133,15 @@ def build_dashboard_state(settings: Settings | None = None, store: MetadataStore
             "sqlite_path": str(settings.data.sqlite_path),
             "parquet_dir": str(settings.data.parquet_dir),
             "trial_window_days": settings.trial_ledger.window_days,
+            "position_sizing": {
+                "max_leverage": settings.position_sizing.max_leverage,
+                "symbol_max_leverage": {
+                    "BTCUSDT": settings.position_sizing.max_leverage_for("BTCUSDT"),
+                    "ETHUSDT": settings.position_sizing.max_leverage_for("ETHUSDT"),
+                },
+                "fixed_notional_usd": settings.position_sizing.fixed_notional_usd,
+            },
+            "costs": settings.costs.model_dump(mode="json"),
         },
         "bundle": bundle,
         "experiments": experiments,
@@ -263,7 +272,25 @@ def _run_args(payload: dict[str, Any]) -> dict[str, Any]:
         "tail": None if tail <= 0 else tail,
         "archive_top": max(0, min(_as_int(payload.get("archive_top"), 3), 10)),
         "research_brief": str(payload.get("research_brief") or "").strip() or None,
+        "btc_leverage": _optional_nonnegative_float(payload, "btc_leverage"),
+        "eth_leverage": _optional_nonnegative_float(payload, "eth_leverage"),
+        "taker_bps": _optional_nonnegative_float(payload, "taker_bps"),
+        "slippage_base_bps": _optional_nonnegative_float(payload, "slippage_base_bps"),
+        "slippage_k": _optional_nonnegative_float(payload, "slippage_k"),
+        "slippage_gamma": _optional_nonnegative_float(payload, "slippage_gamma"),
     }
+
+
+def _settings_for_run(settings: Settings, args: dict[str, Any]) -> Settings:
+    return apply_trade_overrides(
+        settings,
+        btc_leverage=args.get("btc_leverage"),
+        eth_leverage=args.get("eth_leverage"),
+        taker_bps=args.get("taker_bps"),
+        slippage_base_bps=args.get("slippage_base_bps"),
+        slippage_k=args.get("slippage_k"),
+        slippage_gamma=args.get("slippage_gamma"),
+    )
 
 
 def _json_safe(value: Any) -> Any:
@@ -284,6 +311,7 @@ def _start_dashboard_run(settings: Settings, args: dict[str, Any]) -> tuple[bool
         return False, f"Run {active['run_id']} is already active."
 
     args = {**args, "mode": "single"}
+    run_settings = _settings_for_run(settings, args)
     run_id = f"run_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     cleared = _clear_run_display_cache(store)
     store.create_pipeline_run(run_id, args)
@@ -309,7 +337,7 @@ def _start_dashboard_run(settings: Settings, args: dict[str, Any]) -> tuple[bool
         try:
             worker_store.append_pipeline_event(run_id, phase="ui", level="info", message="Background worker started.")
             run_pipeline(
-                settings,
+                run_settings,
                 use_llm=args["use_llm"],
                 max_workers=args["max_workers"],
                 tail=args["tail"],
@@ -358,6 +386,7 @@ def _start_hosted_run(settings: Settings, args: dict[str, Any]) -> tuple[bool, s
         return False, f"Run {active['run_id']} is already active."
 
     args = {**args, "mode": "hosted"}
+    run_settings = _settings_for_run(settings, args)
     run_id = f"hosted_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     cleared = _clear_run_display_cache(store)
     store.create_pipeline_run(run_id, args)
@@ -387,7 +416,7 @@ def _start_hosted_run(settings: Settings, args: dict[str, Any]) -> tuple[bool, s
                     payload={"cycle": cycle, "archive_top": args["archive_top"]},
                 )
                 result = run_pipeline(
-                    settings,
+                    run_settings,
                     use_llm=args["use_llm"],
                     max_workers=args["max_workers"],
                     tail=args["tail"],
@@ -897,6 +926,15 @@ def _as_optional_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _optional_nonnegative_float(payload: dict[str, Any], key: str) -> float | None:
+    if key not in payload or payload.get(key) in (None, ""):
+        return None
+    value = _as_optional_float(payload.get(key))
+    if value is None or not math.isfinite(value):
+        return None
+    return max(0.0, value)
 
 
 def _exit_summary(params: dict[str, Any]) -> dict[str, Any]:

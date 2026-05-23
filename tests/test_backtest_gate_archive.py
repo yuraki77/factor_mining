@@ -191,6 +191,34 @@ def test_vol_target_does_not_use_next_open_return(tmp_path) -> None:
     assert shocked_path.position.iloc[19] == pytest.approx(base_path.position.iloc[19])
 
 
+def test_symbol_specific_leverage_caps_vol_target_position(tmp_path) -> None:
+    settings = Settings(
+        data=DataConfig(sqlite_path=tmp_path / "meta.sqlite3"),
+        position_sizing=PositionSizingConfig(
+            target_annual_vol=10.0,
+            vol_window_days=1,
+            max_leverage=1.0,
+            symbol_max_leverage={"ETHUSDT": 4.0},
+        ),
+    )
+    frame = make_frame(80)
+    signals = pd.Series([1.0] * len(frame))
+    btc_candidate = CandidateStrategySpec(
+        candidate_id="c_btc_lev",
+        hypothesis_id="h1",
+        method_id="rule_mining",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+    )
+    eth_candidate = btc_candidate.model_copy(update={"candidate_id": "c_eth_lev", "symbol": "ETHUSDT"})
+
+    btc_path = evaluate_strategy_path(frame, signals, btc_candidate, settings)
+    eth_path = evaluate_strategy_path(frame, signals, eth_candidate, settings)
+
+    assert btc_path.position.max() == pytest.approx(1.0)
+    assert eth_path.position.max() == pytest.approx(4.0)
+
+
 def test_gatecheck_warns_autocorr_and_data_quality_without_hard_fail() -> None:
     result = BacktestResult(
         experiment_id="exp1",

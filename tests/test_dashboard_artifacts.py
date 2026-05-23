@@ -4,7 +4,7 @@ from factor_mining.backtest.engine import build_backtest_detail
 from factor_mining.config import DataConfig, Settings
 from factor_mining.models import BacktestResult, CandidateStrategySpec, GateCheckItem, GateCheckResult, MetricsBlock
 from factor_mining.storage import MetadataStore
-from factor_mining.ui import _json_safe, _recover_interrupted_stop_requests, build_dashboard_state
+from factor_mining.ui import _json_safe, _recover_interrupted_stop_requests, _run_args, _settings_for_run, build_dashboard_state
 
 
 def _frame(n: int = 120) -> pd.DataFrame:
@@ -109,6 +109,27 @@ def test_dashboard_state_includes_gatecheck_diagnostics(tmp_path) -> None:
     state = build_dashboard_state(settings, store)
 
     assert state["bundle"]["gatecheck_diagnostics"]["total"] == 1
+
+
+def test_dashboard_run_args_apply_leverage_and_execution_costs(tmp_path) -> None:
+    settings = Settings(data=DataConfig(sqlite_path=tmp_path / "meta.sqlite3"))
+    args = _run_args({
+        "btc_leverage": 6.0,
+        "eth_leverage": 4.5,
+        "taker_bps": 4.0,
+        "slippage_base_bps": 0.75,
+        "slippage_k": 18.0,
+        "slippage_gamma": 0.65,
+    })
+
+    run_settings = _settings_for_run(settings, args)
+
+    assert run_settings.position_sizing.max_leverage_for("BTCUSDT") == 6.0
+    assert run_settings.position_sizing.max_leverage_for("ETHUSDT") == 4.5
+    assert run_settings.costs.taker_bps == 4.0
+    assert run_settings.costs.slippage_base_bps == 0.75
+    assert run_settings.costs.slippage_k == 18.0
+    assert run_settings.costs.slippage_gamma == 0.65
 
 
 def test_dashboard_state_includes_research_survivors(tmp_path) -> None:

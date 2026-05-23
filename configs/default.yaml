@@ -56,6 +56,9 @@ position_sizing:
   target_annual_vol: 0.15
   vol_window_days: 30
   max_leverage: 3.0
+  symbol_max_leverage:
+    BTCUSDT: 3.0
+    ETHUSDT: 3.0
   fixed_notional_usd: 10000.0
 
 exit:

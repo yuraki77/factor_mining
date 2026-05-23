@@ -12,7 +12,7 @@ import json
 import threading
 import time
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from itertools import combinations
 from typing import Any, Callable
@@ -705,14 +705,25 @@ def _run_pipeline_impl(
         new_candidates: list[CandidateStrategySpec] = []
         child_history: list[dict[str, Any]] = []
 
-        for key, symbol_candidates in _group_candidates_by_data(current_candidates).items():
+        grouped_candidates = _group_candidates_by_data(current_candidates)
+        runnable_groups: list[tuple[tuple[str, str], MarketDataContext, list[CandidateStrategySpec]]] = []
+        for key, symbol_candidates in grouped_candidates.items():
             _check_stop(stop_event)
             context = data_contexts.get(key)
             if context is None:
                 _log(f"  Skip {key[0]}/{key[1]}: no local parquet data")
                 continue
             _log(f"  {context.symbol}/{context.market}: {len(symbol_candidates)} candidates")
-            round_data = _run_mining_round(
+            runnable_groups.append((key, context, symbol_candidates))
+
+        symbol_workers, symbol_max_workers = _symbol_round_parallelism(len(runnable_groups), max_workers)
+        trial_counts_lock = threading.Lock() if symbol_workers > 1 else None
+
+        def run_symbol_group(
+            context: MarketDataContext,
+            symbol_candidates: list[CandidateStrategySpec],
+        ) -> dict[str, Any]:
+            return _run_mining_round(
                 current_candidates=symbol_candidates,
                 frame=context.frame,
                 features_df=context.features_df,
@@ -722,7 +733,7 @@ def _run_pipeline_impl(
                 funding_rate=context.funding_rate,
                 data_quality_notes=context.data_quality_notes,
                 settings=settings,
-                max_workers=max_workers,
+                max_workers=symbol_max_workers,
                 store=store,
                 iteration=round_num - 1,
                 round_num=round_num,
@@ -734,7 +745,28 @@ def _run_pipeline_impl(
                 resume_run_id=resume_run_id,
                 run_args=run_args,
                 stop_event=stop_event,
+                trial_counts_lock=trial_counts_lock,
             )
+
+        round_data_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        if symbol_workers > 1:
+            _log(
+                f"  Running {len(runnable_groups)} data groups in parallel "
+                f"({symbol_workers} symbol workers, {symbol_max_workers} backtest workers/group)"
+            )
+            with ThreadPoolExecutor(max_workers=symbol_workers) as executor:
+                future_to_key = {
+                    executor.submit(run_symbol_group, context, symbol_candidates): key
+                    for key, context, symbol_candidates in runnable_groups
+                }
+                for future in as_completed(future_to_key):
+                    round_data_by_key[future_to_key[future]] = future.result()
+        else:
+            for key, context, symbol_candidates in runnable_groups:
+                round_data_by_key[key] = run_symbol_group(context, symbol_candidates)
+
+        for key, _context, _symbol_candidates in runnable_groups:
+            round_data = round_data_by_key[key]
 
             round_backtests.extend(round_data["backtests"])
             round_gatechecks.extend(round_data["gatechecks"])
@@ -1063,6 +1095,7 @@ def _run_mining_round(
     resume_run_id: str | None = None,
     run_args: dict[str, Any] | None = None,
     stop_event: threading.Event | None = None,
+    trial_counts_lock: Any | None = None,
 ) -> dict[str, Any]:
     """Execute one complete mining round: backtest → gatecheck → hardscore → optimize."""
     artifact_scope = artifact_scope or f"round{round_num}"
@@ -1106,7 +1139,13 @@ def _run_mining_round(
             "supplemental funding features still allowed"
         )
 
-    trial_counts_by_candidate = _record_candidate_trials(current_candidates, store, settings, cumulative_trial_counts)
+    trial_counts_by_candidate = _record_candidate_trials(
+        current_candidates,
+        store,
+        settings,
+        cumulative_trial_counts,
+        trial_counts_lock=trial_counts_lock,
+    )
     full_tasks = _build_tasks(
         current_candidates,
         frame,
@@ -1135,8 +1174,6 @@ def _run_mining_round(
         _log(f"  Discovery backtests: resumed {len(discovery_backtests)} from checkpoint")
     else:
         discovery_backtests = _run_backtests_parallel(discovery_tasks, discovery_frame, settings, max_workers, funding_df)
-        if discovery_backtests:
-            _apply_batch_pbo(discovery_frame, discovery_tasks, discovery_backtests, settings, funding_df)
         _save_stage_checkpoint(
             store,
             run_id,
@@ -1225,7 +1262,13 @@ def _run_mining_round(
 
     if pre_gate_candidates:
         t_repair = time.perf_counter()
-        repair_counts = _record_candidate_trials(pre_gate_candidates, store, settings, cumulative_trial_counts)
+        repair_counts = _record_candidate_trials(
+            pre_gate_candidates,
+            store,
+            settings,
+            cumulative_trial_counts,
+            trial_counts_lock=trial_counts_lock,
+        )
         repair_full_tasks = _build_tasks(
             pre_gate_candidates,
             frame,
@@ -1821,12 +1864,34 @@ def _slice_tasks(tasks: list[tuple], mask: pd.Series) -> list[tuple]:
     return sliced
 
 
+def _symbol_round_parallelism(group_count: int, max_workers: int | None) -> tuple[int, int | None]:
+    if group_count <= 1:
+        return 1, max_workers
+
+    total_workers = max(1, int(max_workers or os.cpu_count() or 4))
+    symbol_workers = min(group_count, total_workers)
+    backtest_workers_per_group = max(1, total_workers // symbol_workers)
+    return symbol_workers, backtest_workers_per_group
+
+
 def _record_candidate_trials(
     candidates: list[CandidateStrategySpec],
     store: MetadataStore | None,
     settings: Settings,
     cumulative_trial_counts: dict[str, int],
+    *,
+    trial_counts_lock: Any | None = None,
 ) -> dict[str, dict[str, int]]:
+    if trial_counts_lock is not None:
+        with trial_counts_lock:
+            return _record_candidate_trials(
+                candidates,
+                store,
+                settings,
+                cumulative_trial_counts,
+                trial_counts_lock=None,
+            )
+
     ledger = TrialLedger(store, settings) if store is not None else None
     counts_by_candidate: dict[str, dict[str, int]] = {}
     for candidate in candidates:
