@@ -1,9 +1,22 @@
+import threading
+
 import numpy as np
 import pandas as pd
 
 from factor_mining.config import BootstrapConfig, CPCVConfig, DataConfig, PermutationTestConfig, Settings
-from factor_mining.models import BacktestResult, CandidateStrategySpec, FactorEvidenceReport, GateCheckItem, GateCheckResult, MetricsBlock
+from factor_mining.models import (
+    BacktestResult,
+    CandidateStrategySpec,
+    FactorEvidenceReport,
+    GateCheckItem,
+    GateCheckResult,
+    HardScoreReport,
+    HypothesisSpec,
+    MetricsBlock,
+    ResearchGateResult,
+)
 from factor_mining.optimizers.traditional_optimizer import apply_exit_adjustments, apply_optimization_result, build_optimization_context, optimize_traditionally
+import factor_mining.pipeline as pipeline
 from factor_mining.pipeline import (
     _apply_batch_pbo,
     _apply_merge_pool_trial_penalty,
@@ -22,6 +35,10 @@ from factor_mining.pipeline import (
     _checkpoint_fingerprint,
     _save_stage_checkpoint,
     _load_stage_checkpoint,
+    _run_mining_round,
+    _symbol_round_parallelism,
+    MarketDataContext,
+    run_pipeline,
 )
 from factor_mining.registry import get_method
 from factor_mining.storage import MetadataStore
@@ -57,6 +74,477 @@ def _result(experiment_id: str, candidate_id: str, *, pbo: float, sharpe: float)
         metrics_gross=MetricsBlock(sharpe=sharpe),
         pbo=pbo,
     )
+
+
+def _hypothesis() -> HypothesisSpec:
+    return HypothesisSpec(
+        hypothesis_id="h1",
+        hypothesis_family="momentum",
+        economic_mechanism="Trend persistence",
+        testable_prediction="Positive follow-through after momentum confirmation",
+        null_hypothesis="No follow-through",
+        expected_ic_range=(0.005, 0.02),
+        expected_decay_halflife_bars=24,
+    )
+
+
+def _candidate(candidate_id: str, symbol: str) -> CandidateStrategySpec:
+    return CandidateStrategySpec(
+        candidate_id=candidate_id,
+        hypothesis_id="h1",
+        method_id="factor_scoring",
+        hypothesis_family="momentum",
+        symbol=symbol,
+        market="um_futures",
+        params={"signal_source": "factor_signal", "factor_family": "momentum"},
+    )
+
+
+def _context_for(candidate: CandidateStrategySpec) -> MarketDataContext:
+    frame = _frame(100)
+    return MarketDataContext(
+        symbol=candidate.symbol,
+        market=candidate.market,
+        frame=frame,
+        features_df=pd.DataFrame(index=frame.index),
+        feature_meta={},
+        forward_regimes=pd.Series(["unknown"] * len(frame), index=frame.index),
+        funding_df=None,
+        funding_rate=pd.Series([0.0] * len(frame), index=frame.index),
+        data_quality_notes=[],
+    )
+
+
+def test_symbol_round_parallelism_splits_total_backtest_worker_budget() -> None:
+    assert _symbol_round_parallelism(1, 8) == (1, 8)
+    assert _symbol_round_parallelism(2, 8) == (2, 4)
+    assert _symbol_round_parallelism(10, 4) == (4, 1)
+
+
+def test_run_pipeline_executes_symbol_rounds_in_parallel(monkeypatch) -> None:
+    candidates = [_candidate("c_btc", "BTCUSDT"), _candidate("c_eth", "ETHUSDT")]
+    contexts = {_data_key: _context_for(candidate) for _data_key, candidate in ((pipeline._data_key(c), c) for c in candidates)}
+    barrier = threading.Barrier(2)
+    max_workers_seen: list[int | None] = []
+
+    monkeypatch.setattr(pipeline, "build_v1_candidates", lambda *args, **kwargs: candidates)
+    monkeypatch.setattr(pipeline, "build_indicator_candidates", lambda *args, **kwargs: candidates)
+    monkeypatch.setattr(pipeline, "_load_data_contexts", lambda *args, **kwargs: contexts)
+
+    def fake_round(*, current_candidates, max_workers, **kwargs):
+        max_workers_seen.append(max_workers)
+        barrier.wait(timeout=2.0)
+        candidate = current_candidates[0]
+        result = BacktestResult(
+            experiment_id=f"exp-{candidate.symbol}",
+            candidate_id=candidate.candidate_id,
+            hypothesis_family=candidate.hypothesis_family,
+            method_id=candidate.method_id,
+            symbol=candidate.symbol,
+            market=candidate.market,
+            interval=candidate.interval,
+            metrics_primary=MetricsBlock(sharpe=0.0),
+            pbo=0.2,
+        )
+        return {
+            "candidates": [candidate],
+            "backtests": [result],
+            "gatechecks": [],
+            "hardscores": [],
+            "factor_evidence": [],
+            "research_gates": [],
+            "near_misses": [],
+            "new_candidates": [],
+            "research_survivors": [],
+            "detail_artifact_ids": [],
+            "history_entry": {"symbol": candidate.symbol},
+        }
+
+    monkeypatch.setattr(pipeline, "_run_mining_round", fake_round)
+
+    result = run_pipeline(
+        Settings(data=DataConfig(symbols=["BTCUSDT", "ETHUSDT"])),
+        use_llm=False,
+        seed_hypotheses=[_hypothesis()],
+        max_workers=2,
+        archive_top=0,
+    )
+
+    assert {backtest.symbol for backtest in result.backtests} == {"BTCUSDT", "ETHUSDT"}
+    assert max_workers_seen == [1, 1]
+
+
+def test_mining_round_skips_discovery_pbo_and_uses_validation_pbo(monkeypatch) -> None:
+    import factor_mining.hardscore as hardscore_module
+    import factor_mining.optimizers.traditional_optimizer as optimizer_module
+    import factor_mining.validation.gatecheck as gatecheck_module
+
+    candidate = _candidate("c_btc", "BTCUSDT")
+    frame = _frame(100)
+    pbo_frame_lengths: list[int] = []
+
+    def fake_build_tasks(candidates, frame_arg, *args, trial_counts_by_candidate=None, **kwargs):
+        trial_counts_by_candidate = trial_counts_by_candidate or {}
+        return [
+            (
+                np.ones(len(frame_arg)),
+                item.model_dump(mode="json"),
+                idx,
+                trial_counts_by_candidate.get(item.candidate_id, {}),
+                [],
+            )
+            for idx, item in enumerate(candidates)
+        ]
+
+    def fake_backtests(tasks, frame_arg, settings, max_workers, funding_df=None):
+        results = []
+        for _signal, candidate_dict, _idx, _trial_counts, _notes in tasks:
+            item = CandidateStrategySpec.model_validate(candidate_dict)
+            results.append(
+                BacktestResult(
+                    experiment_id=f"exp-{len(frame_arg)}-{item.candidate_id}",
+                    candidate_id=item.candidate_id,
+                    hypothesis_family=item.hypothesis_family,
+                    method_id=item.method_id,
+                    symbol=item.symbol,
+                    market=item.market,
+                    interval=item.interval,
+                    metrics_primary=MetricsBlock(sharpe=0.1),
+                    metrics_gross=MetricsBlock(sharpe=0.2),
+                    pbo=None,
+                )
+            )
+        return results
+
+    def fake_apply_batch_pbo(frame_arg, tasks, results, settings, funding_df):
+        pbo_frame_lengths.append(len(frame_arg))
+        for result in results:
+            result.pbo = 0.2
+
+    def fake_evidence(*, results, **kwargs):
+        return [
+            FactorEvidenceReport(
+                experiment_id=result.experiment_id,
+                candidate_id=result.candidate_id,
+                hypothesis_family=result.hypothesis_family,
+                method_id=result.method_id,
+                symbol=result.symbol,
+                market=result.market,
+                interval=result.interval,
+                ic_by_horizon={"12": 0.02},
+            )
+            for result in results
+        ]
+
+    monkeypatch.setattr(pipeline, "_build_tasks", fake_build_tasks)
+    monkeypatch.setattr(pipeline, "_run_backtests_parallel", fake_backtests)
+    monkeypatch.setattr(pipeline, "_apply_batch_pbo", fake_apply_batch_pbo)
+    monkeypatch.setattr(pipeline, "build_factor_evidence_reports", fake_evidence)
+    monkeypatch.setattr(pipeline, "_build_pre_gate_repair_candidates", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        gatecheck_module,
+        "apply_fdr",
+        lambda results, settings: {result.experiment_id: 0.5 for result in results},
+    )
+    monkeypatch.setattr(
+        gatecheck_module,
+        "run_gatecheck",
+        lambda result, *args, **kwargs: GateCheckResult(
+            experiment_id=result.experiment_id,
+            candidate_id=result.candidate_id,
+            passed=True,
+            items=[],
+            risk_tier="full_pass",
+        ),
+    )
+    monkeypatch.setattr(gatecheck_module, "apply_risk_stratified_gatechecks", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        pipeline,
+        "apply_research_gate",
+        lambda results, gatechecks, evidence: [
+            ResearchGateResult(experiment_id=result.experiment_id, candidate_id=result.candidate_id, status="rejected")
+            for result in results
+        ],
+    )
+    monkeypatch.setattr(pipeline, "research_survivor_payloads", lambda *args, **kwargs: [])
+    monkeypatch.setattr(pipeline, "build_research_survivor_records", lambda *args, **kwargs: [])
+    monkeypatch.setattr(pipeline, "analyze_near_misses", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        hardscore_module,
+        "hardscore",
+        lambda result, gatecheck, **kwargs: HardScoreReport(
+            experiment_id=result.experiment_id,
+            score=0.0,
+            haircut_sharpe=0.0,
+            fdr_adjusted_pvalue=0.5,
+            prior_posterior_ic_ratio=1.0,
+            effective_trials_count=1,
+            global_cumulative_trials_count=1,
+        ),
+    )
+    monkeypatch.setattr(optimizer_module, "build_optimization_context", lambda *args, **kwargs: {"research_survivors": []})
+    monkeypatch.setattr(optimizer_module, "optimize_traditionally", lambda *args, **kwargs: {"action": "hold"})
+    monkeypatch.setattr(
+        optimizer_module,
+        "apply_optimization_result",
+        lambda _optimization, candidates, _results: (
+            list(candidates),
+            {
+                "combinations_created": 0,
+                "adjustments_applied": 0,
+                "repairs_created": 0,
+                "hypotheses_suggested": 0,
+            },
+        ),
+    )
+    monkeypatch.setattr(optimizer_module, "optimize_exits_traditionally", lambda *args, **kwargs: {"exit_adjustments": []})
+    monkeypatch.setattr(optimizer_module, "apply_exit_adjustments", lambda _exit_opt, candidates, _settings: candidates)
+
+    round_data = _run_mining_round(
+        current_candidates=[candidate],
+        frame=frame,
+        features_df=pd.DataFrame(index=frame.index),
+        feature_meta={},
+        forward_regimes=pd.Series(["unknown"] * len(frame), index=frame.index),
+        funding_rate=pd.Series([0.0] * len(frame), index=frame.index),
+        funding_df=None,
+        data_quality_notes=[],
+        settings=Settings(data=DataConfig(symbols=["BTCUSDT"])),
+        max_workers=1,
+        store=None,
+        iteration=0,
+        round_num=1,
+        cumulative_trial_counts={},
+        run_args={},
+    )
+
+    assert pbo_frame_lengths == [20]
+    assert round_data["backtests"][0].pbo == 0.2
+
+
+def _signal_build_inputs() -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    dict,
+    pd.Series,
+    pd.Series,
+    list[CandidateStrategySpec],
+]:
+    frame = _frame(220)
+    x = np.linspace(-2.0, 2.0, len(frame))
+    features_df = pd.DataFrame(
+        {
+            "feature_alpha": np.sin(x),
+            "feature_beta": np.cos(x),
+        },
+        index=frame.index,
+    )
+    feature_meta = {
+        "feature_alpha": {"family": "momentum"},
+        "feature_beta": {"family": "mean_reversion"},
+    }
+    regime_values = (["bull", "bear", "sideways", "high_vol"] * (len(frame) // 4 + 1))[:len(frame)]
+    regimes = pd.Series(regime_values, index=frame.index)
+    funding_rate = pd.Series(np.linspace(-2.0, 2.0, len(frame)), index=frame.index)
+    factor_candidate = CandidateStrategySpec(
+        candidate_id="signal-factor",
+        hypothesis_id="h1",
+        method_id="factor_scoring",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+        params={
+            "signal_source": "factor_signal",
+            "factor_family": "momentum",
+            "factor_lookback": 12,
+            "direction": 1,
+            "regime_filter": ["bull", "sideways"],
+            "funding_state_filter": ["negative", "neutral"],
+        },
+    )
+    factor_inverse = factor_candidate.model_copy(
+        update={
+            "candidate_id": "signal-factor-inverse",
+            "params": {**factor_candidate.params, "direction": -1},
+        }
+    )
+    feature_candidate = CandidateStrategySpec(
+        candidate_id="signal-feature",
+        hypothesis_id="h1",
+        method_id="factor_scoring",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+        params={
+            "signal_source": "feature",
+            "indicator_name": "feature_alpha",
+            "direction": 1,
+            "transform": "tanh_zscore",
+            "zscore_window": 24,
+            "tanh_scale": 1.5,
+            "smooth_span": 2,
+            "signal_threshold": 0.05,
+        },
+    )
+    legacy_candidate = CandidateStrategySpec(
+        candidate_id="signal-legacy",
+        hypothesis_id="h1",
+        method_id="parameter_sweep",
+        hypothesis_family="mean_reversion",
+        symbol="BTCUSDT",
+        params={"regime_filter": ["bear", "sideways"]},
+    )
+    composite = CandidateStrategySpec(
+        candidate_id="signal-composite",
+        hypothesis_id="h1",
+        method_id="composite",
+        hypothesis_family="composite",
+        symbol="BTCUSDT",
+        params={
+            "components": [
+                factor_candidate.model_dump(mode="json"),
+                feature_candidate.model_dump(mode="json"),
+            ],
+            "weights": [0.6, 0.4],
+            "smooth_span": 2,
+            "funding_trend_filter": ["rising", "stable"],
+        },
+    )
+    return frame, features_df, feature_meta, regimes, funding_rate, [
+        factor_candidate,
+        factor_inverse,
+        feature_candidate,
+        legacy_candidate,
+        composite,
+    ]
+
+
+def test_build_tasks_parallel_matches_serial_outputs() -> None:
+    frame, features_df, feature_meta, regimes, funding_rate, candidates = _signal_build_inputs()
+    trial_counts = {
+        "signal-factor": {
+            "effective_trials_count": 7,
+            "global_cumulative_trials_count": 11,
+        }
+    }
+
+    serial = _build_tasks(
+        candidates,
+        frame,
+        features_df,
+        feature_meta,
+        regimes,
+        funding_rate,
+        trial_counts_by_candidate=trial_counts,
+        max_workers=1,
+    )
+    parallel = _build_tasks(
+        candidates,
+        frame,
+        features_df,
+        feature_meta,
+        regimes,
+        funding_rate,
+        trial_counts_by_candidate=trial_counts,
+        max_workers=4,
+    )
+
+    assert [task[1]["candidate_id"] for task in parallel] == [task[1]["candidate_id"] for task in serial]
+    for serial_task, parallel_task in zip(serial, parallel, strict=True):
+        np.testing.assert_allclose(parallel_task[0], serial_task[0])
+        assert parallel_task[1:] == serial_task[1:]
+
+
+def test_build_tasks_caches_shared_factor_signal(monkeypatch) -> None:
+    frame, features_df, feature_meta, regimes, funding_rate, _candidates = _signal_build_inputs()
+    candidates = [
+        _candidate(f"shared-factor-{idx}", "BTCUSDT").model_copy(
+            update={
+                "params": {
+                    "signal_source": "factor_signal",
+                    "factor_family": "momentum",
+                    "factor_lookback": 12,
+                    "direction": 1 if idx % 2 == 0 else -1,
+                }
+            }
+        )
+        for idx in range(8)
+    ]
+    calls: list[tuple[str, int]] = []
+    original_factor_signal = pipeline.factor_signal
+
+    def counted_factor_signal(frame_arg, *, family, lookback=12, funding_rate=None):
+        calls.append((family, int(lookback)))
+        return original_factor_signal(frame_arg, family=family, lookback=lookback, funding_rate=funding_rate)
+
+    monkeypatch.setattr(pipeline, "factor_signal", counted_factor_signal)
+
+    tasks = _build_tasks(
+        candidates,
+        frame,
+        features_df,
+        feature_meta,
+        regimes,
+        funding_rate,
+        max_workers=4,
+    )
+
+    assert len(tasks) == len(candidates)
+    assert calls == [("momentum", 12)]
+
+
+def test_build_tasks_composite_reuses_component_factor_cache(monkeypatch) -> None:
+    frame, features_df, feature_meta, regimes, funding_rate, _candidates = _signal_build_inputs()
+    component_long = _candidate("component-long", "BTCUSDT").model_copy(
+        update={
+            "params": {
+                "signal_source": "factor_signal",
+                "factor_family": "momentum",
+                "factor_lookback": 12,
+                "direction": 1,
+            }
+        }
+    )
+    component_short = component_long.model_copy(
+        update={
+            "candidate_id": "component-short",
+            "params": {**component_long.params, "direction": -1},
+        }
+    )
+    composite = CandidateStrategySpec(
+        candidate_id="composite-shared-components",
+        hypothesis_id="h1",
+        method_id="composite",
+        hypothesis_family="composite",
+        symbol="BTCUSDT",
+        params={
+            "components": [
+                component_long.model_dump(mode="json"),
+                component_short.model_dump(mode="json"),
+            ],
+            "weights": [0.5, -0.5],
+        },
+    )
+    calls: list[tuple[str, int]] = []
+    original_factor_signal = pipeline.factor_signal
+
+    def counted_factor_signal(frame_arg, *, family, lookback=12, funding_rate=None):
+        calls.append((family, int(lookback)))
+        return original_factor_signal(frame_arg, family=family, lookback=lookback, funding_rate=funding_rate)
+
+    monkeypatch.setattr(pipeline, "factor_signal", counted_factor_signal)
+
+    tasks = _build_tasks(
+        [composite],
+        frame,
+        features_df,
+        feature_meta,
+        regimes,
+        funding_rate,
+        max_workers=1,
+    )
+
+    assert len(tasks) == 1
+    assert calls == [("momentum", 12)]
+    assert float(np.abs(tasks[0][0]).sum()) > 0.0
 
 
 def test_block_sampling_is_deterministic_chronological_and_sized() -> None:
