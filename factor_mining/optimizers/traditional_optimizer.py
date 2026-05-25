@@ -30,6 +30,12 @@ _NEXT_HYPOTHESIS_LOOKBACKS: dict[str, list[int]] = {
 _EVOLUTION_LOOKBACKS = [6, 12, 24, 48, 96]
 _EVOLUTION_PARENT_LIMIT = 16
 _EVOLUTION_MAX_PER_PARENT = 3
+_COMPOSITE_POOL_LIMIT = 24
+_COMPOSITE_MAX_COMBOS = 12
+_COMPOSITE_GRID_WEIGHTS = (0.20, 0.40, 0.60, 0.80)
+_EXIT_PARENT_LIMIT = 8
+_EXIT_MAX_PER_PARENT = 3
+_EXIT_TOTAL_LIMIT = 24
 _PROPOSAL_PARAM_KEYS = {
     "smooth_span",
     "signal_threshold",
@@ -193,30 +199,24 @@ def optimize_traditionally(context: dict, mode: str = "full") -> dict:
     selected = passed[:8]
     factor_ids = [f["candidate_id"] for f in selected]
     n = len(factor_ids)
-    weights = _traditional_weights(selected)
     source = "GateCheck-passing factors" if context.get("num_gatecheck_passed", 0) else "research survivors"
+    composite_pool = _select_composite_pool(context.get("factors", []), selected)
 
     result = {
         "action": "traditional_survivor_low_turnover_combo",
         "reasoning": f"Deterministic optimizer selected {n} {source} with conservative turnover controls.",
-        "combinations": [{
-            "factor_ids": factor_ids,
-            "weights": weights,
-            "horizon": "5m",
-            "signal_threshold": 0.25,
-            "smooth_span": 48,
-            "position_buffer": 0.20,
-            "rationale": "Deterministic fallback: combine research survivors and damp signal churn before final GateCheck.",
-            "expected_improvement": "Lower turnover and better diversification before applying final-strategy gates."
-        }],
+        "combinations": _composite_combinations(selected, composite_pool),
         "adjustments": [],
         "next_hypotheses": [],
         "proposal_counts": {
+            "combination": 0,
             "repair": 0,
             "evolution": 0,
+            "hill_climb": 0,
             "memory_skipped": 0,
         },
     }
+    result["proposal_counts"]["combination"] = len(result["combinations"])
     factors_by_id = {factor["candidate_id"]: factor for factor in context.get("factors", [])}
     failed_signatures = _failed_proposal_signatures(context)
     repairs, repair_skips = _prepare_adjustments(
@@ -233,6 +233,11 @@ def optimize_traditionally(context: dict, mode: str = "full") -> dict:
     result["adjustments"].extend(evolutions)
     result["proposal_counts"]["evolution"] += len(evolutions)
     result["proposal_counts"]["memory_skipped"] += evolution_skips
+
+    hill_climbs, hill_skips = _hill_climb_adjustments(context, failed_signatures)
+    result["adjustments"].extend(hill_climbs)
+    result["proposal_counts"]["hill_climb"] += len(hill_climbs)
+    result["proposal_counts"]["memory_skipped"] += hill_skips
 
     if n < 2:
         for factor_id in factor_ids:
@@ -265,6 +270,216 @@ def optimize_traditionally(context: dict, mode: str = "full") -> dict:
         })
 
     return result
+
+
+def _select_composite_pool(factors: list[dict], selected: list[dict]) -> list[dict]:
+    pool: list[dict] = []
+    seen: set[str] = set()
+
+    def add(factor: dict) -> None:
+        cid = str(factor.get("candidate_id") or "")
+        if not cid or cid in seen:
+            return
+        seen.add(cid)
+        pool.append(factor)
+
+    for factor in selected:
+        add(factor)
+    viable = [
+        factor for factor in factors
+        if (
+            factor.get("gatecheck_passed")
+            or factor.get("research_gate_status") in {"production_passed", "research_survivor"}
+            or factor.get("research_survivor")
+            or _has_discovery_evidence(factor)
+        )
+    ]
+    for factor in sorted(viable, key=_survivor_sort_key, reverse=True):
+        add(factor)
+        if len(pool) >= _COMPOSITE_POOL_LIMIT:
+            break
+    return pool
+
+
+def _composite_combinations(selected: list[dict], pool: list[dict]) -> list[dict]:
+    combos: list[dict] = []
+    seen: set[str] = set()
+
+    def add_combo(
+        factors: list[dict],
+        weights: list[float],
+        *,
+        subset_strategy: str,
+        weighting_scheme: str,
+        rationale: str,
+    ) -> None:
+        if len(combos) >= _COMPOSITE_MAX_COMBOS:
+            return
+        factor_ids = [str(factor.get("candidate_id")) for factor in factors if factor.get("candidate_id")]
+        if not factor_ids or len(weights) != len(factor_ids):
+            return
+        signature = _combo_signature(factor_ids, weights)
+        if signature in seen:
+            return
+        seen.add(signature)
+        search_variant = (
+            "survivor_combo_low_turnover"
+            if subset_strategy == "top8" and weighting_scheme == "traditional"
+            else f"survivor_combo_{subset_strategy}_{weighting_scheme}"
+        )
+        combos.append({
+            "factor_ids": factor_ids,
+            "weights": weights,
+            "horizon": "5m",
+            "signal_threshold": 0.25,
+            "smooth_span": 48,
+            "position_buffer": 0.20,
+            "subset_strategy": subset_strategy,
+            "weighting_scheme": weighting_scheme,
+            "search_variant": search_variant,
+            "rationale": rationale,
+            "expected_improvement": "Diversify survivor combinations and let subsequent backtests select robust subsets.",
+        })
+
+    add_combo(
+        selected,
+        _traditional_weights(selected),
+        subset_strategy="top8",
+        weighting_scheme="traditional",
+        rationale="Deterministic fallback: combine research survivors and damp signal churn before final GateCheck.",
+    )
+    if len(pool) < 2:
+        return combos
+
+    top4 = pool[:4]
+    add_combo(
+        top4,
+        _equal_weights(top4),
+        subset_strategy="top4",
+        weighting_scheme="equal",
+        rationale="Compact top-survivor composite with equal weights as a low-variance benchmark.",
+    )
+    add_combo(
+        top4,
+        _inverse_turnover_weights(top4),
+        subset_strategy="top4",
+        weighting_scheme="inverse_turnover",
+        rationale="Compact top-survivor composite weighted toward lower-turnover components.",
+    )
+
+    diverse = _diverse_subset(pool, limit=8)
+    add_combo(
+        diverse,
+        _traditional_weights(diverse),
+        subset_strategy="diverse8",
+        weighting_scheme="traditional",
+        rationale="Family-diverse survivor composite to reduce single-theme concentration.",
+    )
+
+    low_turnover = sorted(pool, key=_turnover_sort_key)[:8]
+    add_combo(
+        low_turnover,
+        _inverse_turnover_weights(low_turnover),
+        subset_strategy="low_turnover8",
+        weighting_scheme="inverse_turnover",
+        rationale="Low-turnover survivor composite for cost-sensitive follow-up testing.",
+    )
+
+    high_ic = sorted(pool, key=_ic_strength, reverse=True)[:8]
+    add_combo(
+        high_ic,
+        _ic_strength_weights(high_ic),
+        subset_strategy="high_ic8",
+        weighting_scheme="ic_strength",
+        rationale="IC-weighted survivor composite to test concentrated signal-evidence allocation.",
+    )
+
+    for pair in _top_pairs(pool[:4]):
+        for weight in _COMPOSITE_GRID_WEIGHTS:
+            add_combo(
+                pair,
+                [float(weight), float(1.0 - weight)],
+                subset_strategy="pair_grid",
+                weighting_scheme=f"grid_{int(weight * 100)}_{int((1.0 - weight) * 100)}",
+                rationale="Small pairwise weight grid for bounded composite allocation search.",
+            )
+            if len(combos) >= _COMPOSITE_MAX_COMBOS:
+                return combos
+    return combos
+
+
+def _combo_signature(factor_ids: list[str], weights: list[float]) -> str:
+    payload = {
+        "factor_ids": factor_ids,
+        "weights": [round(float(weight), 8) for weight in weights],
+    }
+    return _params_signature(payload)
+
+
+def _equal_weights(factors: list[dict]) -> list[float]:
+    if not factors:
+        return []
+    return [1.0 / len(factors)] * len(factors)
+
+
+def _inverse_turnover_weights(factors: list[dict]) -> list[float]:
+    raw = [1.0 / max(0.02, min(float(factor.get("factor_turnover") or 0.10), 1.0)) for factor in factors]
+    return _normalize_positive_weights(raw)
+
+
+def _ic_strength_weights(factors: list[dict]) -> list[float]:
+    raw = [max(0.25, _ic_strength(factor)) for factor in factors]
+    return _normalize_positive_weights(raw)
+
+
+def _normalize_positive_weights(raw: list[float]) -> list[float]:
+    if not raw:
+        return []
+    total = sum(max(0.0, value) for value in raw)
+    if total <= 0:
+        return [1.0 / len(raw)] * len(raw)
+    return [max(0.0, value) / total for value in raw]
+
+
+def _diverse_subset(pool: list[dict], *, limit: int) -> list[dict]:
+    selected: list[dict] = []
+    seen_ids: set[str] = set()
+    seen_families: set[str] = set()
+    for factor in pool:
+        family = str(factor.get("hypothesis_family") or "")
+        cid = str(factor.get("candidate_id") or "")
+        if not cid or cid in seen_ids or family in seen_families:
+            continue
+        selected.append(factor)
+        seen_ids.add(cid)
+        seen_families.add(family)
+        if len(selected) >= limit:
+            return selected
+    for factor in pool:
+        cid = str(factor.get("candidate_id") or "")
+        if cid and cid not in seen_ids:
+            selected.append(factor)
+            seen_ids.add(cid)
+            if len(selected) >= limit:
+                break
+    return selected
+
+
+def _top_pairs(pool: list[dict]) -> list[list[dict]]:
+    pairs: list[list[dict]] = []
+    for idx, left in enumerate(pool):
+        for right in pool[idx + 1:]:
+            pairs.append([left, right])
+    return pairs
+
+
+def _turnover_sort_key(factor: dict) -> tuple[float, float]:
+    turnover = float(factor.get("factor_turnover") if factor.get("factor_turnover") is not None else 999.0)
+    return (turnover, -float(factor.get("research_score") or 0.0))
+
+
+def _ic_strength(factor: dict) -> float:
+    return max(abs(float(factor.get("ic_tstat") or 0.0)), abs(float(factor.get("rankic_tstat") or 0.0)))
 
 
 def _prepare_adjustments(
@@ -338,6 +553,90 @@ def _survivor_evolution_adjustments(context: dict, failed_signatures: set[str]) 
                 adjustments.append(item)
                 per_parent += 1
     return adjustments, skipped
+
+
+def _hill_climb_adjustments(context: dict, failed_signatures: set[str]) -> tuple[list[dict], int]:
+    factors_by_id = {factor["candidate_id"]: factor for factor in context.get("factors", [])}
+    adjustments: list[dict] = []
+    skipped = 0
+    seen: set[str] = set()
+    for outcome in context.get("optimizer_outcomes", [])[:_EVOLUTION_PARENT_LIMIT]:
+        if outcome.get("status") != "improved":
+            continue
+        cid = str(outcome.get("candidate_id") or "")
+        factor = factors_by_id.get(cid)
+        if factor is None:
+            continue
+        params = _hill_climb_params(factor, outcome)
+        if not params:
+            continue
+        adjustment = {
+            "candidate_id": cid,
+            "param": "evolution_params",
+            "current": "improved_optimizer_variant",
+            "suggested": params,
+            "proposal_kind": "hill_climb",
+            "variant_key": "hill_climb_neighborhood",
+            "rationale": "Continue one bounded deterministic step from an improved optimizer proposal.",
+        }
+        prepared, skipped_count = _prepare_adjustments(
+            [adjustment],
+            factors_by_id,
+            failed_signatures,
+            default_kind="hill_climb",
+        )
+        skipped += skipped_count
+        for item in prepared:
+            signature = str(item.get("proposal_signature") or "")
+            if signature in seen:
+                continue
+            seen.add(signature)
+            adjustments.append(item)
+    return adjustments[:_EVOLUTION_PARENT_LIMIT], skipped
+
+
+def _hill_climb_params(factor: dict, outcome: dict) -> dict[str, Any]:
+    params = factor.get("params") or {}
+    param_diff = outcome.get("param_diff") if isinstance(outcome.get("param_diff"), dict) else {}
+    delta_sharpe = outcome.get("delta_sharpe")
+    delta_turnover = outcome.get("delta_turnover")
+    sharpe_ok = delta_sharpe is None or float(delta_sharpe) >= -0.05
+    turnover_improved = delta_turnover is not None and float(delta_turnover) <= -0.01
+
+    if {"smooth_span", "signal_threshold", "position_buffer"} & param_diff.keys() and sharpe_ok and turnover_improved:
+        next_controls = _next_turnover_control_step(params)
+        if next_controls:
+            return next_controls
+
+    if "factor_lookback" in param_diff and (delta_sharpe is None or float(delta_sharpe) >= 0.05):
+        return _neighbor_lookback_params(factor)
+
+    if "regime_filter" in param_diff and (delta_sharpe is None or float(delta_sharpe) >= 0.05):
+        return _survivor_low_turnover_params(factor)
+    return {}
+
+
+def _next_turnover_control_step(params: dict[str, Any]) -> dict[str, float | int]:
+    try:
+        smooth_span = int(params.get("smooth_span", 1))
+        signal_threshold = float(params.get("signal_threshold", 0.0))
+        position_buffer = float(params.get("position_buffer", 0.05))
+    except (TypeError, ValueError):
+        return {}
+    ladder = (
+        {"smooth_span": 12, "signal_threshold": 0.10, "position_buffer": 0.08},
+        {"smooth_span": 24, "signal_threshold": 0.20, "position_buffer": 0.15},
+        {"smooth_span": 48, "signal_threshold": 0.30, "position_buffer": 0.25},
+        {"smooth_span": 96, "signal_threshold": 0.40, "position_buffer": 0.30},
+    )
+    for rung in ladder:
+        if (
+            smooth_span < int(rung["smooth_span"])
+            or signal_threshold < float(rung["signal_threshold"])
+            or position_buffer < float(rung["position_buffer"])
+        ):
+            return dict(rung)
+    return {}
 
 
 def _select_evolution_parents(factors: list[dict]) -> list[dict]:
@@ -435,17 +734,27 @@ def _regime_protection_params(factor: dict) -> dict[str, list[str]]:
     return {}
 
 
-def optimize_exits_traditionally(context: dict, *, limit: int = 3) -> dict:
+def optimize_exits_traditionally(context: dict, *, limit: int = _EXIT_PARENT_LIMIT) -> dict:
     """Suggest a small bounded exit grid from observed risk diagnostics."""
     selected = context.get("research_survivors") or [f for f in context["factors"] if f["gatecheck_passed"]]
     adjustments: list[dict] = []
+    seen: set[tuple[str, str]] = set()
     for factor in selected[:limit]:
-        adjustment = _traditional_exit_adjustment(factor)
-        if adjustment:
+        per_parent = 0
+        for adjustment in _traditional_exit_adjustments(factor):
+            signature = (str(adjustment.get("candidate_id") or ""), _params_signature(_exit_adjustment_params(adjustment)))
+            if signature in seen:
+                continue
+            seen.add(signature)
             adjustments.append(adjustment)
+            per_parent += 1
+            if per_parent >= _EXIT_MAX_PER_PARENT or len(adjustments) >= _EXIT_TOTAL_LIMIT:
+                break
+        if len(adjustments) >= _EXIT_TOTAL_LIMIT:
+            break
     return {
         "action": "traditional_exit_grid",
-        "reasoning": "Deterministic bounded exit adjustments from drawdown, holding-period, and cost-drag diagnostics.",
+        "reasoning": "Deterministic bounded exit variants from drawdown, holding-period, and cost-drag diagnostics.",
         "exit_adjustments": adjustments,
     }
 
@@ -467,31 +776,80 @@ def _traditional_weights(factors: list[dict]) -> list[float]:
 
 
 def _traditional_exit_adjustment(factor: dict) -> dict | None:
+    adjustments = _traditional_exit_adjustments(factor)
+    return adjustments[0] if adjustments else None
+
+
+def _traditional_exit_adjustments(factor: dict) -> list[dict]:
     cid = factor.get("candidate_id")
     if not cid:
-        return None
-    adjustment: dict[str, object] = {"candidate_id": cid}
-    reasons: list[str] = []
+        return []
+    adjustments: list[dict] = []
+    seen: set[str] = set()
     max_dd = float(factor.get("max_dd") or 0.0)
     avg_holding = factor.get("avg_holding_bars")
     cost_drag = factor.get("cost_drag_sharpe")
     trade_count = int(factor.get("trade_count") or 0)
 
+    def add(params: dict[str, object], variant_key: str, reasons: list[str]) -> None:
+        if not params:
+            return
+        signature = _params_signature(params)
+        if signature in seen:
+            return
+        seen.add(signature)
+        adjustments.append({
+            "candidate_id": cid,
+            **params,
+            "proposal_kind": "exit",
+            "variant_key": variant_key,
+            "rationale": ",".join(reasons),
+        })
+
     if max_dd <= -0.12:
-        adjustment["stop_loss_pct"] = -0.03
-        adjustment["trailing_stop_pct"] = 0.02
-        reasons.append("drawdown_control")
+        add(
+            {"stop_loss_pct": -0.03, "trailing_stop_pct": 0.02},
+            "exit_drawdown_balanced",
+            ["drawdown_control"],
+        )
+        add(
+            {"stop_loss_pct": -0.02, "trailing_stop_pct": 0.015},
+            "exit_drawdown_tight",
+            ["drawdown_control", "tight_stop"],
+        )
+    elif max_dd <= -0.08:
+        add(
+            {"stop_loss_pct": -0.04, "trailing_stop_pct": 0.025},
+            "exit_drawdown_moderate",
+            ["drawdown_control"],
+        )
     if avg_holding is not None and float(avg_holding) > 500:
-        adjustment["max_hold_bars"] = 500
-        reasons.append("bounded_holding_period")
+        add(
+            {"max_hold_bars": 500},
+            "exit_max_hold_500",
+            ["bounded_holding_period"],
+        )
+        add(
+            {"max_hold_bars": 250},
+            "exit_max_hold_250",
+            ["bounded_holding_period", "faster_recycle"],
+        )
     if cost_drag is not None and float(cost_drag) > 0.5 and trade_count >= 50:
-        adjustment["tp_tiers"] = [[0.02, 0.50]]
-        adjustment["trailing_after_first_tp"] = True
-        reasons.append("cost_drag_profit_lock")
-    if len(adjustment) == 1:
-        return None
-    adjustment["rationale"] = ",".join(reasons)
-    return adjustment
+        add(
+            {"tp_tiers": [[0.02, 0.50]], "trailing_after_first_tp": True},
+            "exit_profit_lock_balanced",
+            ["cost_drag_profit_lock"],
+        )
+        add(
+            {"tp_tiers": [[0.01, 0.40]], "trailing_stop_pct": 0.015, "trailing_after_first_tp": True},
+            "exit_profit_lock_fast",
+            ["cost_drag_profit_lock", "fast_partial"],
+        )
+    return adjustments[:_EXIT_MAX_PER_PARENT]
+
+
+def _exit_adjustment_params(adjustment: dict) -> dict[str, object]:
+    return {key: adjustment[key] for key in _EXIT_PARAM_KEYS if key in adjustment}
 
 
 def _select_research_survivors(factors: list[dict], *, limit: int = 8) -> list[dict]:
@@ -817,9 +1175,11 @@ def apply_optimization_result(
                     "components": components,
                     "horizon": combo.get("horizon", "5m"),
                     "rationale": combo.get("rationale", ""),
-                    "search_variant": "survivor_combo_low_turnover",
+                    "search_variant": combo.get("search_variant", "survivor_combo_low_turnover"),
                     "generated_by": "traditional_survivor_composite",
                     "turnover_objective": "reduce_churn_before_final_gate",
+                    "subset_strategy": combo.get("subset_strategy", "top8"),
+                    "weighting_scheme": combo.get("weighting_scheme", "traditional"),
                     **turnover_controls,
                 },
             ))
@@ -987,6 +1347,10 @@ def apply_exit_adjustments(
         new_c.params["parent_id"] = cid
         new_c.params["generated_by"] = "traditional_exit_adjustment"
         new_c.params["exit_rationale"] = adj.get("rationale", "")
+        if adj.get("variant_key"):
+            new_c.params["exit_variant_key"] = adj.get("variant_key")
+        if adj.get("proposal_kind"):
+            new_c.params["exit_proposal_kind"] = adj.get("proposal_kind")
         new_candidates.append(new_c)
     return new_candidates
 

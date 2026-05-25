@@ -15,7 +15,13 @@ from factor_mining.models import (
     MetricsBlock,
     ResearchGateResult,
 )
-from factor_mining.optimizers.traditional_optimizer import apply_exit_adjustments, apply_optimization_result, build_optimization_context, optimize_traditionally
+from factor_mining.optimizers.traditional_optimizer import (
+    apply_exit_adjustments,
+    apply_optimization_result,
+    build_optimization_context,
+    optimize_exits_traditionally,
+    optimize_traditionally,
+)
 import factor_mining.pipeline as pipeline
 from factor_mining.pipeline import (
     _apply_batch_pbo,
@@ -994,6 +1000,40 @@ def test_exit_adjustments_dedupe_within_parent_not_across_candidates() -> None:
     assert {c.params["parent_id"] for c in generated} == {"c_first", "c_second"}
 
 
+def test_exit_optimizer_generates_bounded_variants_with_metadata() -> None:
+    candidate = CandidateStrategySpec(
+        candidate_id="c_exit_opt",
+        hypothesis_id="h1",
+        method_id="factor_scoring",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+        market="um_futures",
+    )
+    result = BacktestResult(
+        experiment_id="exp-exit-opt",
+        candidate_id="c_exit_opt",
+        hypothesis_family="momentum",
+        method_id="factor_scoring",
+        symbol="BTCUSDT",
+        market="um_futures",
+        interval="5m",
+        metrics_primary=MetricsBlock(sharpe=0.3, max_drawdown=-0.15, trade_count=120),
+        metrics_gross=MetricsBlock(sharpe=1.0),
+        avg_holding_period_bars=800,
+    )
+    gate = GateCheckResult(experiment_id="exp-exit-opt", passed=True, items=[])
+    ctx = build_optimization_context([candidate], [result], [gate], iteration=0)
+
+    optimization = optimize_exits_traditionally(ctx)
+    candidates = apply_exit_adjustments(optimization, [candidate], Settings())
+    generated = [item for item in candidates if item.params.get("generated_by") == "traditional_exit_adjustment"]
+
+    assert len(optimization["exit_adjustments"]) == 3
+    assert len(generated) == 3
+    assert {item.params.get("exit_proposal_kind") for item in generated} == {"exit"}
+    assert {item.params.get("exit_variant_key") for item in generated}
+
+
 def test_optimizer_uses_research_survivors_when_gatecheck_has_no_passes() -> None:
     base_a = CandidateStrategySpec(
         candidate_id="c_a",
@@ -1064,12 +1104,62 @@ def test_optimizer_uses_research_survivors_when_gatecheck_has_no_passes() -> Non
     assert ctx["num_gatecheck_passed"] == 0
     assert ctx["num_research_survivors"] == 2
     assert set(optimization["combinations"][0]["factor_ids"]) == {"c_a", "c_b"}
-    assert summary["combinations_created"] == 1
+    assert summary["combinations_created"] >= 2
     combo = next(c for c in new_candidates if c.hypothesis_family == "composite")
     assert combo.params["search_variant"] == "survivor_combo_low_turnover"
     assert combo.params["smooth_span"] >= 24
     assert combo.params["signal_threshold"] >= 0.20
     assert combo.params["position_buffer"] >= 0.15
+    assert any(c.params.get("weighting_scheme") == "inverse_turnover" for c in new_candidates if c.hypothesis_family == "composite")
+
+
+def test_optimizer_generates_multiple_composite_subset_and_weight_variants() -> None:
+    candidates = [
+        CandidateStrategySpec(
+            candidate_id=f"c_{idx}",
+            hypothesis_id=f"h{idx}",
+            method_id="factor_scoring",
+            hypothesis_family=family,
+            symbol="BTCUSDT",
+            market="um_futures",
+        )
+        for idx, family in enumerate(["momentum", "mean_reversion", "volatility", "funding_basis", "volume_confirmation"], start=1)
+    ]
+    results = [
+        BacktestResult(
+            experiment_id=f"exp-{idx}",
+            candidate_id=candidate.candidate_id,
+            hypothesis_family=candidate.hypothesis_family,
+            method_id=candidate.method_id,
+            symbol=candidate.symbol,
+            market=candidate.market,
+            interval="5m",
+            metrics_primary=MetricsBlock(sharpe=0.2 + idx * 0.05),
+            metrics_gross=MetricsBlock(sharpe=0.7 + idx * 0.05),
+            ic_tstat_nw=1.5 + idx * 0.2,
+            factor_turnover=0.04 + idx * 0.03,
+            break_even_cost_bps=10.0,
+            actual_cost_bps=2.0,
+            oos_trade_count=200,
+        )
+        for idx, candidate in enumerate(candidates, start=1)
+    ]
+    gates = [
+        GateCheckResult(experiment_id=result.experiment_id, passed=True, items=[])
+        for result in results
+    ]
+
+    ctx = build_optimization_context(candidates, results, gates, iteration=0)
+    optimization = optimize_traditionally(ctx, "full")
+    new_candidates, summary = apply_optimization_result(optimization, candidates, results)
+
+    composites = [item for item in new_candidates if item.hypothesis_family == "composite"]
+    assert len(optimization["combinations"]) > 1
+    assert summary["combinations_created"] == len(composites)
+    assert "top4" in {item.params.get("subset_strategy") for item in composites}
+    assert "low_turnover8" in {item.params.get("subset_strategy") for item in composites}
+    assert "inverse_turnover" in {item.params.get("weighting_scheme") for item in composites}
+    assert any(item.params.get("subset_strategy") == "pair_grid" for item in composites)
 
 
 def test_survivor_evolution_generates_bounded_variants() -> None:
@@ -1228,6 +1318,69 @@ def test_optimizer_memory_skips_failed_duplicate_proposal() -> None:
 
     assert not any(item.get("param") == "evolution_params" for item in second["adjustments"])
     assert second["proposal_counts"]["memory_skipped"] >= 1
+
+
+def test_optimizer_hill_climbs_from_improved_turnover_proposal() -> None:
+    parent = CandidateStrategySpec(
+        candidate_id="c_hill_parent",
+        hypothesis_id="h1",
+        method_id="factor_scoring",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+        market="um_futures",
+    )
+    parent_result = BacktestResult(
+        experiment_id="exp-hill-parent",
+        candidate_id="c_hill_parent",
+        hypothesis_family="momentum",
+        method_id="factor_scoring",
+        symbol="BTCUSDT",
+        market="um_futures",
+        interval="5m",
+        metrics_primary=MetricsBlock(sharpe=0.5),
+        metrics_gross=MetricsBlock(sharpe=0.7),
+        factor_turnover=0.20,
+    )
+    generated, _summary = apply_optimization_result(
+        {
+            "adjustments": [{
+                "candidate_id": "c_hill_parent",
+                "param": "evolution_params",
+                "suggested": {"smooth_span": 24, "signal_threshold": 0.20, "position_buffer": 0.15},
+                "proposal_kind": "evolution",
+                "variant_key": "survivor_evolve_low_turnover",
+            }]
+        },
+        [parent],
+        [parent_result],
+    )
+    child = generated[0]
+    child_result = BacktestResult(
+        experiment_id="exp-hill-child",
+        candidate_id=child.candidate_id,
+        hypothesis_family="momentum",
+        method_id="factor_scoring",
+        symbol="BTCUSDT",
+        market="um_futures",
+        interval="5m",
+        metrics_primary=MetricsBlock(sharpe=0.5),
+        metrics_gross=MetricsBlock(sharpe=0.7),
+        factor_turnover=0.12,
+    )
+    ctx = build_optimization_context(
+        [child],
+        [child_result],
+        [GateCheckResult(experiment_id="exp-hill-child", passed=True, items=[])],
+        iteration=1,
+    )
+
+    optimization = optimize_traditionally(ctx, "full")
+    hill = next(item for item in optimization["adjustments"] if item.get("proposal_kind") == "hill_climb")
+
+    assert hill["suggested"]["smooth_span"] == 48
+    assert hill["suggested"]["signal_threshold"] == 0.30
+    assert hill["suggested"]["position_buffer"] == 0.25
+    assert optimization["proposal_counts"]["hill_climb"] == 1
 
 
 def test_single_research_survivor_generates_low_turnover_variant() -> None:
