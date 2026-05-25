@@ -264,9 +264,12 @@ def _make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
 
 def _run_args(payload: dict[str, Any]) -> dict[str, Any]:
     tail = _as_int(payload.get("tail"), 50_000)
+    legacy_iterations = max(1, min(_as_int(payload.get("iterations"), 1), 7))
     return {
         "use_llm": bool(payload.get("use_llm", False)),
-        "iterations": max(1, min(_as_int(payload.get("iterations"), 1), 7)),
+        "iterations": legacy_iterations,
+        "discovery_rounds": max(1, min(_as_int(payload.get("discovery_rounds"), 1), 7)),
+        "optimization_rounds": max(0, min(_as_int(payload.get("optimization_rounds"), max(0, legacy_iterations - 1)), 7)),
         "hypothesis_count": max(1, min(_as_int(payload.get("hypothesis_count"), 5), 10)),
         "max_workers": max(1, _as_int(payload.get("max_workers"), 1)),
         "tail": None if tail <= 0 else tail,
@@ -345,6 +348,8 @@ def _start_dashboard_run(settings: Settings, args: dict[str, Any]) -> tuple[bool
                 research_brief=args["research_brief"],
                 hypothesis_count=args["hypothesis_count"],
                 iterations=args["iterations"],
+                discovery_rounds=args["discovery_rounds"],
+                optimization_rounds=args["optimization_rounds"],
                 store=worker_store,
                 event_sink=sink,
                 run_id=run_id,
@@ -424,6 +429,8 @@ def _start_hosted_run(settings: Settings, args: dict[str, Any]) -> tuple[bool, s
                     research_brief=args["research_brief"],
                     hypothesis_count=args["hypothesis_count"],
                     iterations=args["iterations"],
+                    discovery_rounds=args["discovery_rounds"],
+                    optimization_rounds=args["optimization_rounds"],
                     store=worker_store,
                     event_sink=sink,
                     run_id=run_id,

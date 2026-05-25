@@ -10,6 +10,8 @@ const app = {
   runArgs: {
     use_llm: false,
     iterations: 1,
+    discovery_rounds: 1,
+    optimization_rounds: 0,
     hypothesis_count: 5,
     max_workers: 1,
     tail: 50000,
@@ -316,9 +318,10 @@ function renderRail() {
             ${active ? `<span class="badge info">${icon("activity", 11)}${esc(active.status)} ${esc(shortId(active.run_id))}</span>` : `<span class="muted mono">No active run.</span>`}
             <label class="toggle-row"><span>Use DeepSeek hypotheses</span><input data-run-field="use_llm" type="checkbox" ${app.runArgs.use_llm ? "checked" : ""} ${active ? "disabled" : ""}></label>
             <div class="field-row">
-              ${field("Rounds", "iterations", "number", 1, 7, active)}
-              ${app.runArgs.use_llm ? field("Hypotheses", "hypothesis_count", "number", 1, 10, active) : `<span class="muted" style="font-size:11px;align-self:center">19 built-in</span>`}
+              ${field("Discovery rounds", "discovery_rounds", "number", 1, 7, active)}
+              ${field("Optimization rounds", "optimization_rounds", "number", 0, 7, active)}
             </div>
+            ${app.runArgs.use_llm ? field("Hypotheses", "hypothesis_count", "number", 1, 10, active) : `<div class="muted" style="font-size:11px;line-height:1.35">19 built-in hypotheses</div>`}
             <div class="field-row">
               ${field("Workers", "max_workers", "number", 1, 64, active)}
               ${field("Archive top", "archive_top", "number", 0, 10, active)}

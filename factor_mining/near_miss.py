@@ -131,7 +131,12 @@ def analyze_near_miss(
     if not reasons:
         reasons.append("no_evidence")
 
-    actionable = bool(suggested) and reasons[0] != "no_evidence"
+    suggested_variants = _suggested_param_variants(candidate, suggested)
+    actionable = bool(suggested_variants) and reasons[0] != "no_evidence"
+    if actionable:
+        suggested = dict(suggested_variants[0])
+    else:
+        suggested = {}
     return NearMissAnalysis(
         experiment_id=result.experiment_id,
         candidate_id=result.candidate_id,
@@ -139,35 +144,50 @@ def analyze_near_miss(
         reasons=_dedupe(reasons),
         actionable=actionable,
         suggested_params=suggested,
+        suggested_param_variants=suggested_variants if actionable else [],
         repair_actions=_dedupe(actions),
         diagnostics=diagnostics,
     )
 
 
-def repair_adjustments_from_near_misses(near_misses: list[NearMissAnalysis], *, limit: int = 16) -> list[dict]:
+def repair_adjustments_from_near_misses(
+    near_misses: list[NearMissAnalysis],
+    *,
+    limit: int = 48,
+    max_per_parent: int = 4,
+) -> list[dict]:
     adjustments: list[dict] = []
     seen: set[tuple[str, str]] = set()
+    per_parent: dict[str, int] = {}
     for miss in near_misses:
         if not miss.actionable:
             continue
-        signature = (miss.candidate_id, _params_signature(miss.suggested_params))
-        if signature in seen:
-            continue
-        seen.add(signature)
-        adjustments.append({
-            "candidate_id": miss.candidate_id,
-            "param": "repair_params",
-            "current": "failed_candidate",
-            "suggested": {
-                **miss.suggested_params,
-                "near_miss_reason": miss.primary_reason,
-                "near_miss_reasons": miss.reasons,
-                "repair_actions": miss.repair_actions,
-            },
-            "rationale": f"Near-miss repair for {miss.primary_reason}: {', '.join(miss.repair_actions)}",
-        })
-        if len(adjustments) >= limit:
-            break
+        variants = miss.suggested_param_variants or ([miss.suggested_params] if miss.suggested_params else [])
+        for idx, variant in enumerate(variants):
+            if per_parent.get(miss.candidate_id, 0) >= max_per_parent:
+                break
+            signature = (miss.candidate_id, _params_signature(variant))
+            if signature in seen:
+                continue
+            seen.add(signature)
+            per_parent[miss.candidate_id] = per_parent.get(miss.candidate_id, 0) + 1
+            adjustments.append({
+                "candidate_id": miss.candidate_id,
+                "param": "repair_params",
+                "current": "failed_candidate",
+                "suggested": {
+                    **variant,
+                    "near_miss_reason": miss.primary_reason,
+                    "near_miss_reasons": miss.reasons,
+                    "repair_actions": miss.repair_actions,
+                },
+                "proposal_kind": "near_miss_repair",
+                "variant_key": _variant_key(miss.primary_reason, variant, idx),
+                "param_diff": variant,
+                "rationale": f"Near-miss repair for {miss.primary_reason}: {', '.join(miss.repair_actions)}",
+            })
+            if len(adjustments) >= limit:
+                return adjustments
     return adjustments
 
 
@@ -278,6 +298,50 @@ _LOW_TURNOVER_LADDER: tuple[dict[str, float | int], ...] = (
     {"smooth_span": 96, "signal_threshold": 0.40, "position_buffer": 0.30},
 )
 
+_LOW_TURNOVER_GRID: tuple[dict[str, float | int], ...] = (
+    {"smooth_span": 12, "signal_threshold": 0.10, "position_buffer": 0.08},
+    {"smooth_span": 24, "signal_threshold": 0.20, "position_buffer": 0.15},
+    {"smooth_span": 48, "signal_threshold": 0.30, "position_buffer": 0.25},
+    {"smooth_span": 96, "signal_threshold": 0.40, "position_buffer": 0.30},
+)
+
+_LOW_TURNOVER_KEYS = {"smooth_span", "signal_threshold", "position_buffer"}
+
+
+def _suggested_param_variants(
+    candidate: CandidateStrategySpec | None,
+    suggested: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not suggested:
+        return []
+    variants: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add_variant(params: dict[str, Any]) -> None:
+        signature = _params_signature(params)
+        if signature in seen:
+            return
+        seen.add(signature)
+        variants.append(dict(params))
+
+    add_variant(suggested)
+    if _LOW_TURNOVER_KEYS & suggested.keys():
+        additive = {key: value for key, value in suggested.items() if key not in _LOW_TURNOVER_KEYS}
+        for params in _low_turnover_grid_params(candidate):
+            add_variant({**additive, **params})
+    return variants[:4]
+
+
+def _low_turnover_grid_params(
+    candidate: CandidateStrategySpec | None,
+) -> list[dict[str, float | int]]:
+    current_idx = _current_low_turnover_grid_index(candidate.params if candidate is not None else {})
+    if current_idx >= len(_LOW_TURNOVER_GRID) - 1:
+        return []
+    if current_idx >= 0:
+        return [dict(item) for item in _LOW_TURNOVER_GRID[current_idx + 1:]]
+    return [dict(item) for item in _LOW_TURNOVER_GRID]
+
 
 def _suggest_low_turnover_params(
     candidate: CandidateStrategySpec | None,
@@ -304,6 +368,14 @@ def _low_turnover_params(
 
 
 def _current_low_turnover_ladder_index(params: dict[str, Any]) -> int:
+    return _current_low_turnover_index(params, _LOW_TURNOVER_LADDER)
+
+
+def _current_low_turnover_grid_index(params: dict[str, Any]) -> int:
+    return _current_low_turnover_index(params, _LOW_TURNOVER_GRID)
+
+
+def _current_low_turnover_index(params: dict[str, Any], ladder: tuple[dict[str, float | int], ...]) -> int:
     try:
         smooth_span = int(params.get("smooth_span", 1))
         signal_threshold = float(params.get("signal_threshold", 0.0))
@@ -311,7 +383,7 @@ def _current_low_turnover_ladder_index(params: dict[str, Any]) -> int:
     except (TypeError, ValueError):
         return -1
     current_idx = -1
-    for idx, rung in enumerate(_LOW_TURNOVER_LADDER):
+    for idx, rung in enumerate(ladder):
         if (
             smooth_span >= int(rung["smooth_span"])
             and signal_threshold >= float(rung["signal_threshold"])
@@ -319,6 +391,21 @@ def _current_low_turnover_ladder_index(params: dict[str, Any]) -> int:
         ):
             current_idx = idx
     return current_idx
+
+
+def _variant_key(reason: str, variant: dict[str, Any], idx: int) -> str:
+    controls = []
+    for key in ("smooth_span", "signal_threshold", "position_buffer", "factor_lookback", "side_mode"):
+        if key in variant:
+            controls.append(f"{key}={variant[key]}")
+    if "regime_filter" in variant:
+        controls.append(f"regime={','.join(str(item) for item in variant['regime_filter'])}")
+    if "funding_state_filter" in variant:
+        controls.append(f"funding_state={','.join(str(item) for item in variant['funding_state_filter'])}")
+    if "funding_trend_filter" in variant:
+        controls.append(f"funding_trend={','.join(str(item) for item in variant['funding_trend_filter'])}")
+    suffix = "_".join(controls) if controls else f"variant={idx}"
+    return f"{reason}_{suffix}"
 
 
 def _params_signature(params: dict[str, Any]) -> str:

@@ -174,6 +174,87 @@ def test_run_pipeline_executes_symbol_rounds_in_parallel(monkeypatch) -> None:
     assert max_workers_seen == [1, 1]
 
 
+def test_split_round_controls_disable_repairs_and_stop_on_optimizer_convergence(monkeypatch) -> None:
+    candidate = _candidate("c_btc", "BTCUSDT")
+    contexts = {pipeline._data_key(candidate): _context_for(candidate)}
+    calls: list[dict] = []
+
+    monkeypatch.setattr(pipeline, "build_v1_candidates", lambda *args, **kwargs: [candidate])
+    monkeypatch.setattr(pipeline, "build_indicator_candidates", lambda *args, **kwargs: [candidate])
+    monkeypatch.setattr(pipeline, "_load_data_contexts", lambda *args, **kwargs: contexts)
+
+    def fake_round(
+        *,
+        current_candidates,
+        phase,
+        allow_pre_gate_repair,
+        allow_optimizer_repairs,
+        allow_next_hypotheses,
+        round_num,
+        **kwargs,
+    ):
+        calls.append({
+            "phase": phase,
+            "allow_pre_gate_repair": allow_pre_gate_repair,
+            "allow_optimizer_repairs": allow_optimizer_repairs,
+            "allow_next_hypotheses": allow_next_hypotheses,
+        })
+        current = current_candidates[0]
+        result = BacktestResult(
+            experiment_id=f"exp-{round_num}",
+            candidate_id=current.candidate_id,
+            hypothesis_family=current.hypothesis_family,
+            method_id=current.method_id,
+            symbol=current.symbol,
+            market=current.market,
+            interval=current.interval,
+            metrics_primary=MetricsBlock(sharpe=0.0),
+            pbo=0.2,
+        )
+        next_candidate = current.model_copy(deep=True)
+        next_candidate.candidate_id = f"c_next_{round_num}"
+        next_candidate.parent_candidate_id = current.candidate_id
+        next_candidate.params.update({
+            "generated_by": "traditional_survivor_adjustment",
+            "search_variant": "survivor_low_turnover",
+            "parent_id": current.candidate_id,
+            "smooth_span": 48,
+            "signal_threshold": 0.25,
+        })
+        return {
+            "candidates": [current],
+            "backtests": [result],
+            "gatechecks": [],
+            "hardscores": [],
+            "factor_evidence": [],
+            "research_gates": [],
+            "near_misses": [],
+            "new_candidates": [next_candidate],
+            "research_survivors": [],
+            "detail_artifact_ids": [],
+            "history_entry": {"phase": phase, "num_candidates": 1, "num_backtests": 1},
+        }
+
+    monkeypatch.setattr(pipeline, "_run_mining_round", fake_round)
+
+    result = run_pipeline(
+        Settings(data=DataConfig(symbols=["BTCUSDT"])),
+        use_llm=False,
+        seed_hypotheses=[_hypothesis()],
+        archive_top=0,
+        discovery_rounds=1,
+        optimization_rounds=4,
+    )
+
+    assert [call["phase"] for call in calls] == ["discovery", "optimization", "optimization"]
+    assert calls[0]["allow_pre_gate_repair"] is True
+    assert calls[1]["allow_pre_gate_repair"] is False
+    assert calls[1]["allow_optimizer_repairs"] is False
+    assert calls[1]["allow_next_hypotheses"] is False
+    assert result.optimization_history[-1]["converged"] is True
+    assert result.total_rounds == 3
+
+
 def test_mining_round_skips_discovery_pbo_and_uses_validation_pbo(monkeypatch) -> None:
     import factor_mining.hardscore as hardscore_module
     import factor_mining.optimizers.traditional_optimizer as optimizer_module
@@ -287,7 +368,7 @@ def test_mining_round_skips_discovery_pbo_and_uses_validation_pbo(monkeypatch) -
     monkeypatch.setattr(
         optimizer_module,
         "apply_optimization_result",
-        lambda _optimization, candidates, _results: (
+        lambda _optimization, candidates, _results, **_kwargs: (
             list(candidates),
             {
                 "combinations_created": 0,
@@ -743,6 +824,39 @@ def test_optimization_result_accepts_compact_schema_variants() -> None:
     assert repaired.params["regime_filter"] == ["sideways", "unknown"]
 
 
+def test_optimization_result_can_suppress_repairs_and_next_hypotheses() -> None:
+    candidate = CandidateStrategySpec(
+        candidate_id="c_a",
+        hypothesis_id="h1",
+        method_id="factor_scoring",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+        market="um_futures",
+    )
+    optimization = {
+        "adjustments": [
+            {"candidate_id": "c_a", "suggested": {"regime_filter": ["bull"]}},
+        ],
+        "next_hypotheses": [
+            {"family": "Momentum", "mechanism": "trend persistence"},
+        ],
+    }
+
+    new_candidates, summary = apply_optimization_result(
+        optimization,
+        [candidate],
+        [],
+        allow_repairs=False,
+        allow_next_hypotheses=False,
+    )
+
+    assert new_candidates == []
+    assert summary["repairs_suppressed"] == 1
+    assert summary["hypotheses_suppressed"] == 1
+    assert summary["repairs_created"] == 0
+    assert summary["hypotheses_suggested"] == 0
+
+
 def test_status_adjustment_does_not_mutate_source_candidate() -> None:
     candidate = CandidateStrategySpec(
         candidate_id="c_failed",
@@ -958,6 +1072,164 @@ def test_optimizer_uses_research_survivors_when_gatecheck_has_no_passes() -> Non
     assert combo.params["position_buffer"] >= 0.15
 
 
+def test_survivor_evolution_generates_bounded_variants() -> None:
+    candidate = CandidateStrategySpec(
+        candidate_id="c_survivor",
+        hypothesis_id="h1",
+        method_id="factor_scoring",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+        market="um_futures",
+        params={"signal_source": "factor_signal", "factor_family": "momentum", "factor_lookback": 12},
+    )
+    result = BacktestResult(
+        experiment_id="exp-survivor",
+        candidate_id="c_survivor",
+        hypothesis_family="momentum",
+        method_id="factor_scoring",
+        symbol="BTCUSDT",
+        market="um_futures",
+        interval="5m",
+        metrics_primary=MetricsBlock(sharpe=0.5),
+        metrics_gross=MetricsBlock(sharpe=0.7),
+        factor_turnover=0.16,
+        break_even_cost_bps=8.0,
+        actual_cost_bps=2.0,
+        regime_conditional_metrics={
+            "bull": MetricsBlock(sharpe=1.2),
+            "bear": MetricsBlock(sharpe=-0.1),
+        },
+    )
+    gate = GateCheckResult(experiment_id="exp-survivor", passed=True, items=[])
+
+    ctx = build_optimization_context([candidate], [result], [gate], iteration=0)
+    optimization = optimize_traditionally(ctx, "full")
+    new_candidates, summary = apply_optimization_result(optimization, [candidate], [result])
+
+    evolved = [item for item in new_candidates if item.params.get("generated_by") == "traditional_survivor_evolution"]
+    assert summary["evolutions_created"] == 3
+    assert {item.params["search_variant"] for item in evolved} == {
+        "survivor_evolve_low_turnover",
+        "survivor_evolve_lookback",
+        "survivor_evolve_regime_filter",
+    }
+    assert all(item.params["optimizer_proposal_id"] for item in evolved)
+    assert all(item.params["optimizer_root_parent_id"] == "c_survivor" for item in evolved)
+    assert next(item for item in evolved if item.params["search_variant"] == "survivor_evolve_lookback").params["factor_lookback"] == 24
+    assert next(item for item in evolved if item.params["search_variant"] == "survivor_evolve_regime_filter").params["regime_filter"] == ["bull"]
+
+
+def test_optimizer_lineage_context_computes_outcome_delta() -> None:
+    parent = CandidateStrategySpec(
+        candidate_id="c_parent",
+        hypothesis_id="h1",
+        method_id="factor_scoring",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+        market="um_futures",
+    )
+    parent_result = BacktestResult(
+        experiment_id="exp-parent",
+        candidate_id="c_parent",
+        hypothesis_family="momentum",
+        method_id="factor_scoring",
+        symbol="BTCUSDT",
+        market="um_futures",
+        interval="5m",
+        metrics_primary=MetricsBlock(sharpe=0.6, max_drawdown=-0.08),
+        metrics_gross=MetricsBlock(sharpe=0.7),
+        factor_turnover=0.20,
+        break_even_cost_bps=8.0,
+        actual_cost_bps=2.0,
+    )
+    optimization = {
+        "adjustments": [{
+            "candidate_id": "c_parent",
+            "param": "evolution_params",
+            "suggested": {"smooth_span": 48, "signal_threshold": 0.25, "position_buffer": 0.20},
+            "proposal_kind": "evolution",
+            "variant_key": "survivor_evolve_low_turnover",
+            "rationale": "test lineage",
+        }]
+    }
+    generated, _summary = apply_optimization_result(optimization, [parent], [parent_result])
+    child = generated[0]
+    child_result = BacktestResult(
+        experiment_id="exp-child",
+        candidate_id=child.candidate_id,
+        hypothesis_family="momentum",
+        method_id="factor_scoring",
+        symbol="BTCUSDT",
+        market="um_futures",
+        interval="5m",
+        metrics_primary=MetricsBlock(sharpe=0.4, max_drawdown=-0.10),
+        metrics_gross=MetricsBlock(sharpe=0.5),
+        factor_turnover=0.22,
+        break_even_cost_bps=6.0,
+        actual_cost_bps=2.0,
+    )
+    ctx = build_optimization_context(
+        [child],
+        [child_result],
+        [GateCheckResult(experiment_id="exp-child", passed=False, items=[])],
+        iteration=1,
+    )
+
+    outcome = ctx["optimizer_outcomes"][0]
+    assert outcome["status"] == "failed"
+    assert round(outcome["delta_sharpe"], 6) == -0.2
+    assert round(outcome["delta_turnover"], 6) == 0.02
+    assert ctx["optimizer_outcome_counts"] == {"failed": 1}
+
+
+def test_optimizer_memory_skips_failed_duplicate_proposal() -> None:
+    candidate = CandidateStrategySpec(
+        candidate_id="c_memory",
+        hypothesis_id="h1",
+        method_id="factor_scoring",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+        market="um_futures",
+    )
+    result = BacktestResult(
+        experiment_id="exp-memory",
+        candidate_id="c_memory",
+        hypothesis_family="momentum",
+        method_id="factor_scoring",
+        symbol="BTCUSDT",
+        market="um_futures",
+        interval="5m",
+        metrics_primary=MetricsBlock(sharpe=0.5),
+        metrics_gross=MetricsBlock(sharpe=0.6),
+        factor_turnover=0.18,
+    )
+    gate = GateCheckResult(experiment_id="exp-memory", passed=True, items=[])
+    first_ctx = build_optimization_context([candidate], [result], [gate], iteration=0)
+    first = optimize_traditionally(first_ctx, "full")
+    failed_signature = next(
+        item["proposal_signature"]
+        for item in first["adjustments"]
+        if item.get("param") == "evolution_params"
+    )
+
+    second_ctx = build_optimization_context(
+        [candidate],
+        [result],
+        [gate],
+        iteration=1,
+        previous_actions=[{
+            "optimizer_outcomes": [{
+                "status": "failed",
+                "proposal_signature": failed_signature,
+            }]
+        }],
+    )
+    second = optimize_traditionally(second_ctx, "full")
+
+    assert not any(item.get("param") == "evolution_params" for item in second["adjustments"])
+    assert second["proposal_counts"]["memory_skipped"] >= 1
+
+
 def test_single_research_survivor_generates_low_turnover_variant() -> None:
     candidate = CandidateStrategySpec(
         candidate_id="c_single",
@@ -991,11 +1263,12 @@ def test_single_research_survivor_generates_low_turnover_variant() -> None:
 
     assert ctx["num_research_survivors"] == 1
     assert summary["combinations_created"] == 0
-    assert summary["adjustments_applied"] == 1
-    assert new_candidates[0].params["search_variant"] == "survivor_low_turnover"
-    assert new_candidates[0].params["smooth_span"] == 48
-    assert new_candidates[0].params["signal_threshold"] == 0.25
-    assert new_candidates[0].params["position_buffer"] == 0.20
+    assert summary["adjustments_applied"] == 2
+    survivor_low_turnover = next(item for item in new_candidates if item.params["search_variant"] == "survivor_low_turnover")
+    assert survivor_low_turnover.params["smooth_span"] == 48
+    assert survivor_low_turnover.params["signal_threshold"] == 0.25
+    assert survivor_low_turnover.params["position_buffer"] == 0.20
+    assert summary["evolutions_created"] == 1
 
 
 def test_boundary_conditions_do_not_block_repair_candidates() -> None:

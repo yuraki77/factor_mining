@@ -84,7 +84,9 @@ def mine_run(
     seed: int = typer.Option(42, "--seed", help="Deterministic seed for block sampling."),
     resume: str | None = typer.Option(None, "--resume", help="Resume from checkpoints saved under a previous run id."),
     archive_top: int = typer.Option(3, "--archive", help="Number of top experiments to archive."),
-    iterations: int = typer.Option(1, "--iterations", help="Max mining rounds (1=single pass, >1=iterative traditional optimization)."),
+    iterations: int = typer.Option(1, "--iterations", help="Legacy total rounds: 1 discovery + N-1 optimization rounds when split controls are omitted."),
+    discovery_rounds: int | None = typer.Option(None, "--discovery-rounds", help="Discovery rounds that may generate broad candidates and pre-gate repairs."),
+    optimization_rounds: int | None = typer.Option(None, "--optimization-rounds", help="Optimization rounds that tune survivors and stop early on convergence."),
     btc_leverage: float | None = typer.Option(None, "--btc-leverage", help="Run-scoped BTCUSDT max leverage override."),
     eth_leverage: float | None = typer.Option(None, "--eth-leverage", help="Run-scoped ETHUSDT max leverage override."),
     taker_bps: float | None = typer.Option(None, "--taker-bps", help="Run-scoped taker fee assumption, in bps."),
@@ -94,8 +96,8 @@ def mine_run(
 ) -> None:
     """Run the full factor mining pipeline: hypotheses → backtest → gatecheck → hardscore → optimize.
 
-    With --iterations > 1, deterministic optimizer suggestions are backtested in subsequent rounds
-    until convergence or the iteration limit is reached.
+    Discovery rounds generate broad candidates and pre-gate repairs. Optimization rounds
+    only tune survivor outputs and stop early on convergence.
     """
     from factor_mining.pipeline import run_pipeline
 
@@ -121,6 +123,8 @@ def mine_run(
         "seed": seed,
         "archive_top": archive_top,
         "iterations": iterations,
+        "discovery_rounds": discovery_rounds,
+        "optimization_rounds": optimization_rounds,
         "btc_leverage": btc_leverage,
         "eth_leverage": eth_leverage,
         "taker_bps": taker_bps,
@@ -141,6 +145,7 @@ def mine_run(
             for key in (
                 "use_llm", "hypothesis_count", "research_brief", "symbols", "max_workers",
                 "tail", "sample_bars", "sample_mode", "seed", "archive_top", "iterations",
+                "discovery_rounds", "optimization_rounds",
                 "btc_leverage", "eth_leverage", "taker_bps",
                 "slippage_base_bps", "slippage_k", "slippage_gamma",
             )
@@ -169,6 +174,8 @@ def mine_run(
             research_brief=run_args.get("research_brief"),
             hypothesis_count=int(run_args["hypothesis_count"]),
             iterations=int(run_args["iterations"]),
+            discovery_rounds=run_args.get("discovery_rounds"),
+            optimization_rounds=run_args.get("optimization_rounds"),
             store=store,
             event_sink=sink,
             run_id=run_id,

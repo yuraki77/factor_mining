@@ -88,6 +88,8 @@ def test_near_miss_classifies_cost_and_turnover_repairs() -> None:
     assert miss.actionable is True
     assert miss.suggested_params["smooth_span"] == 48
     assert miss.suggested_params["signal_threshold"] == 0.30
+    assert len(miss.suggested_param_variants) == 4
+    assert {variant["smooth_span"] for variant in miss.suggested_param_variants} == {12, 24, 48, 96}
 
 
 def test_near_miss_ladder_advances_instead_of_repeating_same_turnover_repair() -> None:
@@ -263,10 +265,13 @@ def test_optimizer_turns_near_miss_into_repair_candidate() -> None:
 
     repair_candidates = [item for item in new_candidates if item.params.get("generated_by") == "near_miss_repair"]
     assert ctx["repair_adjustments"]
-    assert summary["repairs_created"] == 1
+    assert summary["repairs_created"] == 4
     assert repair_candidates
     assert repair_candidates[0].params["near_miss_reason"] == "cost_destroyed_edge"
     assert repair_candidates[0].params["search_variant"] == "repair_cost_destroyed_edge"
+    assert repair_candidates[0].params["optimizer_proposal_id"]
+    assert repair_candidates[0].params["optimizer_root_parent_id"] == "cand-near"
+    assert repair_candidates[0].params["optimizer_parent_metrics"]["sharpe"] == -0.2
 
 
 def test_optimizer_dedupes_equivalent_near_miss_repair_adjustments() -> None:
@@ -357,5 +362,6 @@ def test_repair_adjustments_from_near_misses_limits_to_actionable() -> None:
 
     adjustments = repair_adjustments_from_near_misses([actionable, actionable, passed])
 
-    assert len(adjustments) == 1
-    assert adjustments[0]["param"] == "repair_params"
+    assert len(adjustments) == 4
+    assert {item["param"] for item in adjustments} == {"repair_params"}
+    assert {item["variant_key"] for item in adjustments}

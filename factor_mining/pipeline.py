@@ -1,7 +1,8 @@
 """Full pipeline orchestrator: DeepSeek/default hypotheses → backtest → gatecheck → hardscore → optimize → archive.
 
-Supports iterative optimization: deterministic optimizer suggestions are backtested
-in subsequent rounds until convergence or max_iterations.
+Supports separate discovery and optimization round budgets. Discovery rounds can
+generate broad candidates and repairs; optimization rounds tune survivor outputs
+and stop early on convergence.
 """
 
 from __future__ import annotations
@@ -29,7 +30,15 @@ from factor_mining.data.quality import interval_to_ms, kline_quality_notes
 from factor_mining.factors.engineering import generate_features
 from factor_mining.factors.returns import forward_returns
 from factor_mining.hypotheses.discovered import should_continue_mining
-from factor_mining.mining import build_indicator_candidates, build_v1_candidates, default_hypotheses, factor_signal, generate_hypotheses_with_deepseek, normalize_family
+from factor_mining.mining import (
+    build_indicator_candidates,
+    build_v1_candidates,
+    default_hypotheses,
+    factor_signal,
+    filter_candidates_for_lab_factors,
+    generate_hypotheses_with_deepseek,
+    normalize_family,
+)
 from factor_mining.near_miss import analyze_near_misses
 from factor_mining.research_gate import apply_research_gate, build_research_survivor_records, research_survivor_payloads
 from factor_mining.models import (
@@ -332,6 +341,18 @@ def _annotate_candidates_for_direction_scope(
     ]
 
 
+def _filter_candidates_for_direction_scope(
+    candidates: list[CandidateStrategySpec],
+    direction_scope: dict[str, Any] | None,
+) -> list[CandidateStrategySpec]:
+    if not direction_scope:
+        return candidates
+    factor_ids = list(direction_scope.get("factor_ids") or [])
+    if not factor_ids:
+        return candidates
+    return filter_candidates_for_lab_factors(candidates, factor_ids)
+
+
 def _run_checkpoint_args(**kwargs: Any) -> dict[str, Any]:
     return {
         key: value
@@ -483,6 +504,8 @@ def run_pipeline(
     research_brief: str | None = None,
     hypothesis_count: int = 5,
     iterations: int = 1,
+    discovery_rounds: int | None = None,
+    optimization_rounds: int | None = None,
     store: MetadataStore | None = None,
     event_sink: Callable[[str, str, str, dict[str, Any] | None], None] | None = None,
     run_id: str | None = None,
@@ -497,10 +520,12 @@ def run_pipeline(
       1. Hypothesis generation (DeepSeek or defaults)
       2. Build initial candidates + load data + generate features
       3-6. Mining round(s): backtest → gatecheck → hardscore → optimize
-         Each round backtests new candidates from the previous round's optimizer output.
 
     Args:
-        iterations: Maximum number of mining rounds (1 = single pass, >1 = iterative).
+        iterations: Legacy total round budget. When split controls are omitted,
+            this runs one discovery round plus iterations - 1 optimization rounds.
+        discovery_rounds: Rounds that can generate broad candidates and repairs.
+        optimization_rounds: Rounds that tune survivor candidates and stop on convergence.
     """
     if tail is not None and sample_bars is not None:
         raise ValueError("--tail and --sample-bars are mutually exclusive")
@@ -517,6 +542,11 @@ def run_pipeline(
     normalized_scope = _normalize_direction_scope(direction_scope)
     effective_settings = _settings_for_direction_scope(settings, normalized_scope)
     effective_research_brief = _research_brief_for_direction_scope(research_brief, normalized_scope)
+    resolved_discovery_rounds, resolved_optimization_rounds, resolved_total_rounds = _resolve_round_controls(
+        iterations=iterations,
+        discovery_rounds=discovery_rounds,
+        optimization_rounds=optimization_rounds,
+    )
     try:
         return _run_pipeline_impl(
             effective_settings,
@@ -529,7 +559,9 @@ def run_pipeline(
             archive_top=archive_top,
             research_brief=effective_research_brief,
             hypothesis_count=hypothesis_count,
-            iterations=iterations,
+            iterations=resolved_total_rounds,
+            discovery_rounds=resolved_discovery_rounds,
+            optimization_rounds=resolved_optimization_rounds,
             store=store,
             result=result,
             t_start=t_start,
@@ -542,6 +574,22 @@ def run_pipeline(
     finally:
         _EVENT_SINK = previous_sink
         _RUN_ID = previous_run_id
+
+
+def _resolve_round_controls(
+    *,
+    iterations: int,
+    discovery_rounds: int | None,
+    optimization_rounds: int | None,
+) -> tuple[int, int, int]:
+    legacy_total = max(1, int(iterations or 1))
+    if discovery_rounds is None and optimization_rounds is None:
+        discovery = 1
+        optimization = max(0, legacy_total - 1)
+    else:
+        discovery = max(1, int(discovery_rounds if discovery_rounds is not None else 1))
+        optimization = max(0, int(optimization_rounds if optimization_rounds is not None else 0))
+    return discovery, optimization, discovery + optimization
 
 
 def _run_pipeline_impl(
@@ -557,6 +605,8 @@ def _run_pipeline_impl(
     research_brief: str | None,
     hypothesis_count: int,
     iterations: int,
+    discovery_rounds: int,
+    optimization_rounds: int,
     store: MetadataStore | None,
     result: PipelineResult,
     t_start: float,
@@ -577,6 +627,8 @@ def _run_pipeline_impl(
         research_brief=research_brief,
         hypothesis_count=hypothesis_count,
         iterations=iterations,
+        discovery_rounds=discovery_rounds,
+        optimization_rounds=optimization_rounds,
         direction_scope=direction_scope,
     )
     checkpoint_source_run_id = resume_run_id or run_id
@@ -724,6 +776,7 @@ def _run_pipeline_impl(
             interval=settings.data.default_interval,
         )
         indicator_candidates = _annotate_candidates_for_direction_scope(indicator_candidates, direction_scope)
+        indicator_candidates = _filter_candidates_for_direction_scope(indicator_candidates, direction_scope)
         indicator_candidates = [
             c for c in indicator_candidates
             if _data_key(c) in data_contexts
@@ -767,9 +820,16 @@ def _run_pipeline_impl(
     all_detail_artifact_ids: list[str] = []
     cumulative_trial_counts: dict[str, int] = {}
     round_num = 0
+    previous_optimization_signature: str | None = None
 
     for round_num in range(1, iterations + 1):
-        _step_header(2 + round_num, f"Mining round {round_num}/{iterations} — {len(current_candidates)} candidates")
+        phase = "discovery" if round_num <= discovery_rounds else "optimization"
+        phase_round = round_num if phase == "discovery" else round_num - discovery_rounds
+        phase_total = discovery_rounds if phase == "discovery" else optimization_rounds
+        _step_header(
+            2 + round_num,
+            f"{phase.title()} round {phase_round}/{phase_total} — {len(current_candidates)} candidates",
+        )
         _check_stop(stop_event)
 
         round_backtests: list[BacktestResult] = []
@@ -811,6 +871,10 @@ def _run_pipeline_impl(
                 store=store,
                 iteration=round_num - 1,
                 round_num=round_num,
+                phase=phase,
+                allow_pre_gate_repair=phase == "discovery",
+                allow_optimizer_repairs=phase == "discovery",
+                allow_next_hypotheses=phase == "discovery",
                 artifact_scope=f"round{round_num}_{context.symbol}_{context.market}",
                 cumulative_trial_counts=cumulative_trial_counts,
                 survivor_candidate_ids=survivor_candidate_ids,
@@ -859,20 +923,41 @@ def _run_pipeline_impl(
         all_gatechecks.extend(round_gatechecks)
         all_hardscores.extend(round_hardscores)
         all_retained_candidates.extend(round_candidates)
-        result.optimization_history.append(_combine_round_history(round_num, round_num - 1, child_history, new_candidates))
-
-        if not new_candidates and round_num < iterations:
-            _log("No new candidates from optimization — stopping early.")
-            break
+        generated_candidates = list(new_candidates)
 
         # Check boundary conditions for continued mining
-        if iterations > 1:
+        if iterations > 1 and new_candidates:
             new_candidates = _filter_candidates_by_mining_boundaries(
                 new_candidates, cumulative_trial_counts, round_backtests, result.hypotheses, log_blocks=True,
             )
-            if not new_candidates:
-                _log("Boundary conditions triggered — stopping early.")
-                break
+
+        history_entry = _combine_round_history(
+            round_num,
+            round_num - 1,
+            child_history,
+            generated_candidates,
+            phase=phase,
+            next_candidates_count=len(new_candidates),
+        )
+        converged = False
+        if phase == "optimization":
+            signature = _candidate_output_signature(new_candidates)
+            history_entry["output_signature"] = signature
+            if previous_optimization_signature == signature and round_num < iterations:
+                history_entry["converged"] = True
+                converged = True
+            previous_optimization_signature = signature
+        result.optimization_history.append(history_entry)
+
+        if not generated_candidates and round_num < iterations:
+            _log("No new candidates from optimization — stopping early.")
+            break
+        if generated_candidates and not new_candidates:
+            _log("Boundary conditions triggered — stopping early.")
+            break
+        if converged:
+            _log("Optimization converged — stopping early.")
+            break
 
         current_candidates = new_candidates
 
@@ -1163,6 +1248,10 @@ def _run_mining_round(
     iteration: int,
     round_num: int,
     cumulative_trial_counts: dict[str, int],
+    phase: str = "discovery",
+    allow_pre_gate_repair: bool = True,
+    allow_optimizer_repairs: bool = True,
+    allow_next_hypotheses: bool = True,
     artifact_scope: str | None = None,
     survivor_candidate_ids: set[str] | None = None,
     previous_actions: list[dict] | None = None,
@@ -1294,37 +1383,41 @@ def _run_mining_round(
         funding_df=funding_df,
     )
 
-    pre_gate_checkpoint = _load_stage_checkpoint(
-        store,
-        checkpoint_source if resume_run_id else None,
-        round_num=round_num,
-        symbol=checkpoint_symbol,
-        market=checkpoint_market,
-        stage="pre_gate_candidates",
-        fingerprint=checkpoint_fingerprint,
-    )
-    if pre_gate_checkpoint is not None:
-        pre_gate_candidates = [
-            CandidateStrategySpec.model_validate(item)
-            for item in pre_gate_checkpoint.get("items", [])
-        ]
-        _log(f"  Pre-Gate repair candidates: resumed {len(pre_gate_candidates)} from checkpoint")
-    else:
-        pre_gate_candidates = _build_pre_gate_repair_candidates(
-            discovery_candidates,
-            discovery_backtests,
-            initial_factor_evidence,
-        )
-        _save_stage_checkpoint(
+    pre_gate_candidates: list[CandidateStrategySpec] = []
+    if allow_pre_gate_repair:
+        pre_gate_checkpoint = _load_stage_checkpoint(
             store,
-            run_id,
+            checkpoint_source if resume_run_id else None,
             round_num=round_num,
             symbol=checkpoint_symbol,
             market=checkpoint_market,
             stage="pre_gate_candidates",
             fingerprint=checkpoint_fingerprint,
-            payload={"items": [candidate.model_dump(mode="json") for candidate in pre_gate_candidates]},
         )
+        if pre_gate_checkpoint is not None:
+            pre_gate_candidates = [
+                CandidateStrategySpec.model_validate(item)
+                for item in pre_gate_checkpoint.get("items", [])
+            ]
+            _log(f"  Pre-Gate repair candidates: resumed {len(pre_gate_candidates)} from checkpoint")
+        else:
+            pre_gate_candidates = _build_pre_gate_repair_candidates(
+                discovery_candidates,
+                discovery_backtests,
+                initial_factor_evidence,
+            )
+            _save_stage_checkpoint(
+                store,
+                run_id,
+                round_num=round_num,
+                symbol=checkpoint_symbol,
+                market=checkpoint_market,
+                stage="pre_gate_candidates",
+                fingerprint=checkpoint_fingerprint,
+                payload={"items": [candidate.model_dump(mode="json") for candidate in pre_gate_candidates]},
+            )
+    else:
+        _log("  Pre-Gate repair skipped for optimization round")
     pre_gate_generated = len(pre_gate_candidates)
     pre_gate_completed = 0
     pre_gate_merged = 0
@@ -1699,6 +1792,8 @@ def _run_mining_round(
         previous_actions=previous_actions,
         research_gates=round_research_gates, near_misses=round_near_misses,
     )
+    if not allow_optimizer_repairs:
+        ctx["repair_adjustments"] = []
     research_survivors = ctx.get("research_survivors", [])
     _log(f"  Research survivors: {len(research_survivors)} selected for optimizer")
     for survivor in research_survivors[:3]:
@@ -1711,13 +1806,23 @@ def _run_mining_round(
             f"reason={survivor.get('survivor_reason') or 'ranked'}"
         )
     optimization = optimize_traditionally(ctx, mode="full")
+    if not allow_next_hypotheses:
+        optimization = dict(optimization)
+        optimization["next_hypotheses"] = []
     _log(f"  Traditional optimizer signal: {optimization.get('action', 'unknown')}")
 
-    signal_candidates, opt_summary = apply_optimization_result(optimization, round_candidates, round_backtests)
+    signal_candidates, opt_summary = apply_optimization_result(
+        optimization,
+        round_candidates,
+        round_backtests,
+        allow_repairs=allow_optimizer_repairs,
+        allow_next_hypotheses=allow_next_hypotheses,
+    )
     new_candidates = list(signal_candidates)
     _log(f"  Signal optimization: {opt_summary['combinations_created']} combos, "
          f"{opt_summary['adjustments_applied']} adjustments, "
          f"{opt_summary.get('repairs_created', 0)} repairs, "
+         f"{opt_summary.get('evolutions_created', 0)} evolutions, "
          f"{opt_summary['hypotheses_suggested']} new hypotheses")
 
     # ── Optimize: exit-side ──────────────────────────────────────────
@@ -1731,6 +1836,7 @@ def _run_mining_round(
     history_entry = {
         "round": round_num,
         "iteration": iteration,
+        "phase": phase,
         "symbol": round_candidates[0].symbol if round_candidates else None,
         "market": round_candidates[0].market if round_candidates else None,
         "num_candidates": len(round_candidates),
@@ -1753,6 +1859,9 @@ def _run_mining_round(
         "research_gate_counts": dict(status_counts),
         "near_miss_counts": dict(near_miss_counts),
         "actionable_near_misses": actionable_near_misses,
+        "optimizer_outcomes": ctx.get("optimizer_outcomes", []),
+        "optimizer_outcome_counts": ctx.get("optimizer_outcome_counts", {}),
+        "optimizer_proposal_counts": optimization.get("proposal_counts", {}),
         "optimization": optimization,
         "summary": opt_summary,
         "new_candidates_count": len(new_candidates),
@@ -2623,7 +2732,7 @@ def _apply_merge_pool_trial_penalty(
         result.trial_diagnostics["dsr"] = float(result.deflated_sharpe)
 
 
-def _json_dumps_sorted(payload: dict[str, Any]) -> str:
+def _json_dumps_sorted(payload: Any) -> str:
     import json
 
     return json.dumps(payload, default=str, sort_keys=True)
@@ -2886,14 +2995,20 @@ def _combine_round_history(
     iteration: int,
     child_history: list[dict[str, Any]],
     new_candidates: list[CandidateStrategySpec],
+    *,
+    phase: str = "discovery",
+    next_candidates_count: int | None = None,
 ) -> dict[str, Any]:
     optimization = child_history[-1].get("optimization", {}) if child_history else {}
+    optimizer_outcomes = _combined_optimizer_outcomes(child_history)
     return {
         "round": round_num,
         "iteration": iteration,
+        "phase": phase,
         "children": child_history,
         "optimization": optimization,
         "new_candidates_count": len(new_candidates),
+        "next_candidates_count": len(new_candidates) if next_candidates_count is None else next_candidates_count,
         "num_candidates": sum(child.get("num_candidates", 0) for child in child_history),
         "num_backtests": sum(child.get("num_backtests", 0) for child in child_history),
         "num_pre_gate_repairs": sum(child.get("num_pre_gate_repairs", 0) for child in child_history),
@@ -2906,7 +3021,37 @@ def _combine_round_history(
         "research_gate_counts": _sum_research_gate_counts(child_history),
         "near_miss_counts": _sum_near_miss_counts(child_history),
         "actionable_near_misses": sum(child.get("actionable_near_misses", 0) for child in child_history),
+        "optimizer_outcomes": optimizer_outcomes,
+        "optimizer_outcome_counts": _sum_optimizer_outcome_counts(child_history),
+        "optimizer_proposal_counts": _sum_optimizer_proposal_counts(child_history),
     }
+
+
+def _candidate_output_signature(candidates: list[CandidateStrategySpec]) -> str:
+    payloads = [
+        _strip_candidate_output_ids(candidate.model_dump(mode="json"))
+        for candidate in candidates
+    ]
+    payloads.sort(key=_json_dumps_sorted)
+    raw = _json_dumps_sorted({"candidates": payloads})
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _strip_candidate_output_ids(value: Any) -> Any:
+    if isinstance(value, dict):
+        stripped: dict[str, Any] = {}
+        for key, item in value.items():
+            if key in {"candidate_id", "parent_candidate_id", "parent_id", "experiment_id"}:
+                continue
+            if str(key).startswith("optimizer_"):
+                continue
+            if key == "factor_ids":
+                continue
+            stripped[str(key)] = _strip_candidate_output_ids(item)
+        return stripped
+    if isinstance(value, list):
+        return [_strip_candidate_output_ids(item) for item in value]
+    return value
 
 
 def _survivor_seed_candidates(
@@ -3009,6 +3154,29 @@ def _sum_near_miss_counts(child_history: list[dict[str, Any]]) -> dict[str, int]
     counts: Counter[str] = Counter()
     for child in child_history:
         counts.update(child.get("near_miss_counts", {}))
+    return dict(counts)
+
+
+def _combined_optimizer_outcomes(child_history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    outcomes: list[dict[str, Any]] = []
+    for child in child_history:
+        for outcome in child.get("optimizer_outcomes", []) or []:
+            if isinstance(outcome, dict):
+                outcomes.append(outcome)
+    return outcomes
+
+
+def _sum_optimizer_outcome_counts(child_history: list[dict[str, Any]]) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for child in child_history:
+        counts.update(child.get("optimizer_outcome_counts", {}))
+    return dict(counts)
+
+
+def _sum_optimizer_proposal_counts(child_history: list[dict[str, Any]]) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for child in child_history:
+        counts.update(child.get("optimizer_proposal_counts", {}))
     return dict(counts)
 
 

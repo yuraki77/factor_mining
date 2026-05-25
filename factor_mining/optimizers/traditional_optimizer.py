@@ -8,7 +8,10 @@ reproducible and auditable.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+from collections import Counter
+from typing import Any
 
 from factor_mining.config import Settings
 from factor_mining.mining import normalize_family
@@ -22,6 +25,24 @@ _NEXT_HYPOTHESIS_LOOKBACKS: dict[str, list[int]] = {
     "volatility": [24, 48],
     "funding_basis": [12, 96],
     "volume_confirmation": [6, 12],
+}
+
+_EVOLUTION_LOOKBACKS = [6, 12, 24, 48, 96]
+_EVOLUTION_PARENT_LIMIT = 16
+_EVOLUTION_MAX_PER_PARENT = 3
+_PROPOSAL_PARAM_KEYS = {
+    "smooth_span",
+    "signal_threshold",
+    "position_buffer",
+    "factor_lookback",
+    "lookback",
+    "regime_filter",
+    "funding_state_filter",
+    "funding_trend_filter",
+    "side_mode",
+    "signal_role",
+    "zscore_window",
+    "tanh_scale",
 }
 
 
@@ -50,6 +71,7 @@ def build_optimization_context(
         research_score = research_gate.research_score if research_gate is not None else _research_score(r)
         summary = {
             "candidate_id": c.candidate_id,
+            "parent_candidate_id": c.parent_candidate_id,
             "hypothesis_family": c.hypothesis_family,
             "method_id": c.method_id,
             "symbol": c.symbol,
@@ -82,6 +104,7 @@ def build_optimization_context(
             "near_miss_reasons": near_miss.reasons if near_miss is not None else [],
             "repair_actions": near_miss.repair_actions if near_miss is not None else [],
             "suggested_repair_params": near_miss.suggested_params if near_miss is not None else {},
+            "suggested_repair_param_variants": near_miss.suggested_param_variants if near_miss is not None else [],
             "gatecheck_passed": g.passed,
             "gatecheck_raw_passed": g.raw_passed,
             "risk_tier": g.risk_tier,
@@ -108,6 +131,10 @@ def build_optimization_context(
                 ),
             },
         }
+        outcome = _optimizer_outcome(c, summary)
+        if outcome:
+            summary["optimizer_outcome"] = outcome
+            summary["optimizer_proposal_signature"] = c.params.get("optimizer_proposal_signature")
         summary["survivor_reason"] = (
             ",".join(research_gate.reasons)
             if research_gate is not None and research_gate.reasons
@@ -122,6 +149,12 @@ def build_optimization_context(
     survivor_ids = {item["candidate_id"] for item in research_survivors}
     for factor in factor_summaries:
         factor["research_survivor"] = factor["candidate_id"] in survivor_ids
+    optimizer_outcomes = [
+        factor["optimizer_outcome"]
+        for factor in factor_summaries
+        if factor.get("optimizer_outcome")
+    ]
+    optimizer_outcome_counts = dict(Counter(str(item.get("status", "unknown")) for item in optimizer_outcomes))
 
     return {
         "iteration": iteration,
@@ -139,6 +172,8 @@ def build_optimization_context(
         "near_misses": [item.model_dump(mode="json") for item in (near_misses or [])],
         "repair_adjustments": repair_adjustments_from_near_misses(near_misses or []),
         "factors": factor_summaries,
+        "optimizer_outcomes": optimizer_outcomes,
+        "optimizer_outcome_counts": optimizer_outcome_counts,
         "previous_actions": previous_actions or [],
     }
 
@@ -176,12 +211,32 @@ def optimize_traditionally(context: dict, mode: str = "full") -> dict:
         }],
         "adjustments": [],
         "next_hypotheses": [],
+        "proposal_counts": {
+            "repair": 0,
+            "evolution": 0,
+            "memory_skipped": 0,
+        },
     }
-    result["adjustments"].extend(context.get("repair_adjustments", []))
+    factors_by_id = {factor["candidate_id"]: factor for factor in context.get("factors", [])}
+    failed_signatures = _failed_proposal_signatures(context)
+    repairs, repair_skips = _prepare_adjustments(
+        context.get("repair_adjustments", []),
+        factors_by_id,
+        failed_signatures,
+        default_kind="repair",
+    )
+    result["adjustments"].extend(repairs)
+    result["proposal_counts"]["repair"] += len(repairs)
+    result["proposal_counts"]["memory_skipped"] += repair_skips
+
+    evolutions, evolution_skips = _survivor_evolution_adjustments(context, failed_signatures)
+    result["adjustments"].extend(evolutions)
+    result["proposal_counts"]["evolution"] += len(evolutions)
+    result["proposal_counts"]["memory_skipped"] += evolution_skips
 
     if n < 2:
         for factor_id in factor_ids:
-            result["adjustments"].append({
+            adjustment = {
                 "candidate_id": factor_id,
                 "param": "turnover_controls",
                 "current": "raw",
@@ -191,7 +246,12 @@ def optimize_traditionally(context: dict, mode: str = "full") -> dict:
                     "position_buffer": 0.20,
                 },
                 "rationale": "Only one research survivor is available; continue by lowering turnover before final GateCheck.",
-            })
+                "proposal_kind": "turnover_control",
+                "variant_key": "single_survivor_low_turnover",
+            }
+            prepared, skipped = _prepare_adjustments([adjustment], factors_by_id, failed_signatures, default_kind="turnover_control")
+            result["adjustments"].extend(prepared)
+            result["proposal_counts"]["memory_skipped"] += skipped
 
     # Drop factors with low OOS/IS IC ratio (suggest as adjustments)
     selected_ids = set(factor_ids)
@@ -205,6 +265,174 @@ def optimize_traditionally(context: dict, mode: str = "full") -> dict:
         })
 
     return result
+
+
+def _prepare_adjustments(
+    adjustments: list[dict],
+    factors_by_id: dict[str, dict],
+    failed_signatures: set[str],
+    *,
+    default_kind: str,
+) -> tuple[list[dict], int]:
+    prepared: list[dict] = []
+    skipped = 0
+    for adjustment in adjustments:
+        cid = str(adjustment.get("candidate_id") or "")
+        factor = factors_by_id.get(cid)
+        suggested = adjustment.get("suggested")
+        if factor is None or not isinstance(suggested, dict):
+            prepared.append(adjustment)
+            continue
+        kind = str(adjustment.get("proposal_kind") or default_kind)
+        param_diff = _optimizer_param_diff(factor.get("params") or {}, suggested)
+        if not param_diff:
+            continue
+        root_parent_id = _optimizer_root_parent_id(factor)
+        signature = _proposal_signature(kind, root_parent_id, param_diff)
+        if signature in failed_signatures:
+            skipped += 1
+            continue
+        enriched = dict(adjustment)
+        enriched["proposal_kind"] = kind
+        enriched["param_diff"] = param_diff
+        enriched["optimizer_root_parent_id"] = root_parent_id
+        enriched["proposal_signature"] = signature
+        enriched["proposal_id"] = _proposal_id(signature)
+        enriched.setdefault("variant_key", _variant_key(kind, param_diff))
+        prepared.append(enriched)
+    return prepared, skipped
+
+
+def _survivor_evolution_adjustments(context: dict, failed_signatures: set[str]) -> tuple[list[dict], int]:
+    factors_by_id = {factor["candidate_id"]: factor for factor in context.get("factors", [])}
+    parents = _select_evolution_parents(context.get("factors", []))
+    adjustments: list[dict] = []
+    skipped = 0
+    seen: set[str] = set()
+    for factor in parents[:_EVOLUTION_PARENT_LIMIT]:
+        per_parent = 0
+        for variant_key, params, rationale in _evolution_variants(factor):
+            if per_parent >= _EVOLUTION_MAX_PER_PARENT:
+                break
+            adjustment = {
+                "candidate_id": factor["candidate_id"],
+                "param": "evolution_params",
+                "current": "survivor_candidate",
+                "suggested": params,
+                "proposal_kind": "evolution",
+                "variant_key": variant_key,
+                "rationale": rationale,
+            }
+            prepared, skipped_count = _prepare_adjustments(
+                [adjustment],
+                factors_by_id,
+                failed_signatures,
+                default_kind="evolution",
+            )
+            skipped += skipped_count
+            for item in prepared:
+                signature = str(item.get("proposal_signature") or "")
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                adjustments.append(item)
+                per_parent += 1
+    return adjustments, skipped
+
+
+def _select_evolution_parents(factors: list[dict]) -> list[dict]:
+    viable = [
+        factor for factor in factors
+        if (
+            factor.get("gatecheck_passed")
+            or factor.get("research_gate_status") in {"production_passed", "research_survivor"}
+            or factor.get("research_survivor")
+        )
+    ]
+    return sorted(viable, key=_survivor_sort_key, reverse=True)
+
+
+def _evolution_variants(factor: dict) -> list[tuple[str, dict[str, Any], str]]:
+    variants: list[tuple[str, dict[str, Any], str]] = []
+    low_turnover = _survivor_low_turnover_params(factor)
+    if low_turnover:
+        variants.append((
+            "survivor_evolve_low_turnover",
+            low_turnover,
+            "Evolve survivor with a protective low-turnover signal-control variant.",
+        ))
+    lookback = _neighbor_lookback_params(factor)
+    if lookback:
+        variants.append((
+            "survivor_evolve_lookback",
+            lookback,
+            "Evolve survivor by testing the nearest factor lookback neighbor.",
+        ))
+    regime = _regime_protection_params(factor)
+    if regime:
+        variants.append((
+            "survivor_evolve_regime_filter",
+            regime,
+            "Evolve survivor with a protective regime filter from conditional performance.",
+        ))
+    return variants
+
+
+def _survivor_low_turnover_params(factor: dict) -> dict[str, float | int]:
+    params = factor.get("params") or {}
+    target = (
+        {"smooth_span": 48, "signal_threshold": 0.25, "position_buffer": 0.20}
+        if float(factor.get("factor_turnover") or 0.0) >= 0.15 or float(factor.get("cost_drag_sharpe") or 0.0) >= 0.5
+        else {"smooth_span": 24, "signal_threshold": 0.15, "position_buffer": 0.12}
+    )
+    return {
+        key: value
+        for key, value in target.items()
+        if float(params.get(key, 0.0) or 0.0) < float(value)
+    }
+
+
+def _neighbor_lookback_params(factor: dict) -> dict[str, int]:
+    params = factor.get("params") or {}
+    current = params.get("factor_lookback") or params.get("lookback")
+    if current is None:
+        return {}
+    try:
+        current_int = int(current)
+    except (TypeError, ValueError):
+        return {}
+    if current_int not in _EVOLUTION_LOOKBACKS:
+        return {}
+    idx = _EVOLUTION_LOOKBACKS.index(current_int)
+    if idx < len(_EVOLUTION_LOOKBACKS) - 1:
+        return {"factor_lookback": _EVOLUTION_LOOKBACKS[idx + 1]}
+    if idx > 0:
+        return {"factor_lookback": _EVOLUTION_LOOKBACKS[idx - 1]}
+    return {}
+
+
+def _regime_protection_params(factor: dict) -> dict[str, list[str]]:
+    params = factor.get("params") or {}
+    if params.get("regime_filter"):
+        return {}
+    regime_metrics = factor.get("regime_metrics")
+    if not isinstance(regime_metrics, dict) or not regime_metrics:
+        return {}
+    best_label = None
+    best_sharpe = -999.0
+    for label, metrics in regime_metrics.items():
+        if not isinstance(metrics, dict):
+            continue
+        sharpe = float(metrics.get("sharpe") or 0.0)
+        if sharpe > best_sharpe:
+            best_label = str(label)
+            best_sharpe = sharpe
+    if best_label is None:
+        return {}
+    net_sharpe = float(factor.get("sharpe") or 0.0)
+    if best_sharpe >= max(0.4, net_sharpe + 0.5):
+        return {"regime_filter": [best_label]}
+    return {}
 
 
 def optimize_exits_traditionally(context: dict, *, limit: int = 3) -> dict:
@@ -360,10 +588,185 @@ def _cost_margin_bps(factor: dict) -> float | None:
     return float(break_even) - 2.0 * float(actual)
 
 
+def _optimizer_root_parent_id(factor: dict) -> str:
+    params = factor.get("params") or {}
+    return str(
+        params.get("optimizer_root_parent_id")
+        or params.get("parent_id")
+        or factor.get("parent_candidate_id")
+        or factor.get("candidate_id")
+    )
+
+
+def _optimizer_param_diff(current_params: dict, suggested: dict) -> dict[str, Any]:
+    diff: dict[str, Any] = {}
+    for key, value in suggested.items():
+        if key not in _PROPOSAL_PARAM_KEYS:
+            continue
+        if current_params.get(key) != value:
+            diff[key] = value
+    return diff
+
+
+def _proposal_signature(kind: str, root_parent_id: str, param_diff: dict[str, Any]) -> str:
+    payload = {
+        "kind": kind,
+        "root_parent_id": root_parent_id,
+        "param_diff": param_diff,
+    }
+    return hashlib.sha256(_params_signature(payload).encode("utf-8")).hexdigest()
+
+
+def _proposal_id(signature: str) -> str:
+    return f"opt_{signature[:12]}"
+
+
+def _variant_key(kind: str, param_diff: dict[str, Any]) -> str:
+    parts = [f"{key}={param_diff[key]}" for key in sorted(param_diff)]
+    return f"{kind}_{'_'.join(parts)}" if parts else kind
+
+
+def _parent_metrics_for(candidate_id: str, result_by_candidate: dict[str, BacktestResult]) -> dict[str, float | None]:
+    result = result_by_candidate.get(candidate_id)
+    if result is None:
+        return {
+            "sharpe": None,
+            "gross_sharpe": None,
+            "max_dd": None,
+            "factor_turnover": None,
+            "cost_margin_bps": None,
+        }
+    gross = result.metrics_gross.sharpe if result.metrics_gross is not None else None
+    return {
+        "sharpe": result.metrics_primary.sharpe,
+        "gross_sharpe": gross,
+        "max_dd": result.metrics_primary.max_drawdown,
+        "factor_turnover": result.factor_turnover,
+        "cost_margin_bps": result.break_even_cost_bps - 2.0 * result.actual_cost_bps,
+    }
+
+
+def _apply_optimizer_lineage(
+    candidate: CandidateStrategySpec,
+    source: CandidateStrategySpec,
+    adj: dict,
+    suggested: dict,
+    result_by_candidate: dict[str, BacktestResult],
+    *,
+    default_kind: str,
+) -> None:
+    param_diff = adj.get("param_diff")
+    if not isinstance(param_diff, dict):
+        param_diff = _optimizer_param_diff(source.params, suggested)
+    root_parent_id = str(
+        adj.get("optimizer_root_parent_id")
+        or source.params.get("optimizer_root_parent_id")
+        or source.params.get("parent_id")
+        or source.parent_candidate_id
+        or source.candidate_id
+    )
+    kind = str(adj.get("proposal_kind") or default_kind)
+    signature = str(adj.get("proposal_signature") or _proposal_signature(kind, root_parent_id, param_diff))
+    candidate.params["optimizer_proposal_id"] = str(adj.get("proposal_id") or _proposal_id(signature))
+    candidate.params["optimizer_proposal_signature"] = signature
+    candidate.params["optimizer_proposal_kind"] = kind
+    candidate.params["optimizer_root_parent_id"] = root_parent_id
+    candidate.params["optimizer_param_diff"] = param_diff
+    candidate.params["optimizer_reason"] = adj.get("rationale", "")
+    candidate.params["optimizer_variant_key"] = adj.get("variant_key") or _variant_key(kind, param_diff)
+    candidate.params["optimizer_parent_metrics"] = _parent_metrics_for(source.candidate_id, result_by_candidate)
+
+
+def _optimizer_outcome(candidate: CandidateStrategySpec, summary: dict) -> dict[str, Any] | None:
+    params = candidate.params
+    parent_metrics = params.get("optimizer_parent_metrics")
+    if not isinstance(parent_metrics, dict) or not params.get("optimizer_proposal_signature"):
+        return None
+    current = {
+        "sharpe": summary.get("sharpe"),
+        "gross_sharpe": summary.get("gross_sharpe"),
+        "max_dd": summary.get("max_dd"),
+        "factor_turnover": summary.get("factor_turnover"),
+        "cost_margin_bps": _cost_margin_bps(summary),
+    }
+    deltas = {
+        "delta_sharpe": _delta(current.get("sharpe"), parent_metrics.get("sharpe")),
+        "delta_turnover": _delta(current.get("factor_turnover"), parent_metrics.get("factor_turnover")),
+        "delta_max_dd": _delta(current.get("max_dd"), parent_metrics.get("max_dd")),
+        "delta_cost_margin_bps": _delta(current.get("cost_margin_bps"), parent_metrics.get("cost_margin_bps")),
+    }
+    status = _outcome_status(deltas)
+    return {
+        "candidate_id": candidate.candidate_id,
+        "parent_id": params.get("parent_id") or candidate.parent_candidate_id,
+        "root_parent_id": params.get("optimizer_root_parent_id"),
+        "proposal_id": params.get("optimizer_proposal_id"),
+        "proposal_signature": params.get("optimizer_proposal_signature"),
+        "proposal_kind": params.get("optimizer_proposal_kind"),
+        "variant_key": params.get("optimizer_variant_key"),
+        "param_diff": params.get("optimizer_param_diff") or {},
+        "status": status,
+        "parent_metrics": parent_metrics,
+        "current_metrics": current,
+        **deltas,
+    }
+
+
+def _delta(current: Any, previous: Any) -> float | None:
+    if current is None or previous is None:
+        return None
+    return float(current) - float(previous)
+
+
+def _outcome_status(deltas: dict[str, float | None]) -> str:
+    delta_sharpe = deltas.get("delta_sharpe")
+    delta_turnover = deltas.get("delta_turnover")
+    delta_cost = deltas.get("delta_cost_margin_bps")
+    delta_dd = deltas.get("delta_max_dd")
+    sharpe_ok = delta_sharpe is not None and delta_sharpe >= 0.05
+    turnover_ok = delta_turnover is not None and delta_turnover <= -0.01
+    cost_ok = delta_cost is not None and delta_cost >= 0.5
+    drawdown_ok = delta_dd is not None and delta_dd >= 0.01
+    sharpe_not_bad = delta_sharpe is None or delta_sharpe >= -0.05
+    if sharpe_ok or ((turnover_ok or cost_ok or drawdown_ok) and sharpe_not_bad):
+        return "improved"
+    if (
+        (delta_sharpe is not None and delta_sharpe <= -0.05 and not (turnover_ok or cost_ok))
+        or (delta_turnover is not None and delta_turnover >= 0.02 and not sharpe_ok)
+    ):
+        return "failed"
+    return "neutral"
+
+
+def _failed_proposal_signatures(context: dict) -> set[str]:
+    failed = {
+        str(outcome.get("proposal_signature"))
+        for outcome in context.get("optimizer_outcomes", [])
+        if outcome.get("status") == "failed" and outcome.get("proposal_signature")
+    }
+    for history in context.get("previous_actions", []):
+        failed.update(_failed_proposal_signatures_from_history(history))
+    return failed
+
+
+def _failed_proposal_signatures_from_history(history: Any) -> set[str]:
+    failed: set[str] = set()
+    if isinstance(history, dict):
+        for outcome in history.get("optimizer_outcomes", []) or []:
+            if isinstance(outcome, dict) and outcome.get("status") == "failed" and outcome.get("proposal_signature"):
+                failed.add(str(outcome["proposal_signature"]))
+        for child in history.get("children", []) or []:
+            failed.update(_failed_proposal_signatures_from_history(child))
+    return failed
+
+
 def apply_optimization_result(
     optimization: dict,
     candidates: list[CandidateStrategySpec],
     results: list[BacktestResult],
+    *,
+    allow_repairs: bool = True,
+    allow_next_hypotheses: bool = True,
 ) -> tuple[list[CandidateStrategySpec], dict]:
     """Apply deterministic optimizer suggestions to create new candidate specs.
 
@@ -374,7 +777,10 @@ def apply_optimization_result(
         "combinations_created": 0,
         "adjustments_applied": 0,
         "repairs_created": 0,
+        "repairs_suppressed": 0,
+        "evolutions_created": 0,
         "hypotheses_suggested": 0,
+        "hypotheses_suppressed": 0,
         "status_adjustments_recorded": 0,
     }
 
@@ -440,9 +846,13 @@ def apply_optimization_result(
                     new_c.params["rationale"] = adj.get("rationale", "")
                     new_c.params["search_variant"] = "survivor_low_turnover"
                     new_c.params["generated_by"] = "traditional_survivor_adjustment"
+                    _apply_optimizer_lineage(new_c, c, adj, suggested, result_by_candidate, default_kind="turnover_control")
                     new_candidates.append(new_c)
                     summary["adjustments_applied"] += 1
                 elif param_name == "repair_params" and isinstance(suggested, dict):
+                    if not allow_repairs:
+                        summary["repairs_suppressed"] += 1
+                        continue
                     signature = (cid, _params_signature(suggested))
                     if signature in repair_signatures:
                         continue
@@ -461,9 +871,25 @@ def apply_optimization_result(
                     for key, value in suggested.items():
                         new_c.params[key] = value
                     new_c.params.update(repair_meta)
+                    _apply_optimizer_lineage(new_c, c, adj, suggested, result_by_candidate, default_kind="repair")
                     new_candidates.append(new_c)
                     summary["adjustments_applied"] += 1
                     summary["repairs_created"] += 1
+                elif param_name == "evolution_params" and isinstance(suggested, dict):
+                    new_c = c.model_copy(deep=True)
+                    new_c.candidate_id = f"c_evo_{uuid.uuid4().hex[:12]}"
+                    new_c.candidate_type = "optimizer"
+                    new_c.parent_candidate_id = cid
+                    for key, value in suggested.items():
+                        new_c.params[key] = value
+                    new_c.params["parent_id"] = cid
+                    new_c.params["rationale"] = adj.get("rationale", "")
+                    new_c.params["search_variant"] = str(adj.get("variant_key") or "survivor_evolution")
+                    new_c.params["generated_by"] = "traditional_survivor_evolution"
+                    _apply_optimizer_lineage(new_c, c, adj, suggested, result_by_candidate, default_kind="evolution")
+                    new_candidates.append(new_c)
+                    summary["adjustments_applied"] += 1
+                    summary["evolutions_created"] += 1
                 else:
                     # Spawn a new candidate with the tweaked parameter
                     new_c = c.model_copy(deep=True)
@@ -473,10 +899,17 @@ def apply_optimization_result(
                     new_c.params[param_name] = suggested
                     new_c.params["parent_id"] = cid
                     new_c.params["rationale"] = adj.get("rationale", "")
+                    if adj.get("proposal_kind"):
+                        _apply_optimizer_lineage(new_c, c, adj, {param_name: suggested}, result_by_candidate, default_kind=str(adj["proposal_kind"]))
                     new_candidates.append(new_c)
                     summary["adjustments_applied"] += 1
 
-    for hypothesis in optimization.get("next_hypotheses", []):
+    next_hypotheses = optimization.get("next_hypotheses", [])
+    if not allow_next_hypotheses:
+        summary["hypotheses_suppressed"] = len(next_hypotheses)
+        next_hypotheses = []
+
+    for hypothesis in next_hypotheses:
         if not isinstance(hypothesis, dict) or base_candidate is None:
             continue
         raw_family = str(hypothesis.get("family", ""))
@@ -506,7 +939,7 @@ def apply_optimization_result(
                 },
             ))
 
-    summary["hypotheses_suggested"] = len(optimization.get("next_hypotheses", []))
+    summary["hypotheses_suggested"] = len(next_hypotheses)
 
     return new_candidates, summary
 

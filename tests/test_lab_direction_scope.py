@@ -86,3 +86,67 @@ def test_direction_scope_annotation_adds_lab_payload_fields():
     assert annotated[0].params["lab_direction_symbols"] == ["ETHUSDT"]
     assert annotated[0].params["lab_direction_objective"] == "MAX_SHARPE"
     assert candidate.params == {"signal_source": "factor_signal"}
+
+
+def test_direction_scope_filters_candidates_to_requested_lab_factors():
+    candidates = [
+        pipeline.CandidateStrategySpec(
+            candidate_id="c_rsi",
+            hypothesis_id="h1",
+            method_id="factor_scoring",
+            hypothesis_family="mean_reversion",
+            symbol="ETHUSDT",
+            interval="5m",
+            params={"signal_source": "feature", "indicator_name": "rsi_14"},
+        ),
+        pipeline.CandidateStrategySpec(
+            candidate_id="c_ema",
+            hypothesis_id="h1",
+            method_id="factor_scoring",
+            hypothesis_family="momentum",
+            symbol="ETHUSDT",
+            interval="5m",
+            params={"signal_source": "feature", "indicator_name": "ema_50"},
+        ),
+        pipeline.CandidateStrategySpec(
+            candidate_id="c_generic",
+            hypothesis_id="h1",
+            method_id="factor_scoring",
+            hypothesis_family="momentum",
+            symbol="ETHUSDT",
+            interval="5m",
+            params={"signal_source": "factor_signal", "factor_family": "momentum"},
+        ),
+    ]
+
+    annotated = pipeline._annotate_candidates_for_direction_scope(
+        candidates,
+        {"factor_ids": ["rsi14"], "symbols": ["ETHUSDT"], "objective": "MAX_SHARPE"},
+    )
+    scoped = pipeline._filter_candidates_for_direction_scope(
+        annotated,
+        {"factor_ids": ["rsi14"], "symbols": ["ETHUSDT"], "objective": "MAX_SHARPE"},
+    )
+
+    assert [candidate.candidate_id for candidate in scoped] == ["c_rsi"]
+    assert scoped[0].params["lab_factor_ids"] == ["rsi14"]
+    assert scoped[0].params["lab_direction_factor_ids"] == ["rsi14"]
+
+
+def test_direction_scope_with_unknown_factors_returns_no_candidates():
+    candidate = pipeline.CandidateStrategySpec(
+        candidate_id="c_unsupported",
+        hypothesis_id="h1",
+        method_id="factor_scoring",
+        hypothesis_family="momentum",
+        symbol="ETHUSDT",
+        interval="5m",
+        params={"signal_source": "feature", "indicator_name": "ema_50"},
+    )
+
+    scoped = pipeline._filter_candidates_for_direction_scope(
+        [candidate],
+        {"factor_ids": ["supertrend_up"], "symbols": ["ETHUSDT"]},
+    )
+
+    assert scoped == []

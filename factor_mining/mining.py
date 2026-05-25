@@ -108,6 +108,47 @@ _SEARCH_VARIANTS: list[dict[str, float | int | str]] = [
 ]
 
 
+LAB_MINEABLE_FACTOR_REGISTRY: frozenset[str] = frozenset({
+    "rsi14",
+    "rsi7",
+    "rsi21",
+    "rsi14_short",
+    "ema50_above",
+    "ma_above_200",
+    "bbpct",
+    "bbands_lower_touch",
+    "bbands_percent_b_low",
+    "macd_golden",
+    "adx_strong",
+    "cci_oversold",
+    "williams_r_oversold",
+    "roc_positive",
+    "obv_uptrend",
+    "mfi_oversold",
+    "cmf_positive",
+})
+
+_LAB_FACTOR_FEATURE_PATTERNS: dict[str, tuple[str, ...]] = {
+    "rsi14": ("rsi_14",),
+    "rsi7": ("rsi_7",),
+    "rsi21": ("rsi_21",),
+    "rsi14_short": ("rsi_14",),
+    "ema50_above": ("ema_50",),
+    "ma_above_200": ("sma_200", "price_sma_ratio_200"),
+    "bbpct": ("bb_pct_*",),
+    "bbands_lower_touch": ("bb_pct_*",),
+    "bbands_percent_b_low": ("bb_pct_*",),
+    "macd_golden": ("macd_line_*", "macd_hist_*"),
+    "adx_strong": ("adx_14",),
+    "cci_oversold": ("cci_14",),
+    "williams_r_oversold": ("willr_14",),
+    "roc_positive": ("roc_*",),
+    "obv_uptrend": ("obv",),
+    "mfi_oversold": ("mfi_14",),
+    "cmf_positive": ("cmf_20",),
+}
+
+
 def _direction_sign(meta_direction: str) -> int | None:
     """Convert INDICATOR_META direction string to a signal sign.
 
@@ -120,6 +161,55 @@ def _direction_sign(meta_direction: str) -> int | None:
     if meta_direction in ("negative", "negative_when_high"):
         return -1
     return None
+
+
+def lab_factor_ids_for_candidate_params(
+    params: dict,
+    requested_factor_ids: list[str] | tuple[str, ...] | None = None,
+) -> list[str]:
+    """Return Lab factor IDs that this candidate actually tests."""
+    if params.get("signal_source") != "feature":
+        return []
+    indicator_name = str(params.get("indicator_name") or "")
+    if not indicator_name:
+        return []
+    requested = [
+        factor_id
+        for factor_id in (requested_factor_ids or sorted(LAB_MINEABLE_FACTOR_REGISTRY))
+        if factor_id in LAB_MINEABLE_FACTOR_REGISTRY
+    ]
+    matched: list[str] = []
+    for factor_id in requested:
+        patterns = _LAB_FACTOR_FEATURE_PATTERNS.get(factor_id, ())
+        if any(_feature_pattern_matches(indicator_name, pattern) for pattern in patterns):
+            matched.append(factor_id)
+    return matched
+
+
+def filter_candidates_for_lab_factors(
+    candidates: list[CandidateStrategySpec],
+    factor_ids: list[str] | tuple[str, ...],
+) -> list[CandidateStrategySpec]:
+    """Restrict candidates to the concrete factor IDs in a Lab direction."""
+    requested = [str(item) for item in factor_ids if str(item) in LAB_MINEABLE_FACTOR_REGISTRY]
+    if not factor_ids:
+        return candidates
+    if not requested:
+        return []
+
+    scoped: list[CandidateStrategySpec] = []
+    for candidate in candidates:
+        matched = lab_factor_ids_for_candidate_params(candidate.params, requested)
+        if not matched:
+            continue
+        scoped.append(candidate.model_copy(update={"params": {**candidate.params, "lab_factor_ids": matched}}))
+    return scoped
+
+
+def _feature_pattern_matches(indicator_name: str, pattern: str) -> bool:
+    if pattern.endswith("*"):
+        return indicator_name.startswith(pattern[:-1])
+    return indicator_name == pattern
 
 
 def build_indicator_candidates(

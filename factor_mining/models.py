@@ -213,6 +213,7 @@ class NearMissAnalysis(BaseModel):
     reasons: list[str] = Field(default_factory=list)
     actionable: bool = False
     suggested_params: dict[str, Any] = Field(default_factory=dict)
+    suggested_param_variants: list[dict[str, Any]] = Field(default_factory=list)
     repair_actions: list[str] = Field(default_factory=list)
     diagnostics: dict[str, float | int | str | bool | None] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))

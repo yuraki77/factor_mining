@@ -7,6 +7,7 @@ from factor_mining.config import DataConfig, Settings
 from factor_mining.models import BacktestResult, CandidateStrategySpec, MetricsBlock, ResearchSurvivorRecord
 from factor_mining.pipeline import MarketDataContext, PipelineResult, verify_research_survivors
 from factor_mining.storage import MetadataStore
+from factor_mining.ui import _run_args
 
 
 def test_cli_run_creates_pipeline_run_and_events(tmp_path, monkeypatch) -> None:
@@ -15,13 +16,15 @@ def test_cli_run_creates_pipeline_run_and_events(tmp_path, monkeypatch) -> None:
     def fake_run_pipeline(settings_arg, **kwargs):
         assert settings_arg.data.sqlite_path == settings.data.sqlite_path
         assert kwargs["run_id"]
+        assert kwargs["discovery_rounds"] == 2
+        assert kwargs["optimization_rounds"] == 4
         kwargs["event_sink"]("step", "info", "fake pipeline step", {"ok": True})
         return PipelineResult(elapsed_s=0.1)
 
     monkeypatch.setattr("factor_mining.cli.load_settings", lambda: settings)
     monkeypatch.setattr("factor_mining.pipeline.run_pipeline", fake_run_pipeline)
 
-    result = CliRunner().invoke(app, ["mine", "run", "--tail", "10"])
+    result = CliRunner().invoke(app, ["mine", "run", "--tail", "10", "--discovery-rounds", "2", "--optimization-rounds", "4"])
 
     assert result.exit_code == 0
     store = MetadataStore(settings.data.sqlite_path)
@@ -30,6 +33,18 @@ def test_cli_run_creates_pipeline_run_and_events(tmp_path, monkeypatch) -> None:
     assert runs[0]["status"] == "completed"
     events = store.load_pipeline_events(runs[0]["run_id"])
     assert any(event["message"] == "fake pipeline step" for event in events)
+
+
+def test_dashboard_run_args_parse_split_round_controls() -> None:
+    args = _run_args({
+        "discovery_rounds": 2,
+        "optimization_rounds": 4,
+        "tail": 0,
+    })
+
+    assert args["discovery_rounds"] == 2
+    assert args["optimization_rounds"] == 4
+    assert args["tail"] is None
 
 
 def test_cli_run_rejects_tail_with_sample_bars(tmp_path, monkeypatch) -> None:
