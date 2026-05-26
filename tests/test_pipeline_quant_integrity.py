@@ -27,6 +27,7 @@ from factor_mining.pipeline import (
     _apply_batch_pbo,
     _apply_merge_pool_trial_penalty,
     _build_data_split_plan,
+    _build_local_grid_tuning_candidates,
     _build_pre_gate_repair_candidates,
     _build_signal_for,
     _build_tasks,
@@ -328,6 +329,7 @@ def test_mining_round_skips_discovery_pbo_and_uses_validation_pbo(monkeypatch) -
     monkeypatch.setattr(pipeline, "_apply_batch_pbo", fake_apply_batch_pbo)
     monkeypatch.setattr(pipeline, "build_factor_evidence_reports", fake_evidence)
     monkeypatch.setattr(pipeline, "_build_pre_gate_repair_candidates", lambda *args, **kwargs: [])
+    monkeypatch.setattr(pipeline, "_build_local_grid_tuning_candidates", lambda *args, **kwargs: [])
     monkeypatch.setattr(
         gatecheck_module,
         "apply_fdr",
@@ -1578,6 +1580,70 @@ def test_pre_gate_repair_allows_regime_conflict_when_filter_can_address_it() -> 
     assert any(repair.params.get("regime_filter") == ["bull"] for repair in repairs)
 
 
+def test_local_grid_tuning_generates_bounded_validation_candidates() -> None:
+    candidate = CandidateStrategySpec(
+        candidate_id="c_grid_parent",
+        hypothesis_id="h1",
+        method_id="factor_scoring",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+        market="um_futures",
+        params={
+            "signal_source": "factor_signal",
+            "factor_family": "momentum",
+            "factor_lookback": 12,
+            "smooth_span": 1,
+            "signal_threshold": 0.0,
+            "position_buffer": 0.05,
+        },
+    )
+    result = BacktestResult(
+        experiment_id="exp-grid-parent",
+        candidate_id="c_grid_parent",
+        hypothesis_family="momentum",
+        method_id="factor_scoring",
+        symbol="BTCUSDT",
+        market="um_futures",
+        interval="5m",
+        metrics_primary=MetricsBlock(sharpe=-0.1),
+        metrics_gross=MetricsBlock(sharpe=0.9),
+        factor_turnover=0.22,
+        break_even_cost_bps=1.0,
+        actual_cost_bps=3.0,
+    )
+    evidence = FactorEvidenceReport(
+        experiment_id="exp-grid-parent",
+        candidate_id="c_grid_parent",
+        hypothesis_family="momentum",
+        method_id="factor_scoring",
+        symbol="BTCUSDT",
+        market="um_futures",
+        interval="5m",
+        best_horizon_bars=48,
+        ic_by_horizon={"12": 0.014, "48": 0.025},
+        rankic_by_horizon={"48": 0.018},
+    )
+
+    candidates = _build_local_grid_tuning_candidates(
+        [candidate],
+        [result],
+        [evidence],
+        parent_limit=1,
+        max_per_parent=64,
+        total_limit=64,
+    )
+
+    assert 10 < len(candidates) <= 64
+    assert all(child.candidate_type == "repair" for child in candidates)
+    assert all(child.params["generated_by"] == "local_grid_tuning" for child in candidates)
+    assert all(child.params["parent_id"] == "c_grid_parent" for child in candidates)
+    assert all(child.params["optimizer_param_diff"] for child in candidates)
+    assert all(child.params["parent_validation_baseline"]["evidence_best_horizon_bars"] == 48 for child in candidates)
+    assert 48 in {child.params.get("factor_lookback") for child in candidates}
+    assert len({child.params.get("smooth_span") for child in candidates}) > 1
+    assert len({child.params.get("signal_threshold") for child in candidates}) > 1
+
+
 def test_data_split_plan_keeps_final_oos_out_of_repair_window() -> None:
     frame = _frame(100)
 
@@ -1661,6 +1727,58 @@ def test_repair_merge_pool_prunes_high_pbo_and_redundant_repairs() -> None:
     assert abs(valid.params["parent_signal_correlation"]) < 0.98
     assert "low_incremental_orthogonality" in high_corr.params["merge_pool_reasons"]
     assert "high_validation_pbo" in high_pbo.params["merge_pool_reasons"]
+
+
+def test_local_grid_tuning_merge_keeps_top_validation_variants_despite_high_signal_corr() -> None:
+    parent = CandidateStrategySpec(
+        candidate_id="c_parent_grid",
+        hypothesis_id="h1",
+        method_id="factor_scoring",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+        params={"factor_family": "momentum"},
+    )
+    variants = []
+    for idx, sharpe in enumerate([0.5, 0.8, 0.7, 0.6], start=1):
+        child = parent.model_copy(deep=True)
+        child.candidate_id = f"c_grid_{idx}"
+        child.params.update({
+            "parent_id": "c_parent_grid",
+            "generated_by": "local_grid_tuning",
+            "search_variant": "local_grid",
+            "smooth_span": 12 * idx,
+        })
+        variants.append((child, sharpe))
+
+    parent_signal = np.array([1.0, 1.0, 1.0, -1.0, -1.0, -1.0])
+    tasks = [(parent_signal, parent.model_dump(mode="json"), 0, {}, [])]
+    tasks.extend(
+        (parent_signal.copy(), child.model_dump(mode="json"), idx, {}, [])
+        for idx, (child, _sharpe) in enumerate(variants, start=1)
+    )
+    results = [_result("exp-parent-grid", "c_parent_grid", pbo=0.2, sharpe=0.4)]
+    results.extend(
+        _result(f"exp-{child.candidate_id}", child.candidate_id, pbo=0.2, sharpe=sharpe)
+        for child, sharpe in variants
+    )
+
+    plan = _select_repair_merge_pool(
+        original_candidates=[parent],
+        repair_candidates=[child for child, _sharpe in variants],
+        validation_candidates=[parent] + [child for child, _sharpe in variants],
+        validation_full_tasks=tasks,
+        validation_tasks=tasks,
+        validation_results=results,
+    )
+
+    kept_ids = {candidate.candidate_id for candidate in plan.candidates}
+    assert kept_ids == {"c_parent_grid", "c_grid_2", "c_grid_3", "c_grid_4"}
+    assert plan.merged_repairs == 3
+    assert plan.rejected_repairs == 1
+    assert variants[1][0].params["parent_signal_correlation"] > 0.99
+    assert variants[1][0].params["merge_pool_score"] == variants[1][0].params["validation_selection_score"]
+    rejected = next(child for child, _sharpe in variants if child.candidate_id == "c_grid_1")
+    assert rejected.params["merge_pool_reasons"] == ["local_tuning_parent_ratio_cap"]
 
 
 def test_merge_pool_trial_penalty_counts_original_and_repair_trials() -> None:

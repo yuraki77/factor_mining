@@ -15,7 +15,7 @@ import time
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from itertools import combinations
+from itertools import combinations, product
 from typing import Any, Callable
 import uuid
 
@@ -227,6 +227,14 @@ _FINAL_OOS_FRACTION = 0.20
 _MAX_FINAL_COMPLEXITY = 4
 _REPAIR_MAX_PBO = 0.60
 _REPAIR_MAX_PARENT_CORR = 0.98
+_LOCAL_TUNING_PARENT_LIMIT = 8
+_LOCAL_TUNING_MAX_PER_PARENT = 64
+_LOCAL_TUNING_TOTAL_LIMIT = 256
+_LOCAL_TUNING_TOP_K_PER_PARENT = 3
+_LOCAL_TUNING_LOOKBACKS = (6, 12, 24, 48, 96)
+_LOCAL_TUNING_SMOOTH_SPANS = (1, 12, 24, 48, 96)
+_LOCAL_TUNING_SIGNAL_THRESHOLDS = (0.0, 0.10, 0.20, 0.30)
+_LOCAL_TUNING_POSITION_BUFFERS = (0.05, 0.10, 0.20, 0.30)
 _DETAIL_ARTIFACT_LIMIT_PER_SCOPE = 96
 _DETAIL_BUCKET_LIMIT = 24
 
@@ -1401,11 +1409,17 @@ def _run_mining_round(
             ]
             _log(f"  Pre-Gate repair candidates: resumed {len(pre_gate_candidates)} from checkpoint")
         else:
-            pre_gate_candidates = _build_pre_gate_repair_candidates(
+            pre_gate_repairs = _build_pre_gate_repair_candidates(
                 discovery_candidates,
                 discovery_backtests,
                 initial_factor_evidence,
             )
+            local_tuning_candidates = _build_local_grid_tuning_candidates(
+                discovery_candidates,
+                discovery_backtests,
+                initial_factor_evidence,
+            )
+            pre_gate_candidates = pre_gate_repairs + local_tuning_candidates
             _save_stage_checkpoint(
                 store,
                 run_id,
@@ -1419,6 +1433,10 @@ def _run_mining_round(
     else:
         _log("  Pre-Gate repair skipped for optimization round")
     pre_gate_generated = len(pre_gate_candidates)
+    pre_gate_generated_by_kind = Counter(
+        str(candidate.params.get("generated_by", "unknown"))
+        for candidate in pre_gate_candidates
+    )
     pre_gate_completed = 0
     pre_gate_merged = 0
     pre_gate_rejected = 0
@@ -1453,6 +1471,7 @@ def _run_mining_round(
         validation_candidates.extend(pre_gate_candidates)
         _log(
             f"  Pre-Gate repair generated: {len(pre_gate_candidates)} candidates "
+            f"{dict(pre_gate_generated_by_kind)} "
             f"({time.perf_counter() - t_repair:.0f}s)"
         )
 
@@ -1525,8 +1544,9 @@ def _run_mining_round(
             "merged_ids": [
                 candidate.candidate_id
                 for candidate in merge_plan.candidates
-                if candidate.params.get("generated_by") == "pre_gate_repair"
+                if candidate.params.get("generated_by") in {"pre_gate_repair", "local_grid_tuning"}
             ],
+            "generated_by_kind": dict(pre_gate_generated_by_kind),
             "diagnostics": repair_merge_diagnostics,
         })
 
@@ -1843,6 +1863,7 @@ def _run_mining_round(
         "num_backtests": len(round_backtests),
         "num_pre_gate_repairs": pre_gate_completed,
         "num_pre_gate_repairs_generated": pre_gate_generated,
+        "num_pre_gate_repairs_generated_by_kind": dict(pre_gate_generated_by_kind),
         "num_pre_gate_repairs_merged": pre_gate_merged,
         "num_pre_gate_repairs_rejected": pre_gate_rejected,
         "repair_merge_diagnostics": repair_merge_diagnostics,
@@ -2222,6 +2243,273 @@ def _build_pre_gate_repair_candidates(
     return repairs
 
 
+def _build_local_grid_tuning_candidates(
+    candidates: list[CandidateStrategySpec],
+    results: list[BacktestResult],
+    evidence_reports: list[FactorEvidenceReport],
+    *,
+    parent_limit: int = _LOCAL_TUNING_PARENT_LIMIT,
+    max_per_parent: int = _LOCAL_TUNING_MAX_PER_PARENT,
+    total_limit: int = _LOCAL_TUNING_TOTAL_LIMIT,
+) -> list[CandidateStrategySpec]:
+    """Build bounded per-parent parameter grids for validation-split tuning."""
+    candidate_by_id = {candidate.candidate_id: candidate for candidate in candidates}
+    evidence_by_exp = {report.experiment_id: report for report in evidence_reports}
+    ordered = sorted(
+        results,
+        key=lambda result: _pre_gate_priority(result, evidence_by_exp.get(result.experiment_id)),
+        reverse=True,
+    )
+
+    tuning_candidates: list[CandidateStrategySpec] = []
+    signatures: set[tuple[str, str]] = set()
+    parents_seen = 0
+
+    for result in ordered:
+        parent = candidate_by_id.get(result.candidate_id)
+        if parent is None:
+            continue
+        evidence = evidence_by_exp.get(result.experiment_id)
+        if not _passes_local_tuning_evidence(parent, result, evidence):
+            continue
+
+        raw_grid = _local_tuning_param_grid(parent, result, evidence)
+        ranked_grid = sorted(
+            raw_grid,
+            key=lambda params: _local_grid_acquisition_score(parent, result, evidence, params),
+            reverse=True,
+        )
+        kept_for_parent = 0
+        emitted_for_parent = False
+
+        for params in ranked_grid:
+            candidate = _spawn_local_grid_tuning_candidate(parent, params, result, evidence)
+            if not _repair_respects_family(parent, candidate):
+                continue
+            complexity = _candidate_complexity_score(candidate)
+            candidate.params["complexity_score"] = complexity
+            if complexity > _MAX_FINAL_COMPLEXITY:
+                continue
+
+            signature = (
+                parent.candidate_id,
+                _json_dumps_sorted(_repair_signature_params(candidate.params)),
+            )
+            if signature in signatures:
+                continue
+            signatures.add(signature)
+            tuning_candidates.append(candidate)
+            kept_for_parent += 1
+            emitted_for_parent = True
+
+            if kept_for_parent >= max_per_parent or len(tuning_candidates) >= total_limit:
+                break
+
+        if emitted_for_parent:
+            parents_seen += 1
+        if parents_seen >= parent_limit or len(tuning_candidates) >= total_limit:
+            break
+
+    return tuning_candidates
+
+
+def _passes_local_tuning_evidence(
+    parent: CandidateStrategySpec,
+    result: BacktestResult,
+    evidence: FactorEvidenceReport | None,
+) -> bool:
+    if evidence is None:
+        return False
+    if _candidate_complexity_score(parent) > _MAX_FINAL_COMPLEXITY:
+        return False
+
+    gross_sharpe = result.metrics_gross.sharpe if result.metrics_gross is not None else result.metrics_primary.sharpe
+    has_signal = (
+        _evidence_max_abs_ic(evidence) >= _PRE_GATE_MIN_ABS_IC
+        or _max_abs_mapping(evidence.rankic_by_horizon) >= _PRE_GATE_MIN_ABS_IC
+        or bool(evidence.evidence_flags.get("ic_ci_excludes_zero"))
+        or bool(evidence.evidence_flags.get("decay_curve_supported"))
+        or gross_sharpe >= 0.4
+        or evidence.turnover_adjusted_return > 0.0
+    )
+    return bool(has_signal)
+
+
+def _local_tuning_param_grid(
+    parent: CandidateStrategySpec,
+    result: BacktestResult,
+    evidence: FactorEvidenceReport | None,
+) -> list[dict[str, Any]]:
+    lookback_values = _local_tuning_lookback_values(parent, evidence)
+    smooth_values = _ordered_numeric_values(parent.params.get("smooth_span", 1), _LOCAL_TUNING_SMOOTH_SPANS, int)
+    threshold_values = _ordered_numeric_values(
+        parent.params.get("signal_threshold", 0.0),
+        _LOCAL_TUNING_SIGNAL_THRESHOLDS,
+        float,
+    )
+    buffer_values = _ordered_numeric_values(
+        parent.params.get("position_buffer", 0.05),
+        _LOCAL_TUNING_POSITION_BUFFERS,
+        float,
+    )
+    base_signature = _json_dumps_sorted(_repair_signature_params(parent.params))
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for lookback, smooth_span, signal_threshold, position_buffer in product(
+        lookback_values,
+        smooth_values,
+        threshold_values,
+        buffer_values,
+    ):
+        params: dict[str, Any] = {
+            "smooth_span": int(smooth_span),
+            "signal_threshold": round(float(signal_threshold), 6),
+            "position_buffer": round(float(position_buffer), 6),
+        }
+        if lookback is not None:
+            params["factor_lookback"] = int(lookback)
+        signature = _json_dumps_sorted(_repair_signature_params({**parent.params, **params}))
+        if signature == base_signature or signature in seen:
+            continue
+        seen.add(signature)
+        rows.append(params)
+
+    return rows
+
+
+def _local_tuning_lookback_values(
+    parent: CandidateStrategySpec,
+    evidence: FactorEvidenceReport | None,
+) -> list[int | None]:
+    has_lookback = (
+        parent.params.get("signal_source") == "factor_signal"
+        or parent.params.get("factor_lookback") is not None
+    )
+    if not has_lookback:
+        return [None]
+
+    values: list[int] = []
+    current = parent.params.get("factor_lookback", 12)
+    if _is_int_like(current):
+        values.append(int(current))
+    if evidence is not None and evidence.best_horizon_bars is not None:
+        values.append(int(evidence.best_horizon_bars))
+    values.extend(_LOCAL_TUNING_LOOKBACKS)
+    return _ordered_unique_ints(values)
+
+
+def _ordered_numeric_values(current: Any, defaults: tuple[Any, ...], caster: Callable[[Any], Any]) -> list[Any]:
+    values: list[Any] = []
+    try:
+        values.append(caster(current))
+    except (TypeError, ValueError):
+        pass
+    values.extend(caster(value) for value in defaults)
+
+    ordered: list[Any] = []
+    seen: set[str] = set()
+    for value in values:
+        key = repr(value)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(value)
+    return ordered
+
+
+def _ordered_unique_ints(values: list[int]) -> list[int]:
+    ordered: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
+def _spawn_local_grid_tuning_candidate(
+    parent: CandidateStrategySpec,
+    params: dict[str, Any],
+    result: BacktestResult,
+    evidence: FactorEvidenceReport | None,
+) -> CandidateStrategySpec:
+    candidate = parent.model_copy(deep=True)
+    candidate.candidate_id = f"c_grid_{uuid.uuid4().hex[:12]}"
+    candidate.candidate_type = "repair"
+    candidate.parent_candidate_id = parent.candidate_id
+    candidate.params.update(params)
+    candidate.params["parent_id"] = parent.candidate_id
+    candidate.params["generated_by"] = "local_grid_tuning"
+    candidate.params["search_variant"] = "local_grid"
+    candidate.params["tuning_objective"] = "validation_dsr_cost_turnover_score"
+    candidate.params["optimizer_reason"] = "per_parent_local_grid_validation_tuning"
+    candidate.params["optimizer_param_diff"] = _param_diff(parent.params, params)
+    candidate.params["parent_validation_baseline"] = {
+        "discovery_net_sharpe": result.metrics_primary.sharpe,
+        "discovery_gross_sharpe": result.metrics_gross.sharpe if result.metrics_gross is not None else None,
+        "discovery_deflated_sharpe": result.deflated_sharpe,
+        "discovery_turnover": result.factor_turnover,
+        "discovery_break_even_cost_bps": result.break_even_cost_bps,
+        "discovery_actual_cost_bps": result.actual_cost_bps,
+        "evidence_max_abs_ic": _evidence_max_abs_ic(evidence),
+        "evidence_best_horizon_bars": evidence.best_horizon_bars if evidence is not None else None,
+    }
+    candidate.params["local_grid_acquisition_score"] = _local_grid_acquisition_score(
+        parent,
+        result,
+        evidence,
+        params,
+    )
+    return candidate
+
+
+def _param_diff(parent_params: dict[str, Any], child_params: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    diff: dict[str, dict[str, Any]] = {}
+    for key, child_value in child_params.items():
+        parent_value = parent_params.get(key)
+        if parent_value != child_value:
+            diff[key] = {"from": parent_value, "to": child_value}
+    return diff
+
+
+def _local_grid_acquisition_score(
+    parent: CandidateStrategySpec,
+    result: BacktestResult,
+    evidence: FactorEvidenceReport | None,
+    params: dict[str, Any],
+) -> float:
+    score = _pre_gate_priority(result, evidence)
+    smooth_span = max(1, int(params.get("smooth_span", parent.params.get("smooth_span", 1)) or 1))
+    signal_threshold = float(params.get("signal_threshold", parent.params.get("signal_threshold", 0.0)) or 0.0)
+    position_buffer = float(params.get("position_buffer", parent.params.get("position_buffer", 0.05)) or 0.05)
+    conservatism = np.log2(float(smooth_span)) + 4.0 * signal_threshold + 2.0 * position_buffer
+    if _has_cost_or_turnover_problem(result):
+        score += 0.35 * conservatism
+    else:
+        score -= 0.10 * conservatism
+
+    if evidence is not None and evidence.best_horizon_bars is not None and params.get("factor_lookback") is not None:
+        try:
+            lookback = max(1, int(params["factor_lookback"]))
+            best = max(1, int(evidence.best_horizon_bars))
+            score += 1.0 / (1.0 + abs(np.log2(lookback / best)))
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+
+    diff_size = len(_param_diff(parent.params, params))
+    score += 0.05 * diff_size
+    score -= 0.25 * max(0, _candidate_complexity_score(_candidate_with_params(parent, params)) - 2)
+    return float(score)
+
+
+def _candidate_with_params(parent: CandidateStrategySpec, params: dict[str, Any]) -> CandidateStrategySpec:
+    candidate = parent.model_copy(deep=True)
+    candidate.params.update(params)
+    return candidate
+
+
 def _passes_pre_gate_evidence(
     parent: CandidateStrategySpec,
     result: BacktestResult,
@@ -2546,13 +2834,16 @@ def _select_repair_merge_pool(
         corr = None
         if parent_task is not None and repair_task is not None:
             corr = _signal_correlation(parent_task[0], repair_task[0])
+        score = _repair_selection_score(repair, result_by_candidate[repair.candidate_id], corr)
+        repair.params["validation_selection_score"] = score
         repair_rows.append((
-            _repair_merge_score(result_by_candidate[repair.candidate_id], corr),
+            score,
             repair,
             corr,
         ))
 
-    per_parent_count: Counter[str] = Counter()
+    per_parent_repair_count: Counter[str] = Counter()
+    per_parent_tuning_count: Counter[str] = Counter()
     merged = 0
     rejected = 0
     for _, repair, parent_corr in sorted(repair_rows, key=lambda item: item[0], reverse=True):
@@ -2560,6 +2851,7 @@ def _select_repair_merge_pool(
         result = result_by_candidate[repair.candidate_id]
         parent = original_by_id.get(parent_id) or candidate_by_id.get(parent_id)
         pbo = float(result.pbo if result.pbo is not None else 1.0)
+        is_local_tuning = _is_local_grid_tuning(repair)
         reasons: list[str] = []
         if parent is None or parent_id not in result_by_candidate:
             reasons.append("parent_missing_validation")
@@ -2569,12 +2861,15 @@ def _select_repair_merge_pool(
             reasons.append("complexity_cap")
         if pbo > _REPAIR_MAX_PBO:
             reasons.append("high_validation_pbo")
-        if parent_corr is None:
-            reasons.append("missing_parent_correlation")
-        elif abs(parent_corr) >= _REPAIR_MAX_PARENT_CORR:
-            reasons.append("low_incremental_orthogonality")
-        if per_parent_count[parent_id] >= _PRE_GATE_REPAIR_MAX_PER_PARENT:
-            reasons.append("repair_parent_ratio_cap")
+        if not is_local_tuning:
+            if parent_corr is None:
+                reasons.append("missing_parent_correlation")
+            elif abs(parent_corr) >= _REPAIR_MAX_PARENT_CORR:
+                reasons.append("low_incremental_orthogonality")
+            if per_parent_repair_count[parent_id] >= _PRE_GATE_REPAIR_MAX_PER_PARENT:
+                reasons.append("repair_parent_ratio_cap")
+        elif per_parent_tuning_count[parent_id] >= _LOCAL_TUNING_TOP_K_PER_PARENT:
+            reasons.append("local_tuning_parent_ratio_cap")
 
         if reasons:
             rejected += 1
@@ -2592,12 +2887,15 @@ def _select_repair_merge_pool(
             diagnostics.append(_repair_merge_diagnostic(repair, result, parent_corr, "rejected", reasons))
             continue
 
-        per_parent_count[parent_id] += 1
+        if is_local_tuning:
+            per_parent_tuning_count[parent_id] += 1
+        else:
+            per_parent_repair_count[parent_id] += 1
         merged += 1
         repair.params["merge_pool_status"] = "merged"
         repair.params["repair_validation_pbo"] = pbo
         repair.params["parent_signal_correlation"] = parent_corr
-        repair.params["merge_pool_score"] = _repair_merge_score(result, parent_corr)
+        repair.params["merge_pool_score"] = _repair_selection_score(repair, result, parent_corr)
         kept_candidates.append(repair)
         kept_full_tasks.append(task)
         kept_results.append(result)
@@ -2635,6 +2933,39 @@ def _task_by_candidate_id(tasks: list[tuple]) -> dict[str, tuple]:
     return task_by_id
 
 
+def _is_local_grid_tuning(candidate: CandidateStrategySpec) -> bool:
+    return candidate.params.get("generated_by") == "local_grid_tuning"
+
+
+def _repair_selection_score(
+    repair: CandidateStrategySpec,
+    result: BacktestResult,
+    parent_corr: float | None,
+) -> float:
+    if _is_local_grid_tuning(repair):
+        return _local_tuning_validation_score(result, parent_corr)
+    return _repair_merge_score(result, parent_corr)
+
+
+def _local_tuning_validation_score(result: BacktestResult, parent_corr: float | None) -> float:
+    gross_sharpe = result.metrics_gross.sharpe if result.metrics_gross is not None else result.metrics_primary.sharpe
+    pbo = float(result.pbo if result.pbo is not None else 1.0)
+    cost_margin = result.break_even_cost_bps - 2.0 * result.actual_cost_bps
+    turnover_penalty = max(0.0, float(result.factor_turnover) - 0.10)
+    drawdown_penalty = max(0.0, abs(float(result.metrics_primary.max_drawdown)) - 0.12)
+    corr_penalty = 0.0 if parent_corr is None else 0.10 * abs(parent_corr)
+    return float(
+        result.deflated_sharpe
+        + 0.50 * result.metrics_primary.sharpe
+        + 0.25 * max(0.0, gross_sharpe)
+        + 0.02 * max(-10.0, min(25.0, cost_margin))
+        - 1.50 * turnover_penalty
+        - 2.00 * drawdown_penalty
+        - 0.50 * pbo
+        - corr_penalty
+    )
+
+
 def _repair_merge_score(result: BacktestResult, parent_corr: float | None) -> float:
     gross_sharpe = result.metrics_gross.sharpe if result.metrics_gross is not None else result.metrics_primary.sharpe
     pbo = float(result.pbo if result.pbo is not None else 1.0)
@@ -2666,7 +2997,10 @@ def _repair_merge_diagnostic(
         "net_sharpe": result.metrics_primary.sharpe,
         "gross_sharpe": result.metrics_gross.sharpe if result.metrics_gross is not None else None,
         "complexity_score": repair.params.get("complexity_score"),
+        "generated_by": repair.params.get("generated_by"),
         "search_variant": repair.params.get("search_variant"),
+        "validation_selection_score": repair.params.get("validation_selection_score"),
+        "merge_pool_score": repair.params.get("merge_pool_score"),
     }
 
 
