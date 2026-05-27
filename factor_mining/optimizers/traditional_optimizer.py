@@ -36,6 +36,8 @@ _COMPOSITE_GRID_WEIGHTS = (0.20, 0.40, 0.60, 0.80)
 _EXIT_PARENT_LIMIT = 8
 _EXIT_MAX_PER_PARENT = 3
 _EXIT_TOTAL_LIMIT = 24
+_HILL_CLIMB_ZSCORE_WINDOWS = (96, 288, 576)
+_HILL_CLIMB_TANH_SCALES = (1.0, 2.0, 3.0)
 _PROPOSAL_PARAM_KEYS = {
     "smooth_span",
     "signal_threshold",
@@ -613,6 +615,31 @@ def _hill_climb_params(factor: dict, outcome: dict) -> dict[str, Any]:
 
     if "regime_filter" in param_diff and (delta_sharpe is None or float(delta_sharpe) >= 0.05):
         return _survivor_low_turnover_params(factor)
+    if "zscore_window" in param_diff and (delta_sharpe is None or float(delta_sharpe) >= 0.05):
+        return _neighbor_grid_value_params(params, "zscore_window", _HILL_CLIMB_ZSCORE_WINDOWS, int)
+    if "tanh_scale" in param_diff and (delta_sharpe is None or float(delta_sharpe) >= 0.05):
+        return _neighbor_grid_value_params(params, "tanh_scale", _HILL_CLIMB_TANH_SCALES, float)
+    return {}
+
+
+def _neighbor_grid_value_params(
+    params: dict[str, Any],
+    key: str,
+    ladder: tuple[Any, ...],
+    caster: Any,
+) -> dict[str, Any]:
+    try:
+        current = caster(params.get(key))
+    except (TypeError, ValueError):
+        return {}
+    values = [caster(value) for value in ladder]
+    if current not in values:
+        return {}
+    idx = values.index(current)
+    if idx + 1 < len(values):
+        return {key: values[idx + 1]}
+    if idx > 0:
+        return {key: values[idx - 1]}
     return {}
 
 

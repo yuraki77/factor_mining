@@ -1385,6 +1385,70 @@ def test_optimizer_hill_climbs_from_improved_turnover_proposal() -> None:
     assert optimization["proposal_counts"]["hill_climb"] == 1
 
 
+def test_optimizer_context_uses_local_grid_lineage_for_next_round_hill_climb() -> None:
+    child = CandidateStrategySpec(
+        candidate_id="c_grid_child",
+        hypothesis_id="h1",
+        method_id="feature_indicator",
+        hypothesis_family="mean_reversion",
+        symbol="BTCUSDT",
+        market="um_futures",
+        candidate_type="grid_tuning",
+        parent_candidate_id="c_grid_parent",
+        params={
+            "signal_source": "feature",
+            "indicator_name": "rsi14",
+            "transform": "tanh_zscore",
+            "zscore_window": 288,
+            "generated_by": "local_grid_tuning",
+            "parent_id": "c_grid_parent",
+            "optimizer_proposal_id": "opt_grid_child",
+            "optimizer_proposal_signature": "sig_grid_child",
+            "optimizer_proposal_kind": "local_grid_tuning",
+            "optimizer_variant_key": "local_grid_zscore_window=288",
+            "optimizer_root_parent_id": "c_grid_parent",
+            "optimizer_param_diff": {"zscore_window": 288},
+            "optimizer_parent_metrics": {
+                "sharpe": 0.3,
+                "gross_sharpe": 0.4,
+                "max_dd": -0.10,
+                "factor_turnover": 0.12,
+                "cost_margin_bps": 1.0,
+            },
+        },
+    )
+    child_result = BacktestResult(
+        experiment_id="exp-grid-child",
+        candidate_id="c_grid_child",
+        hypothesis_family="mean_reversion",
+        method_id="feature_indicator",
+        symbol="BTCUSDT",
+        market="um_futures",
+        interval="5m",
+        metrics_primary=MetricsBlock(sharpe=0.5, max_drawdown=-0.08),
+        metrics_gross=MetricsBlock(sharpe=0.6),
+        factor_turnover=0.11,
+        break_even_cost_bps=5.0,
+        actual_cost_bps=1.0,
+    )
+    ctx = build_optimization_context(
+        [child],
+        [child_result],
+        [GateCheckResult(experiment_id="exp-grid-child", passed=True, items=[])],
+        iteration=1,
+    )
+
+    outcome = ctx["optimizer_outcomes"][0]
+    assert outcome["proposal_kind"] == "local_grid_tuning"
+    assert outcome["status"] == "improved"
+    assert round(outcome["delta_sharpe"], 6) == 0.2
+
+    optimization = optimize_traditionally(ctx, "full")
+    hill = next(item for item in optimization["adjustments"] if item.get("proposal_kind") == "hill_climb")
+
+    assert hill["suggested"] == {"zscore_window": 576}
+
+
 def test_single_research_survivor_generates_low_turnover_variant() -> None:
     candidate = CandidateStrategySpec(
         candidate_id="c_single",
@@ -1634,14 +1698,100 @@ def test_local_grid_tuning_generates_bounded_validation_candidates() -> None:
     )
 
     assert 10 < len(candidates) <= 64
-    assert all(child.candidate_type == "repair" for child in candidates)
+    assert all(child.candidate_type == "grid_tuning" for child in candidates)
     assert all(child.params["generated_by"] == "local_grid_tuning" for child in candidates)
     assert all(child.params["parent_id"] == "c_grid_parent" for child in candidates)
     assert all(child.params["optimizer_param_diff"] for child in candidates)
+    assert all(child.params["optimizer_proposal_signature"] for child in candidates)
+    assert all(child.params["optimizer_parent_metrics"]["sharpe"] == -0.1 for child in candidates)
     assert all(child.params["parent_validation_baseline"]["evidence_best_horizon_bars"] == 48 for child in candidates)
     assert 48 in {child.params.get("factor_lookback") for child in candidates}
     assert len({child.params.get("smooth_span") for child in candidates}) > 1
     assert len({child.params.get("signal_threshold") for child in candidates}) > 1
+
+
+def test_local_grid_tuning_expands_feature_zscore_and_tanh_dimensions() -> None:
+    candidate = CandidateStrategySpec(
+        candidate_id="c_feature_grid",
+        hypothesis_id="h1",
+        method_id="feature_indicator",
+        hypothesis_family="mean_reversion",
+        symbol="BTCUSDT",
+        market="um_futures",
+        params={
+            "signal_source": "feature",
+            "indicator_name": "rsi14",
+            "transform": "tanh_zscore",
+            "zscore_window": 288,
+            "tanh_scale": 2.0,
+        },
+    )
+    result = BacktestResult(
+        experiment_id="exp-feature-grid",
+        candidate_id="c_feature_grid",
+        hypothesis_family="mean_reversion",
+        method_id="feature_indicator",
+        symbol="BTCUSDT",
+        market="um_futures",
+        interval="5m",
+        metrics_primary=MetricsBlock(sharpe=0.1),
+        metrics_gross=MetricsBlock(sharpe=0.8),
+        factor_turnover=0.20,
+        break_even_cost_bps=2.0,
+        actual_cost_bps=3.0,
+    )
+    evidence = FactorEvidenceReport(
+        experiment_id="exp-feature-grid",
+        candidate_id="c_feature_grid",
+        hypothesis_family="mean_reversion",
+        method_id="feature_indicator",
+        symbol="BTCUSDT",
+        market="um_futures",
+        interval="5m",
+        ic_by_horizon={"12": -0.02},
+    )
+
+    candidates = _build_local_grid_tuning_candidates(
+        [candidate],
+        [result],
+        [evidence],
+        parent_limit=1,
+        max_per_parent=64,
+        total_limit=64,
+    )
+
+    assert candidates
+    assert {child.params.get("factor_lookback") for child in candidates} == {None}
+    assert len({child.params.get("zscore_window") for child in candidates}) > 1
+    assert len({child.params.get("tanh_scale") for child in candidates}) > 1
+
+
+def test_local_grid_tuning_problem_severity_is_continuous_near_turnover_boundary() -> None:
+    near_low = BacktestResult(
+        experiment_id="exp-near-low",
+        candidate_id="c_near_low",
+        hypothesis_family="momentum",
+        method_id="factor_scoring",
+        symbol="BTCUSDT",
+        market="um_futures",
+        interval="5m",
+        metrics_primary=MetricsBlock(sharpe=0.0),
+        factor_turnover=0.149,
+        break_even_cost_bps=10.0,
+        actual_cost_bps=1.0,
+    )
+    near_high = near_low.model_copy(update={
+        "experiment_id": "exp-near-high",
+        "candidate_id": "c_near_high",
+        "factor_turnover": 0.151,
+    })
+
+    low = pipeline._local_tuning_problem_severity(near_low)
+    high = pipeline._local_tuning_problem_severity(near_high)
+
+    assert low > 0.0
+    assert high > low
+    assert high - low < 0.03
 
 
 def test_data_split_plan_keeps_final_oos_out_of_repair_window() -> None:

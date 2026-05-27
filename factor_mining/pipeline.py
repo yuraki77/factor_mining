@@ -235,6 +235,10 @@ _LOCAL_TUNING_LOOKBACKS = (6, 12, 24, 48, 96)
 _LOCAL_TUNING_SMOOTH_SPANS = (1, 12, 24, 48, 96)
 _LOCAL_TUNING_SIGNAL_THRESHOLDS = (0.0, 0.10, 0.20, 0.30)
 _LOCAL_TUNING_POSITION_BUFFERS = (0.05, 0.10, 0.20, 0.30)
+_LOCAL_TUNING_ZSCORE_WINDOWS = (96, 288, 576)
+_LOCAL_TUNING_TANH_SCALES = (1.0, 2.0, 3.0)
+_LOCAL_TUNING_MIN_PRIORITY = 1.75
+_LOCAL_TUNING_MIN_WEAK_PRIORITY = 1.25
 _DETAIL_ARTIFACT_LIMIT_PER_SCOPE = 96
 _DETAIL_BUCKET_LIMIT = 24
 
@@ -2324,15 +2328,28 @@ def _passes_local_tuning_evidence(
         return False
 
     gross_sharpe = result.metrics_gross.sharpe if result.metrics_gross is not None else result.metrics_primary.sharpe
-    has_signal = (
-        _evidence_max_abs_ic(evidence) >= _PRE_GATE_MIN_ABS_IC
-        or _max_abs_mapping(evidence.rankic_by_horizon) >= _PRE_GATE_MIN_ABS_IC
+    max_abs_ic = _evidence_max_abs_ic(evidence)
+    max_abs_rankic = _max_abs_mapping(evidence.rankic_by_horizon)
+    has_stat_signal = (
+        max_abs_ic >= _PRE_GATE_MIN_ABS_IC
+        or max_abs_rankic >= _PRE_GATE_MIN_ABS_IC
         or bool(evidence.evidence_flags.get("ic_ci_excludes_zero"))
         or bool(evidence.evidence_flags.get("decay_curve_supported"))
-        or gross_sharpe >= 0.4
-        or evidence.turnover_adjusted_return > 0.0
     )
-    return bool(has_signal)
+    has_economic_signal = (
+        gross_sharpe >= 0.60
+        or (
+            evidence.turnover_adjusted_return > 0.0
+            and (gross_sharpe >= 0.40 or max(max_abs_ic, max_abs_rankic) >= 0.006)
+        )
+    )
+    if not (has_stat_signal or has_economic_signal):
+        return False
+
+    priority = _pre_gate_priority(result, evidence)
+    if priority >= _LOCAL_TUNING_MIN_PRIORITY:
+        return True
+    return _local_tuning_problem_severity(result) > 0.0 and priority >= _LOCAL_TUNING_MIN_WEAK_PRIORITY
 
 
 def _local_tuning_param_grid(
@@ -2352,15 +2369,19 @@ def _local_tuning_param_grid(
         _LOCAL_TUNING_POSITION_BUFFERS,
         float,
     )
+    zscore_values = _local_tuning_zscore_values(parent)
+    tanh_values = _local_tuning_tanh_values(parent)
     base_signature = _json_dumps_sorted(_repair_signature_params(parent.params))
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
 
-    for lookback, smooth_span, signal_threshold, position_buffer in product(
+    for lookback, smooth_span, signal_threshold, position_buffer, zscore_window, tanh_scale in product(
         lookback_values,
         smooth_values,
         threshold_values,
         buffer_values,
+        zscore_values,
+        tanh_values,
     ):
         params: dict[str, Any] = {
             "smooth_span": int(smooth_span),
@@ -2369,6 +2390,10 @@ def _local_tuning_param_grid(
         }
         if lookback is not None:
             params["factor_lookback"] = int(lookback)
+        if zscore_window is not None:
+            params["zscore_window"] = int(zscore_window)
+        if tanh_scale is not None:
+            params["tanh_scale"] = round(float(tanh_scale), 6)
         signature = _json_dumps_sorted(_repair_signature_params({**parent.params, **params}))
         if signature == base_signature or signature in seen:
             continue
@@ -2397,6 +2422,28 @@ def _local_tuning_lookback_values(
         values.append(int(evidence.best_horizon_bars))
     values.extend(_LOCAL_TUNING_LOOKBACKS)
     return _ordered_unique_ints(values)
+
+
+def _local_tuning_zscore_values(parent: CandidateStrategySpec) -> list[int | None]:
+    if parent.params.get("signal_source") != "feature":
+        return [None]
+    transform = str(parent.params.get("transform", "tanh_zscore"))
+    if transform not in {"tanh_zscore", "rank"}:
+        return [None]
+    values: list[int] = []
+    current = parent.params.get("zscore_window", 288)
+    if _is_int_like(current):
+        values.append(int(current))
+    values.extend(_LOCAL_TUNING_ZSCORE_WINDOWS)
+    return _ordered_unique_ints(values)
+
+
+def _local_tuning_tanh_values(parent: CandidateStrategySpec) -> list[float | None]:
+    if parent.params.get("signal_source") != "feature":
+        return [None]
+    if str(parent.params.get("transform", "tanh_zscore")) != "tanh_zscore":
+        return [None]
+    return _ordered_numeric_values(parent.params.get("tanh_scale", 2.0), _LOCAL_TUNING_TANH_SCALES, float)
 
 
 def _ordered_numeric_values(current: Any, defaults: tuple[Any, ...], caster: Callable[[Any], Any]) -> list[Any]:
@@ -2437,7 +2484,7 @@ def _spawn_local_grid_tuning_candidate(
 ) -> CandidateStrategySpec:
     candidate = parent.model_copy(deep=True)
     candidate.candidate_id = f"c_grid_{uuid.uuid4().hex[:12]}"
-    candidate.candidate_type = "repair"
+    candidate.candidate_type = "grid_tuning"
     candidate.parent_candidate_id = parent.candidate_id
     candidate.params.update(params)
     candidate.params["parent_id"] = parent.candidate_id
@@ -2445,7 +2492,15 @@ def _spawn_local_grid_tuning_candidate(
     candidate.params["search_variant"] = "local_grid"
     candidate.params["tuning_objective"] = "validation_dsr_cost_turnover_score"
     candidate.params["optimizer_reason"] = "per_parent_local_grid_validation_tuning"
-    candidate.params["optimizer_param_diff"] = _param_diff(parent.params, params)
+    param_diff = _optimizer_style_param_diff(parent.params, params)
+    proposal_signature = _local_grid_proposal_signature(parent.candidate_id, param_diff)
+    candidate.params["optimizer_proposal_id"] = f"opt_{proposal_signature[:12]}"
+    candidate.params["optimizer_proposal_signature"] = proposal_signature
+    candidate.params["optimizer_proposal_kind"] = "local_grid_tuning"
+    candidate.params["optimizer_root_parent_id"] = parent.candidate_id
+    candidate.params["optimizer_param_diff"] = param_diff
+    candidate.params["optimizer_param_change"] = _param_change(parent.params, params)
+    candidate.params["optimizer_variant_key"] = _local_grid_variant_key(param_diff)
     candidate.params["parent_validation_baseline"] = {
         "discovery_net_sharpe": result.metrics_primary.sharpe,
         "discovery_gross_sharpe": result.metrics_gross.sharpe if result.metrics_gross is not None else None,
@@ -2456,6 +2511,7 @@ def _spawn_local_grid_tuning_candidate(
         "evidence_max_abs_ic": _evidence_max_abs_ic(evidence),
         "evidence_best_horizon_bars": evidence.best_horizon_bars if evidence is not None else None,
     }
+    candidate.params["optimizer_parent_metrics"] = _metrics_payload(result)
     candidate.params["local_grid_acquisition_score"] = _local_grid_acquisition_score(
         parent,
         result,
@@ -2465,13 +2521,63 @@ def _spawn_local_grid_tuning_candidate(
     return candidate
 
 
-def _param_diff(parent_params: dict[str, Any], child_params: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def _optimizer_style_param_diff(parent_params: dict[str, Any], child_params: dict[str, Any]) -> dict[str, Any]:
+    keys = {
+        "smooth_span",
+        "signal_threshold",
+        "position_buffer",
+        "factor_lookback",
+        "zscore_window",
+        "tanh_scale",
+    }
+    return {
+        key: child_params[key]
+        for key in keys
+        if key in child_params and parent_params.get(key) != child_params[key]
+    }
+
+
+def _param_change(parent_params: dict[str, Any], child_params: dict[str, Any]) -> dict[str, dict[str, Any]]:
     diff: dict[str, dict[str, Any]] = {}
     for key, child_value in child_params.items():
         parent_value = parent_params.get(key)
         if parent_value != child_value:
             diff[key] = {"from": parent_value, "to": child_value}
     return diff
+
+
+def _local_grid_proposal_signature(root_parent_id: str, param_diff: dict[str, Any]) -> str:
+    payload = {
+        "kind": "local_grid_tuning",
+        "root_parent_id": root_parent_id,
+        "param_diff": param_diff,
+    }
+    return hashlib.sha256(_json_dumps_sorted(payload).encode("utf-8")).hexdigest()
+
+
+def _local_grid_variant_key(param_diff: dict[str, Any]) -> str:
+    if not param_diff:
+        return "local_grid"
+    parts = [f"{key}={param_diff[key]}" for key in sorted(param_diff)]
+    return f"local_grid_{'_'.join(parts)}"
+
+
+def _metrics_payload(result: BacktestResult | None) -> dict[str, float | None]:
+    if result is None:
+        return {
+            "sharpe": None,
+            "gross_sharpe": None,
+            "max_dd": None,
+            "factor_turnover": None,
+            "cost_margin_bps": None,
+        }
+    return {
+        "sharpe": result.metrics_primary.sharpe,
+        "gross_sharpe": result.metrics_gross.sharpe if result.metrics_gross is not None else None,
+        "max_dd": result.metrics_primary.max_drawdown,
+        "factor_turnover": result.factor_turnover,
+        "cost_margin_bps": result.break_even_cost_bps - 2.0 * result.actual_cost_bps,
+    }
 
 
 def _local_grid_acquisition_score(
@@ -2485,10 +2591,8 @@ def _local_grid_acquisition_score(
     signal_threshold = float(params.get("signal_threshold", parent.params.get("signal_threshold", 0.0)) or 0.0)
     position_buffer = float(params.get("position_buffer", parent.params.get("position_buffer", 0.05)) or 0.05)
     conservatism = np.log2(float(smooth_span)) + 4.0 * signal_threshold + 2.0 * position_buffer
-    if _has_cost_or_turnover_problem(result):
-        score += 0.35 * conservatism
-    else:
-        score -= 0.10 * conservatism
+    problem_severity = _local_tuning_problem_severity(result)
+    score += (0.45 * problem_severity - 0.10) * conservatism
 
     if evidence is not None and evidence.best_horizon_bars is not None and params.get("factor_lookback") is not None:
         try:
@@ -2498,10 +2602,18 @@ def _local_grid_acquisition_score(
         except (TypeError, ValueError, ZeroDivisionError):
             pass
 
-    diff_size = len(_param_diff(parent.params, params))
+    diff_size = len(_optimizer_style_param_diff(parent.params, params))
     score += 0.05 * diff_size
     score -= 0.25 * max(0, _candidate_complexity_score(_candidate_with_params(parent, params)) - 2)
     return float(score)
+
+
+def _local_tuning_problem_severity(result: BacktestResult) -> float:
+    actual_cost = float(result.actual_cost_bps)
+    denominator = 2.0 * actual_cost + 1e-12
+    cost_ratio = max(0.0, 1.0 - float(result.break_even_cost_bps) / denominator) if actual_cost > 0.0 else 0.0
+    turnover_severity = max(0.0, (float(result.factor_turnover) - 0.10) / 0.10)
+    return min(1.0, max(cost_ratio, turnover_severity))
 
 
 def _candidate_with_params(parent: CandidateStrategySpec, params: dict[str, Any]) -> CandidateStrategySpec:
@@ -2788,6 +2900,8 @@ def _repair_signature_params(params: dict[str, Any]) -> dict[str, Any]:
         "funding_state_filter",
         "funding_trend_filter",
         "side_mode",
+        "zscore_window",
+        "tanh_scale",
     }
     return {key: params[key] for key in keys if key in params}
 
@@ -2889,6 +3003,9 @@ def _select_repair_merge_pool(
 
         if is_local_tuning:
             per_parent_tuning_count[parent_id] += 1
+            parent_result = result_by_candidate.get(parent_id)
+            repair.params["optimizer_parent_metrics"] = _metrics_payload(parent_result)
+            repair.params["local_grid_validation_delta"] = _local_grid_validation_delta(result, parent_result)
         else:
             per_parent_repair_count[parent_id] += 1
         merged += 1
@@ -2954,16 +3071,37 @@ def _local_tuning_validation_score(result: BacktestResult, parent_corr: float | 
     turnover_penalty = max(0.0, float(result.factor_turnover) - 0.10)
     drawdown_penalty = max(0.0, abs(float(result.metrics_primary.max_drawdown)) - 0.12)
     corr_penalty = 0.0 if parent_corr is None else 0.10 * abs(parent_corr)
+    # Deflated Sharpe is the primary objective; gross Sharpe is only a small
+    # tie-breaker so observed Sharpe is not counted twice.
     return float(
         result.deflated_sharpe
-        + 0.50 * result.metrics_primary.sharpe
-        + 0.25 * max(0.0, gross_sharpe)
+        + 0.15 * max(0.0, gross_sharpe)
         + 0.02 * max(-10.0, min(25.0, cost_margin))
         - 1.50 * turnover_penalty
         - 2.00 * drawdown_penalty
         - 0.50 * pbo
         - corr_penalty
     )
+
+
+def _local_grid_validation_delta(
+    result: BacktestResult,
+    parent_result: BacktestResult | None,
+) -> dict[str, float | None]:
+    parent_metrics = _metrics_payload(parent_result)
+    current = _metrics_payload(result)
+    return {
+        "delta_sharpe": _delta_metric(current.get("sharpe"), parent_metrics.get("sharpe")),
+        "delta_turnover": _delta_metric(current.get("factor_turnover"), parent_metrics.get("factor_turnover")),
+        "delta_max_dd": _delta_metric(current.get("max_dd"), parent_metrics.get("max_dd")),
+        "delta_cost_margin_bps": _delta_metric(current.get("cost_margin_bps"), parent_metrics.get("cost_margin_bps")),
+    }
+
+
+def _delta_metric(current: Any, previous: Any) -> float | None:
+    if current is None or previous is None:
+        return None
+    return float(current) - float(previous)
 
 
 def _repair_merge_score(result: BacktestResult, parent_corr: float | None) -> float:
@@ -3001,6 +3139,7 @@ def _repair_merge_diagnostic(
         "search_variant": repair.params.get("search_variant"),
         "validation_selection_score": repair.params.get("validation_selection_score"),
         "merge_pool_score": repair.params.get("merge_pool_score"),
+        "local_grid_validation_delta": repair.params.get("local_grid_validation_delta"),
     }
 
 

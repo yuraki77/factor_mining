@@ -33,7 +33,7 @@ class CandidateStrategySpec(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
     max_feature_lookback_bars: int = 288
     is_ml: bool = False
-    candidate_type: Literal["original", "repair", "composite", "optimizer"] = "original"
+    candidate_type: Literal["original", "repair", "grid_tuning", "composite", "optimizer"] = "original"
     parent_candidate_id: str | None = None
 
 
