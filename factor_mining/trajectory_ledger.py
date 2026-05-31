@@ -78,6 +78,8 @@ class TrajectoryLedger:
             return "CROSSOVER", "COMPOSITE_EQUI_WEIGHT"
 
         if ctype == "optimizer":
+            if kind == "crossover" or generated_by == "crossover_dsl_composite":
+                return "CROSSOVER", "DSL_COMPOSITE"
             if kind == "hill_climb":
                 return "MUTATION_AT_DSL", "OPTIMIZER_HILL_CLIMB"
             if kind in ("evolution", "turnover_control"):
@@ -220,6 +222,14 @@ def _resolve_parent_ids(candidate: CandidateStrategySpec) -> list[str]:
     """Walk the optimizer lineage metadata to produce an ordered parent id list."""
     seen: set[str] = set()
     ids: list[str] = []
+
+    explicit_parent_ids = candidate.params.get("parent_ids")
+    if isinstance(explicit_parent_ids, list):
+        for item in explicit_parent_ids:
+            parent_id = str(item or "").strip()
+            if parent_id and parent_id not in seen and parent_id != candidate.candidate_id:
+                ids.append(parent_id)
+                seen.add(parent_id)
 
     # Explicit parent from params lineage
     root = str(

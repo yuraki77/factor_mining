@@ -1883,6 +1883,104 @@ def _run_mining_round(
     _log(f"  Total optimization: {len(new_candidates) - len(round_candidates)} new candidates "
          f"({time.perf_counter() - t0:.0f}s)")
 
+    # ── Evolutionary selector (Phase 3) ─────────────────────────
+    evo_candidates_created = 0
+    if settings.evolutionary.enabled and phase == "discovery":
+        from factor_mining.optimizers.evolutionary_selector import (  # noqa: F811
+            allocate_evolutionary_budget,
+            select_evolutionary_parents,
+        )
+        from factor_mining.optimizers.evolutionary_operations import (  # noqa: F811
+            crossover_dsl_composite,
+        )
+        from factor_mining.dsl.fingerprint_store import FingerprintStore  # noqa: F811
+
+        evo_budget = allocate_evolutionary_budget(ctx, total_budget=settings.evolutionary.budget_per_round)
+        _log(f"  Evolutionary budget: {evo_budget}")
+
+        candidate_by_id = {c.candidate_id: c for c in round_candidates}
+        evo_fingerprint_store = FingerprintStore(store)
+        remaining_evo_budget = sum(max(0, int(value)) for value in evo_budget.values())
+        evo_corr_rejected = 0
+        evo_corr_warned = 0
+
+        # CROSSOVER from exploit parents
+        exploit_budget = min(remaining_evo_budget, max(0, int(evo_budget.get("exploit", 0))))
+        if exploit_budget > 0:
+            exploit_parent_count = min(settings.evolutionary.crossover_parent_count, exploit_budget * 2)
+            exploit_parents = select_evolutionary_parents(ctx, operator="exploit", count=exploit_parent_count)
+            for i in range(0, len(exploit_parents) - 1, 2):
+                if remaining_evo_budget <= 0:
+                    break
+                parent_a = candidate_by_id.get(exploit_parents[i].get("candidate_id") or "")
+                parent_b = candidate_by_id.get(exploit_parents[i + 1].get("candidate_id") or "")
+                if parent_a is not None and parent_b is not None:
+                    children = crossover_dsl_composite(
+                        parent_a,
+                        parent_b,
+                        settings,
+                        fingerprint_store=evo_fingerprint_store,
+                        max_children=remaining_evo_budget,
+                    )
+                    children, rejected, warned = _filter_evolutionary_output_correlation(
+                        children,
+                        candidate_by_id,
+                        final_frame,
+                        features_df,
+                        feature_meta,
+                        final_regimes,
+                        final_funding_rate,
+                        settings,
+                    )
+                    evo_corr_rejected += rejected
+                    evo_corr_warned += warned
+                    if children:
+                        new_candidates.extend(children)
+                        evo_candidates_created += len(children)
+                        remaining_evo_budget -= len(children)
+
+        # MUTATION_AT_MECHANISM from variation parents
+        variation_budget = min(remaining_evo_budget, max(0, int(evo_budget.get("variation", 0))))
+        if settings.evolutionary.llm_mutations and variation_budget > 0:
+            from factor_mining.optimizers.evolutionary_operations import (  # noqa: F811
+                extract_freeze_point,
+            )
+            from factor_mining.llm.mutation import mutate_with_mechanism  # noqa: F811
+
+            variation_parents = select_evolutionary_parents(ctx, operator="variation", count=min(3, variation_budget))
+            for parent_summary in variation_parents:
+                if remaining_evo_budget <= 0:
+                    break
+                parent = candidate_by_id.get(parent_summary.get("candidate_id") or "")
+                if parent is None:
+                    continue
+                fp = extract_freeze_point(parent, freeze_depth=settings.evolutionary.freeze_depth)
+                child = mutate_with_mechanism(parent, fp, settings, store=store, fingerprint_store=evo_fingerprint_store)
+                if child is not None:
+                    accepted, rejected, warned = _filter_evolutionary_output_correlation(
+                        [child],
+                        candidate_by_id,
+                        final_frame,
+                        features_df,
+                        feature_meta,
+                        final_regimes,
+                        final_funding_rate,
+                        settings,
+                    )
+                    evo_corr_rejected += rejected
+                    evo_corr_warned += warned
+                    if accepted:
+                        new_candidates.extend(accepted)
+                        evo_candidates_created += len(accepted)
+                        remaining_evo_budget -= len(accepted)
+
+        if evo_candidates_created:
+            _log(f"  Evolutionary candidates: {evo_candidates_created} added ({len(new_candidates)} total)")
+        if evo_corr_rejected:
+            _log(f"  Evolutionary output-correlation gate: rejected={evo_corr_rejected}")
+        if evo_corr_warned:
+            _log(f"  Evolutionary output-correlation warnings: warned={evo_corr_warned}")
+
     history_entry = {
         "round": round_num,
         "iteration": iteration,
@@ -1916,6 +2014,9 @@ def _run_mining_round(
         "optimization": optimization,
         "summary": opt_summary,
         "new_candidates_count": len(new_candidates),
+        "evo_candidates_created": evo_candidates_created,
+        "evo_output_corr_rejected": evo_corr_rejected if settings.evolutionary.enabled and phase == "discovery" else 0,
+        "evo_output_corr_warned": evo_corr_warned if settings.evolutionary.enabled and phase == "discovery" else 0,
         "trajectory_ids": [t.get("trajectory_id") for t in round_trajectories if isinstance(t, dict)],
     }
 
@@ -3966,7 +4067,7 @@ def _build_tasks(
 def _filter_unfunded_factor_signal_candidates(
     candidates: list[CandidateStrategySpec],
     funding_rate: pd.Series | None,
-) -> tuple[list[CandidateStrategySpec], int]:
+) -> tuple[list[CandidateStrategySpec], int, int]:
     if _has_usable_funding_rate(funding_rate):
         return candidates, 0
     filtered = [candidate for candidate in candidates if not _candidate_requires_funding_rate(candidate)]
@@ -3981,7 +4082,21 @@ def _has_usable_funding_rate(funding_rate: pd.Series | None) -> bool:
 
 
 def _candidate_requires_funding_rate(candidate: CandidateStrategySpec, *, depth: int = 0) -> bool:
+    if _candidate_dsl_uses_leaf(candidate, "$funding_rate"):
+        return True
     return _params_require_funding_rate(candidate.hypothesis_family, candidate.params, depth=depth)
+
+
+def _candidate_dsl_uses_leaf(candidate: CandidateStrategySpec, leaf: str) -> bool:
+    if not candidate.dsl_ast and not candidate.dsl_expression:
+        return False
+    try:
+        from factor_mining.dsl import extract_features, parse
+
+        ast = candidate.dsl_ast or parse(candidate.dsl_expression or "")
+        return leaf in extract_features(ast)
+    except Exception:
+        return False
 
 
 def _params_require_funding_rate(hypothesis_family: str, params: dict, *, depth: int = 0) -> bool:
@@ -4223,14 +4338,22 @@ def _build_signal_for_uncached(
     """Construct a trading signal for a single candidate.
 
     Dispatch order:
-      1. ``signal_source="feature"`` — explicit indicator from features_df
-      2. ``signal_source="factor_signal"`` — factor_signal() with explicit params
-      3. composite — multi-factor blend
-      4. legacy — implicit family/index routing (backward compat)
+      1. DSL expression — explicit factor formula from the phase-2 DSL
+      2. ``signal_source="feature"`` — explicit indicator from features_df
+      3. ``signal_source="factor_signal"`` — factor_signal() with explicit params
+      4. composite — multi-factor blend
+      5. legacy — implicit family/index routing (backward compat)
     """
     signal_source = candidate.params.get("signal_source")
 
-    # ── Priority 1: explicit feature indicator ──────────────────────
+    # ── Priority 1: explicit DSL signal ─────────────────────────────
+    if candidate.dsl_ast is not None or candidate.dsl_expression:
+        signal = _build_dsl_signal(candidate, frame, features_df, forward_regimes, funding_rate)
+        signal = _apply_signal_controls(signal.fillna(0.0), candidate.params).clip(-3, 3)
+        signal = _apply_candidate_filters(signal, candidate.params, forward_regimes, funding_rate, build_context)
+        return signal.to_numpy(dtype=float)
+
+    # ── Priority 2: explicit feature indicator ──────────────────────
     if signal_source == "feature":
         indicator_name = candidate.params.get("indicator_name")
         if indicator_name is None or indicator_name not in features_df.columns:
@@ -4257,7 +4380,7 @@ def _build_signal_for_uncached(
         signal = _apply_candidate_filters(signal, candidate.params, forward_regimes, funding_rate, build_context)
         return signal.to_numpy(dtype=float)
 
-    # ── Priority 2: explicit factor_signal ──────────────────────────
+    # ── Priority 3: explicit factor_signal ──────────────────────────
     if signal_source == "factor_signal":
         family = candidate.params.get("factor_family")
         lookback = candidate.params.get("factor_lookback", 12)
@@ -4319,6 +4442,164 @@ def _build_signal_for_uncached(
     signal = features_df[feature_col].fillna(0).clip(-3, 3)
     signal = _apply_candidate_filters(signal, candidate.params, forward_regimes, funding_rate, build_context)
     return signal.to_numpy(dtype=float)
+
+
+def _build_dsl_signal(
+    candidate: CandidateStrategySpec,
+    frame: pd.DataFrame,
+    features_df: pd.DataFrame,
+    forward_regimes: pd.Series,
+    funding_rate: pd.Series | None,
+) -> pd.Series:
+    from factor_mining.dsl import canonicalize, parse
+    from factor_mining.dsl.evaluator import evaluate
+
+    ast = candidate.dsl_ast or parse(candidate.dsl_expression or "")
+    ast = canonicalize(ast)
+    dsl_frame = _dsl_market_frame(frame, forward_regimes, funding_rate)
+    return evaluate(ast, dsl_frame, features_df)
+
+
+def _dsl_market_frame(
+    frame: pd.DataFrame,
+    forward_regimes: pd.Series,
+    funding_rate: pd.Series | None,
+) -> pd.DataFrame:
+    dsl_frame = frame.copy()
+    if funding_rate is not None and "funding_rate" not in dsl_frame.columns:
+        dsl_frame["funding_rate"] = pd.Series(funding_rate).reindex(frame.index)
+    if "regime_state" not in dsl_frame.columns:
+        dsl_frame["regime_state"] = _regime_state_series(forward_regimes, frame.index)
+    return dsl_frame
+
+
+def _regime_state_series(forward_regimes: pd.Series, index: pd.Index) -> pd.Series:
+    regimes = pd.Series(forward_regimes).reindex(index)
+    if pd.api.types.is_numeric_dtype(regimes):
+        return regimes.astype(float)
+    mapping = {
+        "bull": 1.0,
+        "bear": 2.0,
+        "sideways": 3.0,
+        "high_vol": 4.0,
+    }
+    return regimes.astype(str).map(mapping).fillna(0.0)
+
+
+def _filter_evolutionary_output_correlation(
+    candidates: list[CandidateStrategySpec],
+    parent_by_id: dict[str, CandidateStrategySpec],
+    frame: pd.DataFrame,
+    features_df: pd.DataFrame,
+    feature_meta: dict,
+    forward_regimes: pd.Series,
+    funding_rate: pd.Series | None,
+    settings: Settings,
+) -> tuple[list[CandidateStrategySpec], int]:
+    """Reject evolutionary children that are effectively parent duplicates."""
+    if not candidates:
+        return [], 0, 0
+    threshold = float(settings.evolutionary.output_correlation_reject_threshold)
+    warn_threshold = float(settings.evolutionary.output_correlation_warn_threshold)
+    context = SignalBuildContext(
+        frame=frame,
+        features_df=features_df,
+        feature_meta=feature_meta,
+        forward_regimes=forward_regimes,
+        funding_rate=funding_rate,
+    )
+    accepted: list[CandidateStrategySpec] = []
+    rejected = 0
+    warned = 0
+    for child in candidates:
+        try:
+            child_signal = _build_signal_for(
+                child,
+                frame,
+                features_df,
+                feature_meta,
+                0,
+                forward_regimes,
+                funding_rate,
+                build_context=context,
+            )
+        except ValueError:
+            rejected += 1
+            continue
+        if _is_empty_signal(child_signal):
+            rejected += 1
+            continue
+        reject = False
+        warn = False
+        for parent_id in _evolutionary_parent_ids(child):
+            parent = parent_by_id.get(parent_id)
+            if parent is None:
+                continue
+            try:
+                parent_signal = _build_signal_for(
+                    parent,
+                    frame,
+                    features_df,
+                    feature_meta,
+                    0,
+                    forward_regimes,
+                    funding_rate,
+                    build_context=context,
+                )
+            except ValueError:
+                continue
+            corr = _absolute_signal_correlation(child_signal, parent_signal)
+            if corr is not None and corr >= threshold:
+                reject = True
+                break
+            if corr is not None and corr >= warn_threshold:
+                warn = True
+        if reject:
+            rejected += 1
+        else:
+            if warn:
+                warned += 1
+            accepted.append(child)
+    return accepted, rejected, warned
+
+
+def _evolutionary_parent_ids(candidate: CandidateStrategySpec) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    parent_ids = candidate.params.get("parent_ids")
+    if isinstance(parent_ids, list):
+        for item in parent_ids:
+            value = str(item or "").strip()
+            if value and value not in seen:
+                seen.add(value)
+                out.append(value)
+    if candidate.parent_candidate_id and candidate.parent_candidate_id not in seen:
+        out.append(candidate.parent_candidate_id)
+    return out
+
+
+def _is_empty_signal(signal: np.ndarray) -> bool:
+    values = np.asarray(signal, dtype=float)
+    finite = values[np.isfinite(values)]
+    return (
+        finite.size == 0
+        or float(np.abs(finite).sum()) <= 1e-12
+        or float(np.std(finite)) <= 1e-12
+    )
+
+
+def _absolute_signal_correlation(left: np.ndarray, right: np.ndarray) -> float | None:
+    lval = np.asarray(left, dtype=float)
+    rval = np.asarray(right, dtype=float)
+    mask = np.isfinite(lval) & np.isfinite(rval)
+    if int(mask.sum()) < 3:
+        return None
+    lsel = lval[mask]
+    rsel = rval[mask]
+    if float(np.std(lsel)) <= 1e-12 or float(np.std(rsel)) <= 1e-12:
+        return None
+    corr = float(np.corrcoef(lsel, rsel)[0, 1])
+    return abs(corr) if np.isfinite(corr) else None
 
 
 def _build_composite_signal(

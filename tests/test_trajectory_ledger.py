@@ -272,6 +272,13 @@ def test_classify_optimizer_turnover_control() -> None:
     assert ledger.classify_operator_with_detail(c, {}) == ("MUTATION_AT_DSL", "OPTIMIZER_EVOLUTION")
 
 
+def test_classify_optimizer_crossover() -> None:
+    ledger = TrajectoryLedger(None, _settings())
+    c = _candidate("c1", ctype="optimizer", parent_id="p1", optimizer_proposal_kind="crossover")
+    assert ledger.classify_operator(c, {}) == "CROSSOVER"
+    assert ledger.classify_operator_with_detail(c, {}) == ("CROSSOVER", "DSL_COMPOSITE")
+
+
 def test_classify_legacy_parent() -> None:
     ledger = TrajectoryLedger(None, _settings())
     c = _candidate("c1", ctype="original", parent_id="p1")
@@ -284,6 +291,27 @@ def test_classify_grid_tuning_from_local_grid_kind() -> None:
     c = _candidate("c1", ctype="optimizer", parent_id="p1", optimizer_proposal_kind="local_grid_tuning")
     assert ledger.classify_operator(c, {}) == "MUTATION_AT_DSL"
     assert ledger.classify_operator_with_detail(c, {}) == ("MUTATION_AT_DSL", "GRID_TUNING")
+
+
+def test_optimizer_crossover_record_keeps_all_parent_ids() -> None:
+    ledger = TrajectoryLedger(None, _settings())
+    c = _candidate(
+        "c_xo",
+        ctype="optimizer",
+        parent_id="p1",
+        optimizer_proposal_kind="crossover",
+        parent_ids=["p1", "p2"],
+    )
+    record = ledger.create_record(
+        c, _result("c_xo"), _evidence("c_xo"),
+        _research_gate("c_xo", "research_survivor"),
+        _near_miss("c_xo"),
+        {},
+        artifact_scope="round1",
+    )
+    assert record.operator == "CROSSOVER"
+    assert record.operator_detail == "DSL_COMPOSITE"
+    assert record.parent_ids == ["p1", "p2"]
 
 
 # ── create_record tests ─────────────────────────────────────────────
@@ -592,14 +620,14 @@ def test_candidate_with_dsl_fields_round_trips() -> None:
         method_id="factor_scoring",
         hypothesis_family="momentum",
         symbol="BTCUSDT",
-        dsl_expression="ts_mean(close, 12)",
-        dsl_canonical_expression="ts_mean(close, 12)",
+        dsl_expression="TS_MEAN($close, 20)",
+        dsl_canonical_expression="TS_MEAN($close, 20)",
         dsl_fingerprint="abc123",
         dsl_version="0.1.0",
     )
     payload = c.model_dump(mode="json")
     restored = CandidateStrategySpec.model_validate(payload)
-    assert restored.dsl_expression == "ts_mean(close, 12)"
+    assert restored.dsl_expression == "TS_MEAN($close, 20)"
     assert restored.dsl_fingerprint == "abc123"
 
 

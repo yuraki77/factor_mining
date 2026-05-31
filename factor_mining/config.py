@@ -160,6 +160,25 @@ class ExitBoundsConfig(BaseModel):
     trailing_stop_pct_max: float = 0.10
 
 
+class EvolutionaryConfig(BaseModel):
+    """Controls for the evolutionary alpha workflow (Phase 3).
+
+    All evolutionary behaviour is gated behind ``enabled`` — when False
+    (default) the pipeline is unchanged.
+    """
+
+    enabled: bool = False
+    budget_per_round: int = 20
+    crossover_parent_count: int = 4
+    freeze_depth: int = 3
+    llm_mutations: bool = False
+    max_constants_per_expression: int = 3
+    max_complexity: int = 30
+    max_categorical_comparisons: int = 4
+    output_correlation_reject_threshold: float = 0.8
+    output_correlation_warn_threshold: float = 0.6
+
+
 class Settings(BaseModel):
     data: DataConfig = Field(default_factory=DataConfig)
     trial_ledger: TrialLedgerConfig = Field(default_factory=TrialLedgerConfig)
@@ -177,6 +196,7 @@ class Settings(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     gatecheck: GateCheckConfig = Field(default_factory=GateCheckConfig)
     exit_bounds: ExitBoundsConfig = Field(default_factory=ExitBoundsConfig)
+    evolutionary: EvolutionaryConfig = Field(default_factory=EvolutionaryConfig)
 
 
 def apply_trade_overrides(
