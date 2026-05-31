@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, computed_field, model_validator
 
 
 UTC = timezone.utc
@@ -35,6 +35,12 @@ class CandidateStrategySpec(BaseModel):
     is_ml: bool = False
     candidate_type: Literal["original", "repair", "grid_tuning", "composite", "optimizer"] = "original"
     parent_candidate_id: str | None = None
+    # ── DSL fields (optional, None for non-DSL candidates) ──────────
+    dsl_expression: str | None = None
+    dsl_canonical_expression: str | None = None
+    dsl_ast: dict[str, Any] | None = None
+    dsl_fingerprint: str | None = None
+    dsl_version: str | None = None
 
 
 class MetricsBlock(BaseModel):
@@ -283,6 +289,72 @@ class TrialRecord(BaseModel):
     hypothesis_family: str
     method_id: str
     evaluated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+_TRAJECTORY_OPERATOR_LITERAL = Literal[
+    "SEED", "SEED_INFORMED",
+    "MUTATION_AT_HYPOTHESIS", "MUTATION_AT_MECHANISM", "MUTATION_AT_DSL",
+    "CROSSOVER",
+]
+
+_TRAJECTORY_CLASSIFICATION_LITERAL = Literal[
+    "production_passed", "research_survivor", "rejected",
+    "gatecheck_failed", "pre_gate_skipped",
+]
+
+
+class TrajectoryRecord(BaseModel):
+    """Lineage record for a single evaluated candidate after final OOS classification.
+
+    Every candidate that reaches the final OOS window receives a trajectory
+    record, regardless of whether it passes GateCheck.  Failed pre-gate repair
+    attempts are NOT promoted to trajectories — they remain inline logs.
+    """
+
+    trajectory_id: str
+    candidate_id: str
+    experiment_id: str | None = None
+    artifact_scope: str = ""
+    parent_ids: list[str] = Field(default_factory=list)
+    parent_trajectory_ids: list[str] = Field(default_factory=list)
+    operator: _TRAJECTORY_OPERATOR_LITERAL = "SEED"
+    operator_detail: str | None = None
+    source_candidate_type: str | None = None
+    freeze_point: dict[str, Any] = Field(default_factory=dict)
+    hypothesis_family: str = ""
+    method_id: str = ""
+    symbol: str = ""
+    classification: _TRAJECTORY_CLASSIFICATION_LITERAL = "rejected"
+    promotion_reason: str | None = None
+    diagnosis_text: str | None = None
+    candidate_snapshot: dict[str, Any] = Field(default_factory=dict)
+    backtest_result: dict[str, Any] | None = None
+    evidence_snapshot: dict[str, Any] | None = None
+    research_gate_snapshot: dict[str, Any] | None = None
+    near_miss_snapshot: dict[str, Any] | None = None
+    trial_ids: list[str] = Field(default_factory=list)
+    trial_refs: list[dict[str, Any]] = Field(default_factory=list)
+    artifact_references: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_legacy_operator(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        legacy_map = {
+            "GRID_TUNING": "MUTATION_AT_DSL",
+            "PRE_GATE_REPAIR": "MUTATION_AT_DSL",
+            "OPTIMIZER_HILL_CLIMB": "MUTATION_AT_DSL",
+            "OPTIMIZER_EVOLUTION": "MUTATION_AT_DSL",
+            "COMPOSITE_EQUI_WEIGHT": "CROSSOVER",
+        }
+        operator = data.get("operator")
+        if operator in legacy_map:
+            data = dict(data)
+            data.setdefault("operator_detail", operator)
+            data["operator"] = legacy_map[operator]
+        return data
 
 
 class DataCoverageRecord(BaseModel):

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from factor_mining.models import ResearchSurvivorRecord, TrialRecord, UTC
+from factor_mining.models import ResearchSurvivorRecord, TrajectoryRecord, TrialRecord, UTC
 
 
 class MetadataStore:
@@ -86,6 +86,20 @@ class MetadataStore:
 
                     create index if not exists idx_research_survivors_status_updated
                         on research_survivors(status, updated_at);
+
+                    create table if not exists trajectories (
+                        trajectory_id text primary key,
+                        candidate_id text not null,
+                        operator text not null,
+                        payload_json text not null,
+                        created_at text not null
+                    );
+
+                    create index if not exists idx_trajectories_candidate
+                        on trajectories(candidate_id);
+
+                    create index if not exists idx_trajectories_operator
+                        on trajectories(operator);
                     """
                 )
 
@@ -423,6 +437,91 @@ class MetadataStore:
                         candidate_id,
                     ),
                 )
+
+
+    # ── Trajectory methods ──────────────────────────────────────────
+
+    def save_trajectory(self, record: TrajectoryRecord) -> None:
+        with closing(self.connect()) as conn:
+            with conn:
+                conn.execute(
+                    """
+                    insert or replace into trajectories
+                        (trajectory_id, candidate_id, operator, payload_json, created_at)
+                    values (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.trajectory_id,
+                        record.candidate_id,
+                        record.operator,
+                        json.dumps(record.model_dump(mode="json"), default=str, sort_keys=True),
+                        record.created_at.astimezone(UTC).isoformat(),
+                    ),
+                )
+
+    def load_trajectory(self, trajectory_id: str) -> TrajectoryRecord | None:
+        with closing(self.connect()) as conn:
+            row = conn.execute(
+                "select payload_json from trajectories where trajectory_id = ?",
+                (trajectory_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return TrajectoryRecord.model_validate(json.loads(row["payload_json"]))
+
+    def list_trajectories(
+        self,
+        *,
+        candidate_id: str | None = None,
+        operator: str | None = None,
+        limit: int = 200,
+    ) -> list[TrajectoryRecord]:
+        query = "select payload_json from trajectories"
+        params: list[Any] = []
+        conditions: list[str] = []
+        if candidate_id is not None:
+            conditions.append("candidate_id = ?")
+            params.append(candidate_id)
+        if operator is not None:
+            conditions.append("operator = ?")
+            params.append(operator)
+        if conditions:
+            query += " where " + " and ".join(conditions)
+        query += " order by created_at desc limit ?"
+        params.append(limit)
+        with closing(self.connect()) as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [TrajectoryRecord.model_validate(json.loads(row["payload_json"])) for row in rows]
+
+    def prune_trajectories(
+        self,
+        *,
+        keep_ids: set[str] | None = None,
+        max_unprotected_rows: int = 500,
+    ) -> int:
+        keep_ids = keep_ids or set()
+        with closing(self.connect()) as conn:
+            rows = conn.execute(
+                "select trajectory_id from trajectories order by created_at desc",
+            ).fetchall()
+            to_delete: list[str] = []
+            retained_unprotected = 0
+            for row in rows:
+                tid = str(row["trajectory_id"])
+                if tid in keep_ids:
+                    continue
+                if retained_unprotected < max_unprotected_rows:
+                    retained_unprotected += 1
+                    continue
+                to_delete.append(tid)
+            if not to_delete:
+                return 0
+            with conn:
+                conn.executemany(
+                    "delete from trajectories where trajectory_id = ?",
+                    [(tid,) for tid in to_delete],
+                )
+            return len(to_delete)
 
 
 def ensure_project_dirs(paths: list[Path]) -> None:

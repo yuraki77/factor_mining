@@ -1800,6 +1800,32 @@ def _run_mining_round(
 
     _log(f"  HardScore: {sum(1 for s in round_hardscores if s.score > 0)} positive ({time.perf_counter() - t0:.0f}s)")
 
+    # ── Trajectory Records (Evolutionary Alpha lineage) ──────────
+    round_trajectories: list[dict[str, Any]] = []
+    if store:
+        from factor_mining.trajectory_ledger import TrajectoryLedger  # noqa: F811
+
+        trajectory_ledger = TrajectoryLedger(store, settings)
+        parent_candidates_by_id = {c.candidate_id: c for c in current_candidates}
+        records, skipped_trajectory_candidates = trajectory_ledger.create_records_for_candidates(
+            round_candidates,
+            round_backtests,
+            round_factor_evidence,
+            round_research_gates,
+            round_near_misses,
+            parent_candidates_by_id,
+            artifact_scope=artifact_scope,
+        )
+        for record in records:
+            trajectory_ledger.save(record)
+            round_trajectories.append(record.model_dump(mode="json"))
+        if skipped_trajectory_candidates:
+            _log(
+                "  Trajectory records: skipped missing backtests for "
+                + ", ".join(item[:16] for item in skipped_trajectory_candidates[:5])
+            )
+        _log(f"  Trajectory records: {len(round_trajectories)} saved")
+
     # ── Optimize: signal-side ───────────────────────────────────────
     _check_stop(stop_event)
     t0 = time.perf_counter()
@@ -1890,6 +1916,7 @@ def _run_mining_round(
         "optimization": optimization,
         "summary": opt_summary,
         "new_candidates_count": len(new_candidates),
+        "trajectory_ids": [t.get("trajectory_id") for t in round_trajectories if isinstance(t, dict)],
     }
 
     return {
