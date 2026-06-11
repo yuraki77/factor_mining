@@ -131,6 +131,9 @@ def crossover_dsl_composite(
 
     Always returns at most 2 children.
     """
+    if parent_a.hypothesis_family == parent_b.hypothesis_family:
+        return []
+
     # Check DSL compatibility
     a_has_dsl = parent_a.dsl_expression is not None and parent_a.dsl_fingerprint is not None
     b_has_dsl = parent_b.dsl_expression is not None and parent_b.dsl_fingerprint is not None
@@ -166,6 +169,7 @@ def crossover_dsl_composite(
         except Exception:
             return []
 
+        # RANK wrapping is deferred until cross-sectional panel evaluation exists.
         # Create addition crossover: A + B
         add_ast: dict[str, Any] = {
             "type": "binary_op", "op": "+",

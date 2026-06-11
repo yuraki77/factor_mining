@@ -41,6 +41,10 @@ def _features(n: int = 100) -> pd.DataFrame:
     return pd.DataFrame({"rsi_14": np.linspace(20.0, 80.0, n)}, index=pd.RangeIndex(n))
 
 
+def _parse_catalog(expr: str) -> dict:
+    return parse(expr, allow_cross_sectional=True)
+
+
 class TestParserCatalog:
     def test_requires_dollar_leaf_syntax(self) -> None:
         assert parse("$close") == {"type": "factor", "value": "$close"}
@@ -54,9 +58,13 @@ class TestParserCatalog:
             parse("rsi_14")
 
     def test_accepts_phase_two_catalog_case_insensitively(self) -> None:
-        ast = parse("rank(ts_corr($returns, delta($volume, 1) / $volume, 20))")
+        ast = _parse_catalog("rank(ts_corr($returns, delta($volume, 1) / $volume, 20))")
         assert ast["name"] == "RANK"
         assert ast["args"][0]["name"] == "TS_CORR"
+
+    def test_rejects_cross_sectional_ops_by_default_in_single_symbol_mode(self) -> None:
+        with pytest.raises(ValueError, match="cross-sectional operator"):
+            parse("RANK($returns)")
 
     def test_rejects_explicitly_excluded_operators(self) -> None:
         for expr in ("TS_SUM($close, 5)", "SIGNEDPOWER($close, 2)", "DECAYLINEAR($close, 10)"):
@@ -107,19 +115,49 @@ class TestCanonicalization:
         assert left == right
 
     def test_cross_sectional_idempotence(self) -> None:
-        assert canonicalize(parse("RANK(RANK($returns))")) == canonicalize(parse("RANK($returns)"))
-        assert canonicalize(parse("ZSCORE(ZSCORE($returns))")) == canonicalize(parse("ZSCORE($returns)"))
+        assert canonicalize(_parse_catalog("RANK(RANK($returns))")) == canonicalize(_parse_catalog("RANK($returns)"))
+        assert canonicalize(_parse_catalog("ZSCORE(ZSCORE($returns))")) == canonicalize(_parse_catalog("ZSCORE($returns)"))
+
+    def test_negation_normalization_preserves_linear_operator_intent(self) -> None:
+        pairs = [
+            ("TS_MEAN(NEG($returns), 20)", "NEG(TS_MEAN($returns, 20))"),
+            ("DELAY(NEG($close), 5)", "NEG(DELAY($close, 5))"),
+            ("DELTA(NEG($close), 10)", "NEG(DELTA($close, 10))"),
+            ("RANK(NEG($returns))", "NEG(RANK($returns))"),
+            ("NEG($close) + NEG($open)", "NEG($close + $open)"),
+            ("NEG($close) * $volume", "NEG($close * $volume)"),
+        ]
+        for left, right in pairs:
+            assert structural_fingerprint(_parse_catalog(left)) == structural_fingerprint(_parse_catalog(right))
+
+    def test_constant_folding_keeps_constants_on_allowed_grid(self) -> None:
+        canonical = canonicalize(parse("$close + (0.5 + 0.1)"))
+        values: list[float] = []
+
+        def collect_constants(ast: dict) -> None:
+            if ast["type"] == "constant":
+                values.append(ast["value"])
+            elif ast["type"] == "binary_op":
+                collect_constants(ast["left"])
+                collect_constants(ast["right"])
+            elif ast["type"] == "func_call":
+                for arg in ast["args"]:
+                    collect_constants(arg)
+
+        collect_constants(canonical)
+        assert 0.6 not in values
+        assert sorted(values) == [0.1, 0.5]
 
     def test_roundtrip_render_parse_fingerprint(self) -> None:
         expr = "RANK(TS_CORR($returns, DELTA($volume, 1) / $volume, 20) * TS_MEAN(($close - $open) / $close, 5))"
-        canonical = canonicalize(parse(expr))
+        canonical = canonicalize(_parse_catalog(expr))
         rendered = render(canonical)
-        assert structural_fingerprint(parse(rendered)) == structural_fingerprint(canonical)
+        assert structural_fingerprint(_parse_catalog(rendered)) == structural_fingerprint(canonical)
 
 
 class TestComplexity:
     def test_extracts_features_lookbacks_and_free_constants(self) -> None:
-        ast = parse("WHERE(GT(TS_STD($returns, 20), 0.5), RANK(TS_MEAN($returns, 5)), 0)")
+        ast = _parse_catalog("WHERE(GT(TS_STD($returns, 20), 0.5), RANK(TS_MEAN($returns, 5)), 0)")
         assert extract_features(ast) == {"$returns"}
         assert extract_lookbacks(ast) == {5, 20}
         assert free_constant_count(ast) == 1
@@ -154,9 +192,17 @@ class TestEvaluator:
         assert result.iloc[:4].isna().all()
         assert result.iloc[4:].notna().all()
 
-    def test_cross_sectional_ops_parse_but_need_panel_adapter(self) -> None:
+    def test_cross_sectional_ops_require_explicit_parse_opt_in_then_need_panel_adapter(self) -> None:
         with pytest.raises(ValueError, match="panel adapter"):
-            evaluate(parse("RANK($returns)"), _frame(10), _features(10))
+            evaluate(_parse_catalog("RANK($returns)"), _frame(10), _features(10))
+
+    def test_ts_rank_uses_zero_to_one_range(self) -> None:
+        frame = _frame(4)
+        frame["close"] = [3.0, 2.0, 1.0, 2.0]
+        result = evaluate(parse("TS_RANK($close, 3)"), frame, _features(4))
+        assert result.iloc[2] == 0.0
+        assert result.iloc[3] == 1.0
+        assert result.dropna().between(0.0, 1.0).all()
 
     def test_supported_operator_catalog_matches_phase_two_names(self) -> None:
         ops = supported_operators()
@@ -172,11 +218,9 @@ class TestFingerprintStore:
         assert store.is_novel("fp1") is False
         assert store.candidate_ids_for("fp1") == {"c1"}
 
-    def test_parent_exempts_archive_but_not_batch_duplicates(self) -> None:
+    def test_parent_fingerprint_is_not_exempt_from_archive_duplicates(self) -> None:
         store = FingerprintStore()
         store.register_parent("parent_fp")
-        assert store.is_novel("parent_fp", archive_fingerprints={"parent_fp"}) is True
-        store.register("parent_fp", "child")
         assert store.is_novel("parent_fp", archive_fingerprints={"parent_fp"}) is False
 
     def test_clear_caches_resets_transient_sets(self) -> None:
@@ -212,6 +256,10 @@ def test_curated_equivalence_and_non_equivalence_pairs() -> None:
         ("WHERE(NOT(GT($close, $open)), $low, $high)", "WHERE(GT($close, $open), $high, $low)"),
         ("RANK(RANK($returns))", "RANK($returns)"),
         ("ZSCORE(ZSCORE($returns))", "ZSCORE($returns)"),
+        ("TS_MEAN(NEG($returns), 20)", "NEG(TS_MEAN($returns, 20))"),
+        ("DELAY(NEG($close), 5)", "NEG(DELAY($close, 5))"),
+        ("DELTA(NEG($close), 10)", "NEG(DELTA($close, 10))"),
+        ("RANK(NEG($returns))", "NEG(RANK($returns))"),
     ]
     for leaf in ("$open", "$high", "$low", "$close", "$volume", "$vwap", "$returns", "$funding_rate", "$open_interest", "$regime_state"):
         equiv_pairs.append((f"{leaf} + 0", leaf))
@@ -242,9 +290,9 @@ def test_curated_equivalence_and_non_equivalence_pairs() -> None:
     assert len(equiv_pairs) >= 50
     assert len(non_equiv_pairs) >= 50
     for left, right in equiv_pairs:
-        assert structural_fingerprint(parse(left)) == structural_fingerprint(parse(right)), (left, right)
+        assert structural_fingerprint(_parse_catalog(left)) == structural_fingerprint(_parse_catalog(right)), (left, right)
     for left, right in non_equiv_pairs:
-        assert structural_fingerprint(parse(left)) != structural_fingerprint(parse(right)), (left, right)
+        assert structural_fingerprint(_parse_catalog(left)) != structural_fingerprint(_parse_catalog(right)), (left, right)
 
 
 def test_idempotence_samples_cover_catalog() -> None:
@@ -277,6 +325,23 @@ def test_idempotence_samples_cover_catalog() -> None:
     ]
     for i in range(10_000):
         expr = expressions[i % len(expressions)]
-        c1 = canonicalize(parse(expr))
+        c1 = canonicalize(_parse_catalog(expr))
         c2 = canonicalize(c1)
         assert c1 == c2
+
+
+def test_generated_ast_idempotence_samples_cover_nested_shapes() -> None:
+    leaves = ["$close", "$open", "$volume", "$returns"]
+    windows = [3, 5, 20]
+    expressions: list[str] = []
+    for i, leaf in enumerate(leaves):
+        other = leaves[(i + 1) % len(leaves)]
+        window = windows[i % len(windows)]
+        expressions.extend([
+            f"TS_MEAN(NEG({leaf}), {window})",
+            f"({leaf} - {other}) / TS_MEAN({other}, {window})",
+            f"WHERE(GT({leaf}, {other}), DELTA({leaf}, {window}), NEG({other}))",
+        ])
+    for expr in expressions:
+        c1 = canonicalize(parse(expr))
+        assert canonicalize(c1) == c1

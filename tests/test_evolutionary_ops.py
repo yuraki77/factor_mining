@@ -49,8 +49,8 @@ def _candidate(cid: str, **params: object) -> CandidateStrategySpec:
     )
 
 
-def _candidate_dsl(cid: str, expr: str, **params: object) -> CandidateStrategySpec:
-    ast = parse(expr)
+def _candidate_dsl(cid: str, expr: str, *, allow_cross_sectional: bool = False, **params: object) -> CandidateStrategySpec:
+    ast = parse(expr, allow_cross_sectional=allow_cross_sectional)
     fp = structural_fingerprint(ast)
     return CandidateStrategySpec(
         candidate_id=cid,
@@ -265,7 +265,7 @@ class TestCrossover:
 
     def test_dsl_crossover_creates_children(self) -> None:
         a = _candidate_dsl("ca", "$close - ts_mean($close, 20)")
-        b = _candidate_dsl("cb", "$volume / ts_mean($volume, 20)")
+        b = _candidate_dsl("cb", "$volume / ts_mean($volume, 20)", family="liquidity")
         children = crossover_dsl_composite(a, b, _settings())
         assert len(children) >= 1
         child = children[0]
@@ -276,26 +276,26 @@ class TestCrossover:
 
     def test_crossover_children_have_unique_fingerprints(self) -> None:
         a = _candidate_dsl("ca", "$close - ts_mean($close, 20)")
-        b = _candidate_dsl("cb", "$volume / ts_mean($volume, 20)")
+        b = _candidate_dsl("cb", "$volume / ts_mean($volume, 20)", family="liquidity")
         children = crossover_dsl_composite(a, b, _settings())
         assert len(children) >= 1
         fps = {c.dsl_fingerprint for c in children}
         assert len(fps) == len(children)  # all unique
 
-    def test_crossover_dedup_identical_parents(self) -> None:
+    def test_crossover_skips_same_hypothesis_family(self) -> None:
         a = _candidate_dsl("ca", "$close")
-        children = crossover_dsl_composite(a, a, _settings())
-        assert len(children) >= 1
+        b = _candidate_dsl("cb", "$volume")
+        assert crossover_dsl_composite(a, b, _settings()) == []
 
     def test_crossover_respects_child_budget(self) -> None:
         a = _candidate_dsl("ca", "$close - TS_MEAN($close, 20)")
-        b = _candidate_dsl("cb", "$volume / TS_MEAN($volume, 20)")
+        b = _candidate_dsl("cb", "$volume / TS_MEAN($volume, 20)", family="liquidity")
         assert crossover_dsl_composite(a, b, _settings(), max_children=0) == []
         assert len(crossover_dsl_composite(a, b, _settings(), max_children=1)) == 1
 
     def test_cross_sectional_crossover_is_rejected_until_panel_adapter(self) -> None:
-        a = _candidate_dsl("ca", "RANK($returns)")
-        b = _candidate_dsl("cb", "$volume")
+        a = _candidate_dsl("ca", "RANK($returns)", allow_cross_sectional=True)
+        b = _candidate_dsl("cb", "$volume", family="liquidity")
         assert crossover_dsl_composite(a, b, _settings()) == []
 
     def test_dsl_crossover_signal_uses_dsl_expression(self) -> None:
@@ -304,7 +304,7 @@ class TestCrossover:
         frame = _market_frame(40)
         regimes = pd.Series("sideways", index=frame.index)
         a = _candidate_dsl("ca", "$close")
-        b = _candidate_dsl("cb", "$volume")
+        b = _candidate_dsl("cb", "$volume", family="liquidity")
         child = crossover_dsl_composite(a, b, _settings())[0]
         signal = _build_signal_for(child, frame, pd.DataFrame(index=frame.index), {}, 0, regimes)
         assert float(np.abs(signal).sum()) > 0.0
@@ -315,7 +315,7 @@ class TestCrossover:
         frame = _market_frame(40)
         regimes = pd.Series("sideways", index=frame.index)
         a = _candidate_dsl("ca", "$close")
-        b = _candidate_dsl("cb", "$close * 2")
+        b = _candidate_dsl("cb", "$close * 2", family="liquidity")
         child = crossover_dsl_composite(a, b, _settings())[0]
         accepted, rejected, warned = _filter_evolutionary_output_correlation(
             [child],
@@ -330,6 +330,13 @@ class TestCrossover:
         assert accepted == []
         assert rejected == 1
         assert warned == 0
+
+    def test_output_correlation_helpers_reject_multidimensional_signals(self) -> None:
+        from factor_mining.pipeline import _absolute_signal_correlation, _is_empty_signal
+
+        panel_signal = np.zeros((40, 2))
+        assert _is_empty_signal(panel_signal)
+        assert _absolute_signal_correlation(panel_signal, np.arange(40)) is None
 
 
 # ── LLM mutation tests (offline — no actual API call) ───────────────
@@ -358,6 +365,7 @@ class TestLLMMutation:
     def test_mutate_returns_child_for_valid_output(self) -> None:
         """When LLM returns valid DSL, a child candidate is created."""
         from factor_mining.llm.mutation import mutate_with_mechanism
+        from factor_mining.trajectory_ledger import TrajectoryLedger
 
         valid_expr = "WHERE(GT($returns, 0), $returns * 2, $returns)"
         with mock.patch("factor_mining.llm.mutation._call_llm_for_dsl", return_value=valid_expr):
@@ -369,6 +377,7 @@ class TestLLMMutation:
             assert child.dsl_expression == valid_expr
             assert child.dsl_fingerprint is not None
             assert child.params["generated_by"] == "llm_mutation_at_mechanism"
+            assert TrajectoryLedger(None, _settings()).classify_operator(child, {}) == "MUTATION_AT_MECHANISM"
 
     def test_mutate_rejects_exact_parent_fingerprint(self) -> None:
         from factor_mining.llm.mutation import mutate_with_mechanism

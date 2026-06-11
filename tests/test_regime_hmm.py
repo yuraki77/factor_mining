@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 
+from factor_mining.pipeline import _fit_regime_model
 from factor_mining.regime.hmm import MarkovRegimeDetector
 
 
@@ -98,3 +99,23 @@ def test_five_state_labels_collapse_to_canonical_regimes() -> None:
     assert labels[0] == "bear"
     assert labels[4] == "bull"
     assert set(labels.values()) <= {"bear", "bull", "sideways", "high_vol"}
+
+
+def test_fit_regime_model_falls_back_to_unknown_when_hmm_is_invalid(monkeypatch) -> None:
+    class BrokenDetector:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def fit(self, frame: pd.DataFrame) -> "BrokenDetector":
+            return self
+
+        def predict(self, frame: pd.DataFrame) -> np.ndarray:
+            raise ValueError("startprob_ must sum to 1 (got nan)")
+
+    monkeypatch.setattr("factor_mining.regime.hmm.MarkovRegimeDetector", BrokenDetector)
+    logs: list[str] = []
+
+    regimes = _fit_regime_model(_regime_frame(300), tail=5000, log_fn=logs.append)
+
+    assert regimes.tolist() == ["unknown"] * 300
+    assert any("HMM unavailable" in message for message in logs)

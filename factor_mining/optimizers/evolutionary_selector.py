@@ -121,11 +121,10 @@ def _survivor_sort_key(survivor: dict[str, Any]) -> float:
 
 
 def _param_variation_score(survivor: dict[str, Any]) -> float:
-    """Lower score = less explored = preferred for variation."""
+    """Lower score = simpler local proxy for less explored variation space."""
     params = survivor.get("params") or {}
     if not isinstance(params, dict):
         return 0.0
-    # Count how many optimizer variant keys have been tried
     variant_key = str(params.get("optimizer_variant_key") or "")
     complexity = int(params.get("complexity_score") or 1)
     return float(len(variant_key) + complexity)

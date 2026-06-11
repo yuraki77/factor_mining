@@ -279,6 +279,13 @@ def test_classify_optimizer_crossover() -> None:
     assert ledger.classify_operator_with_detail(c, {}) == ("CROSSOVER", "DSL_COMPOSITE")
 
 
+def test_classify_llm_mechanism_mutation() -> None:
+    ledger = TrajectoryLedger(None, _settings())
+    c = _candidate("c1", ctype="optimizer", parent_id="p1", optimizer_proposal_kind="mutation_at_mechanism")
+    assert ledger.classify_operator(c, {}) == "MUTATION_AT_MECHANISM"
+    assert ledger.classify_operator_with_detail(c, {}) == ("MUTATION_AT_MECHANISM", "LLM_MECHANISM_MUTATION")
+
+
 def test_classify_legacy_parent() -> None:
     ledger = TrajectoryLedger(None, _settings())
     c = _candidate("c1", ctype="original", parent_id="p1")

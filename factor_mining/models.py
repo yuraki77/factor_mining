@@ -19,6 +19,8 @@ class HypothesisSpec(BaseModel):
     expected_decay_halflife_bars: int
     symbols: list[str] = Field(default_factory=lambda: ["BTCUSDT", "ETHUSDT"])
     generated_by: str = "manual"
+    mechanism_taxonomy: str | None = None
+    required_data_families: list[str] | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 

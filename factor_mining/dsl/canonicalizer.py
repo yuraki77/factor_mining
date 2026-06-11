@@ -8,6 +8,8 @@ import math
 from copy import deepcopy
 from typing import Any
 
+from factor_mining.dsl.catalog import FREE_CONST_GRID, TRIVIAL_CONSTANTS
+
 _COMMUTATIVE_BINARY = frozenset({"+", "*"})
 _COMMUTATIVE_FUNCS = frozenset({"AND", "OR", "EQ"})
 _IDEMPOTENT_FUNCS = frozenset({"RANK", "ZSCORE"})
@@ -55,15 +57,21 @@ def _rewrite_binary(ast: dict[str, Any]) -> dict[str, Any]:
 
     if _is_const(left) and _is_const(right):
         folded = _fold_binary_const(op, left["value"], right["value"])
-        if folded is not None:
+        if folded is not None and _is_on_grid_or_trivial(folded["value"]):
             return folded
 
     if op == "+":
+        if _is_func(left, "NEG") and _is_func(right, "NEG"):
+            return _neg({"type": "binary_op", "op": "+", "left": left["args"][0], "right": right["args"][0]})
         if _is_const_value(left, 0.0):
             return right
         if _is_const_value(right, 0.0):
             return left
     if op == "*":
+        if _is_func(left, "NEG") and not _is_func(right, "NEG"):
+            return _neg({"type": "binary_op", "op": "*", "left": left["args"][0], "right": right})
+        if _is_func(right, "NEG") and not _is_func(left, "NEG"):
+            return _neg({"type": "binary_op", "op": "*", "left": left, "right": right["args"][0]})
         if _is_const_value(left, 1.0):
             return right
         if _is_const_value(right, 1.0):
@@ -85,6 +93,8 @@ def _rewrite_func(ast: dict[str, Any]) -> dict[str, Any]:
 
     if len(args) == 1:
         arg = args[0]
+        if name in ("RANK", "ZSCORE", "SCALE") and _is_func(arg, "NEG"):
+            return _neg({"type": "func_call", "name": name, "args": [arg["args"][0]]})
         if name == "NEG" and _is_func(arg, "NEG"):
             return arg["args"][0]
         if name == "NOT" and _is_func(arg, "NOT"):
@@ -101,6 +111,9 @@ def _rewrite_func(ast: dict[str, Any]) -> dict[str, Any]:
             folded = _fold_unary_const(name, arg["value"])
             if folded is not None:
                 return folded
+
+    if name in ("TS_MEAN", "DELAY", "DELTA", "TS_ZSCORE") and len(args) == 2 and _is_func(args[0], "NEG"):
+        return _neg({"type": "func_call", "name": name, "args": [args[0]["args"][0], args[1]]})
 
     if name == "NOT" and len(args) == 1:
         arg = args[0]
@@ -154,6 +167,13 @@ def _fold_unary_const(name: str, value: float) -> dict[str, Any] | None:
     if name == "SQRT" and value >= 0.0:
         return {"type": "constant", "value": math.sqrt(value)}
     return None
+
+
+def _is_on_grid_or_trivial(value: float) -> bool:
+    if value in TRIVIAL_CONSTANTS:
+        return True
+    abs_value = abs(value)
+    return any(abs(abs_value - g) <= max(abs(g) * 0.05, 1e-12) for g in FREE_CONST_GRID)
 
 
 def _neg(ast: dict[str, Any]) -> dict[str, Any]:

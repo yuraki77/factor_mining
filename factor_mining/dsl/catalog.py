@@ -11,6 +11,14 @@ FREE_CONST_GRID = (0.0, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0)
 TRIVIAL_CONSTANTS = frozenset({-1.0, 0.0, 1.0})
 MAX_FREE_CONSTANTS = 3
 
+# Optional leaves stay in the syntax catalog for portability, but runtime data
+# availability is still gated by the evaluator's market-data/features lookup.
+OPTIONAL_LEAVES = frozenset({
+    "$vwap",
+    "$funding_rate",
+    "$open_interest",
+})
+
 LEAVES = frozenset({
     "$open",
     "$high",
@@ -65,6 +73,9 @@ ALIASES = {
     "SMA": "TS_MEAN",
     "CORRELATION": "TS_CORR",
 }
+
+# TODO: Add macro expansion for EMA, RSI, ATR, BBAND, and VWAP_DEV once the DSL
+# supports multi-node aliases rather than simple operator renames.
 
 BINARY_OPERATOR_ALIASES = {
     ">": "GT",

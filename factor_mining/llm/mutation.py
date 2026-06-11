@@ -28,6 +28,7 @@ from factor_mining.dsl import (
     WINDOWS,
 )
 from factor_mining.dsl.complexity import categorical_comparison_count, free_constant_count
+from factor_mining.dsl.consistency import check_consistent
 from factor_mining.dsl.fingerprint_store import FingerprintStore
 from factor_mining.dsl.renderer import render
 from factor_mining.models import CandidateStrategySpec
@@ -61,6 +62,14 @@ def mutate_with_mechanism(
     try:
         ast = parse(dsl_expr)
     except Exception:
+        return None
+
+    ok, _reason = check_consistent(
+        ast,
+        _first_str(freeze_point.get("mechanism_taxonomy"), parent.params.get("mechanism_taxonomy")),
+        _first_list(freeze_point.get("required_data_families"), parent.params.get("required_data_families")),
+    )
+    if not ok:
         return None
 
     canon = canonicalize(ast)
@@ -120,6 +129,20 @@ def mutate_with_mechanism(
     child.dsl_canonical_expression = render(canon)
     fstore.register(fp, child.candidate_id)
     return child
+
+
+def _first_str(*values: Any) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _first_list(*values: Any) -> list[str] | None:
+    for value in values:
+        if isinstance(value, list):
+            return [str(item) for item in value]
+    return None
 
 
 # ── prompt building ────────────────────────────────────────────────

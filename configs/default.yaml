@@ -118,3 +118,7 @@ exit_bounds:
   max_tp_tiers: 4
   trailing_stop_pct_min: 0.005
   trailing_stop_pct_max: 0.10
+
+evolutionary:
+  enabled: true
+  llm_mutations: true

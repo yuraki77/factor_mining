@@ -588,6 +588,72 @@ def run_pipeline(
         _RUN_ID = previous_run_id
 
 
+def reproduce_candidate(
+    spec: CandidateStrategySpec,
+    settings: Settings,
+    *,
+    data_end_ms: int | None = None,
+) -> BacktestResult:
+    """Faithfully re-run a single archived candidate's final-OOS backtest.
+
+    Rebuilds the exact inputs the original mining run used — frame, features,
+    regimes, funding — for ``spec``'s symbol/market, optionally pinned to the
+    data extent present at archive time (``data_end_ms``), then reproduces the
+    final out-of-sample backtest whose ``metrics_primary`` was archived.
+
+    Reuses the pipeline's own preamble (``_load_data_contexts``), signal builder
+    (``_build_signal_for``) and final-OOS split (``_build_data_split_plan``), so
+    there is no second, drift-prone implementation of the signal/feature math.
+    The reproducible, validated quantities are ``metrics_primary`` (total return
+    / Sharpe / max drawdown). Trial-context stats (deflated Sharpe, PBO,
+    effective trials) depend on the full mining population and are NOT
+    reconstructed here — treat those fields on the result as placeholders.
+
+    Pin fidelity: with ``data_end_ms`` the frame is truncated *before* feature
+    and regime generation (forward-looking quantities can't be sliced after), so
+    the last-20% OOS window matches the original. Without it (e.g. a
+    pre-provenance archive) the current data extent is used and the
+    reproduction is only approximate.
+    """
+    from factor_mining.backtest.engine import run_backtest
+
+    contexts = _load_data_contexts([spec], settings, tail=None, data_end_ms=data_end_ms)
+    key = (spec.symbol, spec.market)
+    if key not in contexts:
+        raise FileNotFoundError(f"no local data for {spec.symbol}/{spec.market}")
+    ctx = contexts[key]
+
+    signal_arr = _build_signal_for(
+        spec,
+        ctx.frame,
+        ctx.features_df,
+        ctx.feature_meta,
+        0,
+        ctx.forward_regimes,
+        ctx.funding_rate,
+        build_context=None,
+    )
+
+    # Mirror the pipeline's final evaluation: backtest the last-20% OOS slice
+    # of the frame against the same slice of the signal (see _slice_tasks +
+    # _run_backtests_parallel(final_tasks, final_frame, ..., funding_df)).
+    split_plan = _build_data_split_plan(ctx.frame, regimes=ctx.forward_regimes)
+    mask_arr = split_plan.final_oos_mask.to_numpy()
+    final_frame = _masked_frame(ctx.frame, split_plan.final_oos_mask)
+    final_signal = pd.Series(
+        np.asarray(signal_arr, dtype=float)[mask_arr], index=final_frame.index
+    )
+
+    return run_backtest(
+        final_frame,
+        final_signal,
+        spec,
+        settings,
+        trial_counts={"effective_trials_count": 1, "global_cumulative_trials_count": 1},
+        funding=ctx.funding_df,
+    )
+
+
 def _resolve_round_controls(
     *,
     iterations: int,
@@ -1924,7 +1990,7 @@ def _run_mining_round(
                     )
                     children, rejected, warned = _filter_evolutionary_output_correlation(
                         children,
-                        candidate_by_id,
+                        {c.candidate_id: c for c in [*round_candidates, *new_candidates, *children]},
                         final_frame,
                         features_df,
                         feature_meta,
@@ -1959,7 +2025,7 @@ def _run_mining_round(
                 if child is not None:
                     accepted, rejected, warned = _filter_evolutionary_output_correlation(
                         [child],
-                        candidate_by_id,
+                        {c.candidate_id: c for c in [*round_candidates, *new_candidates, child]},
                         final_frame,
                         features_df,
                         feature_meta,
@@ -3503,6 +3569,7 @@ def _load_data_contexts(
     sample_bars: int | None = None,
     sample_mode: str = "block",
     seed: int = 42,
+    data_end_ms: int | None = None,
 ) -> dict[tuple[str, str], MarketDataContext]:
     if tail is not None and sample_bars is not None:
         raise ValueError("--tail and --sample-bars are mutually exclusive")
@@ -3517,6 +3584,7 @@ def _load_data_contexts(
                 symbol=symbol,
                 market=market,
                 tail=None if sample_bars is not None else tail,
+                end_ms=data_end_ms,
             )
         except FileNotFoundError as exc:
             _log(f"Skip {symbol}/{market}: {exc}")
@@ -4495,7 +4563,7 @@ def _filter_evolutionary_output_correlation(
     forward_regimes: pd.Series,
     funding_rate: pd.Series | None,
     settings: Settings,
-) -> tuple[list[CandidateStrategySpec], int]:
+) -> tuple[list[CandidateStrategySpec], int, int]:
     """Reject evolutionary children that are effectively parent duplicates."""
     if not candidates:
         return [], 0, 0
@@ -4580,6 +4648,8 @@ def _evolutionary_parent_ids(candidate: CandidateStrategySpec) -> list[str]:
 
 def _is_empty_signal(signal: np.ndarray) -> bool:
     values = np.asarray(signal, dtype=float)
+    if values.ndim != 1:
+        return True
     finite = values[np.isfinite(values)]
     return (
         finite.size == 0
@@ -4591,6 +4661,12 @@ def _is_empty_signal(signal: np.ndarray) -> bool:
 def _absolute_signal_correlation(left: np.ndarray, right: np.ndarray) -> float | None:
     lval = np.asarray(left, dtype=float)
     rval = np.asarray(right, dtype=float)
+    if lval.ndim != 1 or rval.ndim != 1:
+        return None
+    n = min(len(lval), len(rval))
+    if n < 3:
+        return None
+    lval, rval = lval[-n:], rval[-n:]
     mask = np.isfinite(lval) & np.isfinite(rval)
     if int(mask.sum()) < 3:
         return None
@@ -4708,15 +4784,20 @@ def _fit_regime_model(
     fit_rows = min(max(100, n_rows // 3), max_fit_rows)
     fit_frame = frame.iloc[:fit_rows]
     log_fn(f"  HMM fitting on {len(fit_frame):,} bars...")
-    detector.fit(fit_frame)
-    fit_states = detector.predict(fit_frame)
-    labels = detector.label_states(fit_states, fit_frame)
-    log_fn(f"  HMM states: {labels}")
+    try:
+        detector.fit(fit_frame)
+        fit_states = detector.predict(fit_frame)
+        labels = detector.label_states(fit_states, fit_frame)
+        log_fn(f"  HMM states: {labels}")
 
-    # Forward regime is computed with a detector trained only on the prefix.
-    # The prefix itself is unavailable for OOS decisions, and the final signal is
-    # lagged one bar before downstream signal modulation.
-    regimes = detector.rolling_forward_regime(frame, horizon=12)
+        # Forward regime is computed with a detector trained only on the prefix.
+        # The prefix itself is unavailable for OOS decisions, and the final signal is
+        # lagged one bar before downstream signal modulation.
+        regimes = detector.rolling_forward_regime(frame, horizon=12)
+    except Exception as exc:
+        log_fn(f"  HMM unavailable; using unknown regimes: {exc}")
+        return pd.Series("unknown", index=frame.index)
+
     regimes.iloc[:fit_rows] = "unknown"
     return regimes.shift(1).fillna("unknown")
 

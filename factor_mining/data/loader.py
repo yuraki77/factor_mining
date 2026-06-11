@@ -89,6 +89,7 @@ def load_frame(
     *,
     market: str | None = None,
     tail: int | None = None,
+    end_ms: int | None = None,
 ) -> pd.DataFrame:
     """Load standardized kline DataFrame from parquet.
 
@@ -127,6 +128,12 @@ def load_frame(
     start_ms = _date_start_ms(settings.data.start_date)
     if start_ms is not None:
         frame = frame[pd.to_numeric(frame["open_time"], errors="coerce") >= start_ms].reset_index(drop=True)
+
+    # Pin the data extent to a reproduce snapshot: truncate to bars at or
+    # before `end_ms` so a faithful re-run sees the same history (and hence
+    # the same last-20% OOS window) the original mining run did.
+    if end_ms is not None:
+        frame = frame[pd.to_numeric(frame["open_time"], errors="coerce") <= int(end_ms)].reset_index(drop=True)
 
     if tail is not None:
         frame = frame.iloc[-tail:].reset_index(drop=True)

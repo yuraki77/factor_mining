@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from typing import Any
 
 from factor_mining.storage import MetadataStore
+
+logger = logging.getLogger(__name__)
 
 
 class FingerprintStore:
@@ -37,13 +40,10 @@ class FingerprintStore:
     ) -> bool:
         """Return True when *fingerprint* has not already appeared.
 
-        Parent fingerprints are exempt from archive/survivor checks so a direct
-        child can intentionally preserve its parent's signal. Batch duplicates
-        are still rejected after the first child is registered.
+        Parent fingerprints are registered for caller diagnostics, but archive,
+        survivor, and batch duplicates are rejected uniformly.
         """
-        parents = set(self._parent_bank)
-        if parent_bank_fingerprints:
-            parents |= parent_bank_fingerprints
+        del parent_bank_fingerprints
 
         archive = set(archive_fingerprints) if archive_fingerprints is not None else self.load_archive_fingerprints()
         survivor = set(survivor_fingerprints) if survivor_fingerprints is not None else self.load_survivor_fingerprints()
@@ -51,9 +51,9 @@ class FingerprintStore:
 
         if fingerprint in batch:
             return False
-        if fingerprint in archive - parents:
+        if fingerprint in archive:
             return False
-        if fingerprint in survivor - parents:
+        if fingerprint in survivor:
             return False
         return True
 
@@ -77,7 +77,7 @@ class FingerprintStore:
                         if fp:
                             fingerprints.add(fp)
         except Exception:
-            pass
+            logger.warning("failed to load archived DSL fingerprints", exc_info=True)
         self._archive_cache = fingerprints
         return fingerprints
 
@@ -96,7 +96,7 @@ class FingerprintStore:
                     if fp:
                         fingerprints.add(fp)
         except Exception:
-            pass
+            logger.warning("failed to load survivor DSL fingerprints", exc_info=True)
         self._survivor_cache = fingerprints
         return fingerprints
 

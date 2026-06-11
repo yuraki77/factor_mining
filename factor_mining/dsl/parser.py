@@ -31,25 +31,34 @@ _TOKEN_RE = re.compile(
 )
 
 
-def parse(source: str) -> dict[str, Any]:
+_ALLOW_CROSS_SECTIONAL = False
+
+
+def parse(source: str, *, allow_cross_sectional: bool = False) -> dict[str, Any]:
     """Parse a DSL expression into a validated AST.
 
     The phase-2 parser intentionally accepts only whitelisted ``$`` leaves,
     catalog operators, discrete window constants, and snapped free constants.
     """
-    tokens = _tokenize(source)
-    if not tokens:
-        raise ValueError("empty expression")
-    ast, pos = _parse_expression(tokens, 0)
-    if pos < len(tokens):
-        _fail(tokens, pos, "unexpected trailing tokens")
-    ast = _normalize_comparison_funcs(ast)
-    _validate_tree(ast)
-    ast = _snap_constants(ast)
-    free_constants = _count_free_constants(ast)
-    if free_constants > MAX_FREE_CONSTANTS:
-        raise ValueError(f"too many free constants: {free_constants} > {MAX_FREE_CONSTANTS}")
-    return ast
+    global _ALLOW_CROSS_SECTIONAL
+    previous_allow_cross_sectional = _ALLOW_CROSS_SECTIONAL
+    _ALLOW_CROSS_SECTIONAL = allow_cross_sectional
+    try:
+        tokens = _tokenize(source)
+        if not tokens:
+            raise ValueError("empty expression")
+        ast, pos = _parse_expression(tokens, 0)
+        if pos < len(tokens):
+            _fail(tokens, pos, "unexpected trailing tokens")
+        ast = _normalize_comparison_funcs(ast)
+        _validate_tree(ast)
+        ast = _snap_constants(ast)
+        free_constants = _count_free_constants(ast)
+        if free_constants > MAX_FREE_CONSTANTS:
+            raise ValueError(f"too many free constants: {free_constants} > {MAX_FREE_CONSTANTS}")
+        return ast
+    finally:
+        _ALLOW_CROSS_SECTIONAL = previous_allow_cross_sectional
 
 
 def _tokenize(source: str) -> list[dict[str, Any]]:
@@ -168,6 +177,8 @@ def _parse_func_call(tokens: list[dict[str, Any]], pos: int, raw_name: str) -> t
     name = ALIASES.get(raw_name.upper(), raw_name.upper())
     if name not in OPERATORS:
         _fail(tokens, pos, f"unknown operator {raw_name!r}")
+    if OPERATORS[name].cross_sectional and not _ALLOW_CROSS_SECTIONAL:
+        _fail(tokens, pos, f"cross-sectional operator {name!r} is not available in single-symbol mode")
     pos += 1
     pos = _expect(tokens, pos, "op", "(")
     args: list[dict[str, Any]] = []

@@ -33,7 +33,7 @@ def build_success_contract_report(
     - ``mean_sharpe_by_operator``
     - ``gatecheck_pass_rate``
     - ``research_survivor_rate``
-    - ``operator_effectiveness`` — composite (production_rate + 2 * survivor_rate) / 3
+    - ``operator_effectiveness`` — composite (2 * production_rate + survivor_rate) / 3
     - ``lineage_depth_stats`` — min / max / mean of parent chain depth
     """
     records = store.list_trajectories(limit=2000)
@@ -90,8 +90,9 @@ def build_success_contract_report(
         mean_sharpe_by_operator[op] = (
             sharpe_sums.get(op, 0.0) / sharpe_counts[op] if sharpe_counts.get(op, 0) > 0 else None
         )
+        # TODO: Replace this read-only aggregate with an explicit A/B success contract.
         effectiveness_by_operator[op] = (
-            production_rate_by_operator[op] + 2.0 * research_survivor_rate_by_operator[op]
+            2.0 * production_rate_by_operator[op] + research_survivor_rate_by_operator[op]
         ) / 3.0
 
     depth_sorted = sorted(depth_values)

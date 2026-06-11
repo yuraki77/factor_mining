@@ -160,7 +160,10 @@ def _ts_rank(x: np.ndarray, n_arg: np.ndarray) -> np.ndarray:
         window = x[idx - n + 1 : idx + 1]
         if np.isfinite(window).all():
             ordered = np.sort(window)
-            result[idx] = np.searchsorted(ordered, window[-1], side="right") / n
+            if n == 1:
+                result[idx] = 0.0
+            else:
+                result[idx] = (np.searchsorted(ordered, window[-1], side="right") - 1) / (n - 1)
     return result
 
 

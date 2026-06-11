@@ -80,6 +80,10 @@ class TrajectoryLedger:
         if ctype == "optimizer":
             if kind == "crossover" or generated_by == "crossover_dsl_composite":
                 return "CROSSOVER", "DSL_COMPOSITE"
+            if kind == "mutation_at_mechanism":
+                return "MUTATION_AT_MECHANISM", "LLM_MECHANISM_MUTATION"
+            if kind == "mutation_at_hypothesis":
+                return "MUTATION_AT_HYPOTHESIS", "LLM_HYPOTHESIS_MUTATION"
             if kind == "hill_climb":
                 return "MUTATION_AT_DSL", "OPTIMIZER_HILL_CLIMB"
             if kind in ("evolution", "turnover_control"):
