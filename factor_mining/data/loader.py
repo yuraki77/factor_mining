@@ -5,6 +5,7 @@ from __future__ import annotations
 import glob
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -305,6 +306,41 @@ def load_supplemental_features(
     return pd.DataFrame(features, index=frame.index), meta
 
 
+def data_extent(settings: Settings, *, symbol: str, market: str | None = None) -> dict[str, Any]:
+    """Data manifest for an archive bundle: the bar extent of *symbol*'s parquet at
+    archive time, so a later reproduce can pin to the data that was available.
+
+    Reads only the ``open_time`` column. Returns ``{}`` (never raises) when no data
+    is found, so a missing/corrupt parquet degrades the manifest without aborting
+    the archive write.
+    """
+    try:
+        paths = resolve_frame_paths(settings, symbol=symbol, market=market or None)
+        start_ms: int | None = None
+        end_ms = 0
+        rows = 0
+        for path in paths:
+            column = pd.read_parquet(path, columns=["open_time"])["open_time"]
+            numeric = pd.to_numeric(column, errors="coerce").dropna()
+            if len(numeric):
+                rows += int(len(numeric))
+                end_ms = max(end_ms, int(numeric.max()))
+                low = int(numeric.min())
+                start_ms = low if start_ms is None else min(start_ms, low)
+        if not rows:
+            return {}
+        return {
+            "symbol": symbol,
+            "market": market or "",
+            "interval": settings.data.default_interval,
+            "data_start_ms": start_ms or 0,
+            "data_end_ms": end_ms,
+            "rows": rows,
+        }
+    except Exception:  # noqa: BLE001 - a missing/corrupt parquet must not abort archiving
+        return {}
+
+
 def merge_funding_to_frame(frame: pd.DataFrame, funding: pd.DataFrame | None) -> pd.Series:
     """Merge 8h funding rate into 5m frame via forward fill.
 
@@ -317,10 +353,11 @@ def merge_funding_to_frame(frame: pd.DataFrame, funding: pd.DataFrame | None) ->
         funding["last_funding_rate"].to_numpy(dtype=float),
         index=funding["calc_time"].to_numpy(dtype="int64"),
     )
-    # Reindex to frame's open_time with forward fill
-    aligned = fr.reindex(frame["open_time"].to_numpy(dtype="int64"), method="ffill")
-    # Backfill initial NaNs
-    aligned = aligned.bfill().fillna(0.0)
+    # Reindex to frame's open_time with forward fill only. Bars before the first
+    # funding event stay 0.0 — the previous .bfill() leaked the first *future*
+    # funding rate backwards into the warm-up window (lookahead bias). This now
+    # matches funding_event_zscore_to_frame, which is 0 before the first event.
+    aligned = fr.reindex(frame["open_time"].to_numpy(dtype="int64"), method="ffill").fillna(0.0)
     aligned.index = frame.index
     return aligned
 

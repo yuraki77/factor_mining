@@ -288,8 +288,8 @@ def run_cross_sectional_backtest(
     else:
         ci = (0.0, 0.0)
 
-    psr = probabilistic_sharpe_ratio(net_series, observed_sr=sharpe)
-    dsr = deflated_sharpe_ratio(net_series, observed_sr=sharpe, trials_count=trials_count)
+    psr = probabilistic_sharpe_ratio(net_series, observed_sr=sharpe, periods_per_year=periods)
+    dsr = deflated_sharpe_ratio(net_series, observed_sr=sharpe, trials_count=trials_count, periods_per_year=periods)
     one_sided_p = cross_sectional_t_pvalue(net_series.to_numpy(dtype=float))
 
     return CrossSectionalBacktestResult(

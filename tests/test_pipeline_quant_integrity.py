@@ -1809,7 +1809,12 @@ def test_data_split_plan_keeps_final_oos_out_of_repair_window() -> None:
     assert plan.final_oos_start_idx == 80
 
 
-def test_data_split_plan_prefers_regime_covered_contiguous_oos_window() -> None:
+def test_data_split_plan_final_oos_is_chronological_even_with_alien_regime_tail() -> None:
+    """Q7: the final OOS is the chronological last segment even when its regime mix
+    is 'alien' to discovery (here an all-high_vol tail). The previous regime-aware
+    chooser shifted the window earlier to match discovery's regimes — but selecting
+    the test window from full-series regime labels is lookahead. Honest OOS = the
+    genuine future tail, high_vol and all."""
     frame = _frame(100)
     regimes = pd.Series(
         ["bull", "bear"] * 30
@@ -1820,12 +1825,13 @@ def test_data_split_plan_prefers_regime_covered_contiguous_oos_window() -> None:
 
     plan = _build_data_split_plan(frame, regimes=regimes)
 
-    assert plan.final_oos_start_idx < 80
+    assert plan.final_oos_start_idx == 80  # chronological last 20%, never shifted
     assert plan.final_oos_mask.sum() == 20
     assert plan.repair_validation_mask.sum() == 20
     assert not bool((plan.repair_mask & plan.final_oos_mask).any())
+    # The genuine future tail is entirely high_vol — the split does not dodge it.
     final_regimes = set(regimes.loc[plan.final_oos_mask].unique())
-    assert final_regimes == {"bull", "bear"}
+    assert final_regimes == {"high_vol"}
 
 
 def test_repair_merge_pool_prunes_high_pbo_and_redundant_repairs() -> None:

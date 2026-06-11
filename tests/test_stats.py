@@ -1,10 +1,14 @@
+import math
+
 import numpy as np
 
 from factor_mining.stats.metrics import (
     benjamini_hochberg,
     deflated_sharpe_ratio,
+    haircut_sharpe,
     newey_west_tstat,
     permutation_test_mean_ic,
+    probabilistic_sharpe_ratio,
     return_autocorrelation_lag1,
 )
 
@@ -26,9 +30,94 @@ def test_noise_factor_fails_permutation_more_often_than_true_signal() -> None:
 
 def test_deflated_sharpe_gets_tighter_as_trials_grow() -> None:
     returns = np.repeat(0.001, 500) + np.random.default_rng(1).normal(scale=0.01, size=500)
-    low_trials = deflated_sharpe_ratio(returns, observed_sr=1.5, trials_count=10)
-    high_trials = deflated_sharpe_ratio(returns, observed_sr=1.5, trials_count=100_000)
+    low_trials = deflated_sharpe_ratio(returns, observed_sr=1.5, trials_count=10, periods_per_year=365)
+    high_trials = deflated_sharpe_ratio(returns, observed_sr=1.5, trials_count=100_000, periods_per_year=365)
     assert high_trials < low_trials
     assert newey_west_tstat(returns) != 0
     assert abs(return_autocorrelation_lag1(returns)) < 0.5
+
+
+def test_deflated_sharpe_penalty_is_annualized_to_match_sharpe_units() -> None:
+    """Q1 regression: the multiple-testing penalty is a per-period Sharpe quantity
+    and must be annualized to match the annualized ``observed_sr`` it is subtracted
+    from. The prior code subtracted the raw per-period penalty from an annualized
+    Sharpe, so intraday candidates were barely deflated. WHY it matters: two
+    strategies with the same annualized Sharpe over the same number of bars do NOT
+    deserve the same haircut — the intraday one packs the bars into far less
+    calendar time, so its expected-max-over-N-trials penalty is larger."""
+    n = 2000
+    returns = np.zeros(n)  # only the length feeds the penalty term
+    observed_sr, trials = 3.0, 100
+    per_period_penalty = math.sqrt(2.0 * math.log(trials) / n)
+    daily = deflated_sharpe_ratio(returns, observed_sr=observed_sr, trials_count=trials, periods_per_year=365)
+    intraday = deflated_sharpe_ratio(returns, observed_sr=observed_sr, trials_count=trials, periods_per_year=105_120)
+    # Closed form: observed_sr - per_period_penalty * sqrt(periods_per_year).
+    assert math.isclose(daily, observed_sr - per_period_penalty * math.sqrt(365), rel_tol=1e-9)
+    assert math.isclose(intraday, observed_sr - per_period_penalty * math.sqrt(105_120), rel_tol=1e-9)
+    # The intraday haircut is materially larger than the daily one ...
+    assert intraday < daily
+    # ... and far larger than the old per-period-penalty bug, which never annualized.
+    assert intraday < observed_sr - per_period_penalty
+
+
+def test_haircut_sharpe_penalty_is_annualized_to_match_sharpe_units() -> None:
+    """Same SR-unit fix as the deflated Sharpe, applied to the reported haircut:
+    callers pass the *annualized* Sharpe as ``observed_sr`` but the multiple-testing
+    penalty ``sqrt(2 ln N / n)`` is a per-period Sharpe quantity, so it must be
+    annualized to match. WHY it matters: two strategies with the same annualized
+    Sharpe over the same number of bars do NOT deserve the same haircut — the
+    intraday one packs the bars into far less calendar time, so its
+    expected-max-over-N-trials penalty is larger. The prior code subtracted the raw
+    per-period penalty from an annualized Sharpe, leaving the reported haircut
+    barely below the headline Sharpe for intraday candidates."""
+    observations = 2000
+    observed_sr, trials = 3.0, 100
+    per_period_penalty = math.sqrt(2.0 * math.log(trials) / observations)
+    daily = haircut_sharpe(observed_sr, trials_count=trials, observations=observations, periods_per_year=365)
+    intraday = haircut_sharpe(observed_sr, trials_count=trials, observations=observations, periods_per_year=105_120)
+    # Closed form: observed_sr - per_period_penalty * sqrt(periods_per_year).
+    assert math.isclose(daily, observed_sr - per_period_penalty * math.sqrt(365), rel_tol=1e-9)
+    assert math.isclose(intraday, observed_sr - per_period_penalty * math.sqrt(105_120), rel_tol=1e-9)
+    # The intraday haircut is materially larger than the daily one ...
+    assert intraday < daily
+    # ... and far larger than the old per-period-penalty bug, which never annualized.
+    assert intraday < observed_sr - per_period_penalty
+
+
+def test_annualized_return_is_geometric_not_arithmetic() -> None:
+    """Q12: annualized return must annualize realized *compound* growth, not the
+    arithmetic per-period mean. WHY: compounding the arithmetic mean overstates the
+    figure for any volatile series (arithmetic mean ≥ geometric mean), inflating
+    Calmar and any return-based gate."""
+    import pandas as pd
+
+    from factor_mining.backtest.engine import _metrics_from_returns
+
+    returns = pd.Series([0.10, -0.05] * 50)  # 100 obs, volatile
+    metrics = _metrics_from_returns(returns, interval="1d", trade_count=0, pnl=0.0)
+    n = len(returns)
+    periods = 365  # annualization_factor("1d")
+    final_equity = (1.10 * 0.95) ** (n // 2)
+    expected_geometric = final_equity ** (periods / n) - 1.0
+    assert math.isclose(metrics.annualized_return, expected_geometric, rel_tol=1e-9)
+    arithmetic = (1.0 + returns.mean()) ** periods - 1.0
+    assert metrics.annualized_return < arithmetic  # geometric strictly lower here
+
+
+def test_probabilistic_sharpe_is_invariant_to_annualization() -> None:
+    """Q2 regression: PSR is a function of the per-period return distribution, so the
+    SAME returns must yield the SAME PSR whether ``observed_sr`` arrives in per-period
+    units (periods_per_year=1) or annualized units. Passing the annualized Sharpe
+    straight into the formula (the prior bug) inflated the skew/kurtosis denominator
+    until it clamped at 1e-12 and the estimate degenerated."""
+    rng = np.random.default_rng(11)
+    returns = 0.0001 + rng.normal(scale=0.01, size=4000)
+    sr_pp = returns.mean() / returns.std(ddof=1)  # per-period Sharpe
+    periods = 105_120  # 5m bars/year
+    sr_annualized = sr_pp * math.sqrt(periods)  # what the engine reports as .sharpe
+    psr_from_annualized = probabilistic_sharpe_ratio(returns, observed_sr=sr_annualized, periods_per_year=periods)
+    psr_from_per_period = probabilistic_sharpe_ratio(returns, observed_sr=sr_pp, periods_per_year=1)
+    assert math.isclose(psr_from_annualized, psr_from_per_period, rel_tol=1e-9, abs_tol=1e-12)
+    # A sane probability, not a degenerate 0/1 from a collapsed denominator.
+    assert 0.0 < psr_from_annualized < 1.0
 

@@ -7,7 +7,13 @@ from pathlib import Path
 from typing import Any
 
 from factor_mining.config import Settings
-from factor_mining.models import ArchiveManifest, BacktestResult, GateCheckResult, HardScoreReport
+from factor_mining.models import (
+    ArchiveManifest,
+    BacktestResult,
+    CandidateStrategySpec,
+    GateCheckResult,
+    HardScoreReport,
+)
 
 
 def stable_hash(payload: Any) -> str:
@@ -28,6 +34,7 @@ def archive_experiment(
     gatecheck: GateCheckResult,
     hardscore: HardScoreReport,
     settings: Settings,
+    candidate: CandidateStrategySpec | None = None,
     data_manifest: dict[str, Any] | None = None,
     root: Path = Path("archives"),
 ) -> ArchiveManifest:
@@ -41,6 +48,11 @@ def archive_experiment(
     _write_json(archive_dir / "gatecheck.json", gate_payload)
     _write_json(archive_dir / "hardscore.json", score_payload)
     _write_json(archive_dir / "config.json", config_payload)
+    if candidate is not None:
+        # The full candidate spec (params, lookback, type, …) so a later reproduce
+        # can reconstruct the exact CandidateStrategySpec — BacktestResult omits
+        # params and is insufficient to re-run the candidate on its own.
+        _write_json(archive_dir / "candidate.json", candidate.model_dump(mode="json"))
     manifest = ArchiveManifest(
         experiment_id=result.experiment_id,
         git_sha=current_git_sha(),
@@ -52,7 +64,7 @@ def archive_experiment(
     return manifest
 
 
-def reproduce_archive(experiment_id: str, *, root: Path = Path("archives")) -> dict[str, Any]:
+def verify_archive(experiment_id: str, *, root: Path = Path("archives")) -> dict[str, Any]:
     archive_dir = root / experiment_id
     manifest_path = archive_dir / "manifest.json"
     result_path = archive_dir / "backtest_result.json"

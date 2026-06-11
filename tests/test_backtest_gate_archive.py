@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from factor_mining.archive import archive_experiment, reproduce_archive
+from factor_mining.archive import archive_experiment, verify_archive
 from factor_mining.backtest.engine import _apply_exit_rules, evaluate_strategy_path, run_backtest, walk_forward_oos_mask
 from factor_mining.config import BootstrapConfig, DataConfig, GateCheckConfig, PermutationTestConfig, PositionSizingConfig, Settings, WalkForwardConfig
 from factor_mining.models import BacktestResult, CandidateStrategySpec, DataQualityNote, FactorEvidenceReport, GateCheckResult, MetricsBlock
@@ -438,4 +438,53 @@ def test_archive_reproduce_validates_hash(tmp_path) -> None:
     gate = run_gatecheck(filled, Settings(), method=get_method("rule_mining"), fdr_adjusted_pvalue=0.01)
     score = hardscore(filled, gate, fdr_adjusted_pvalue=0.01, settings=Settings())
     archive_experiment(result=filled, gatecheck=gate, hardscore=score, settings=Settings(), root=tmp_path / "archives")
-    assert reproduce_archive("exp-archive", root=tmp_path / "archives")["status"] == "valid"
+    assert verify_archive("exp-archive", root=tmp_path / "archives")["status"] == "valid"
+
+
+def test_archive_bundle_writes_candidate_and_data_manifest(tmp_path) -> None:
+    """I2: the archive bundle must carry the full candidate spec (candidate.json)
+    and a real data manifest, so a later reproduce can reconstruct the exact
+    CandidateStrategySpec and pin the data extent — BacktestResult omits params."""
+    import json
+
+    from factor_mining.models import CandidateStrategySpec
+
+    result = BacktestResult(
+        experiment_id="exp-bundle",
+        candidate_id="c1",
+        hypothesis_family="momentum",
+        method_id="rule_mining",
+        symbol="BTCUSDT",
+        market="um_futures",
+        interval="5m",
+        metrics_primary=MetricsBlock(sharpe=2.0, trade_count=200, pnl=100.0),
+    )
+    gate = GateCheckResult(experiment_id=result.experiment_id, passed=True, items=[], allocation_multiplier=1.0)
+    score = hardscore(result, gate, fdr_adjusted_pvalue=0.01, settings=Settings())
+    candidate = CandidateStrategySpec(
+        candidate_id="c1",
+        hypothesis_id="h1",
+        method_id="rule_mining",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+        market="um_futures",
+        interval="5m",
+        params={"signal_source": "factor_signal", "factor_family": "momentum", "factor_lookback": 24},
+    )
+    data_manifest = {"symbol": "BTCUSDT", "market": "um_futures", "data_end_ms": 1_777_593_300_000, "rows": 1000}
+    root = tmp_path / "archives"
+    archive_experiment(
+        result=result,
+        gatecheck=gate,
+        hardscore=score,
+        settings=Settings(),
+        candidate=candidate,
+        data_manifest=data_manifest,
+        root=root,
+    )
+    bundle = root / "exp-bundle"
+    saved_candidate = json.loads((bundle / "candidate.json").read_text())
+    assert saved_candidate["candidate_id"] == "c1"
+    assert saved_candidate["params"]["factor_family"] == "momentum"  # params survive the round-trip
+    manifest = json.loads((bundle / "manifest.json").read_text())
+    assert manifest["data_manifest"]["data_end_ms"] == 1_777_593_300_000  # real extent, not {}

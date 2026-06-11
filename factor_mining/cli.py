@@ -6,7 +6,7 @@ import uuid
 
 import typer
 
-from factor_mining.archive import reproduce_archive
+from factor_mining.archive import verify_archive
 from factor_mining.config import Settings, apply_trade_overrides, load_settings
 from factor_mining.data.binance import BinanceArchiveClient
 from factor_mining.data.universe import resolve_universe
@@ -334,9 +334,11 @@ def hardscore_run() -> None:
         typer.echo(f"Top score: {top[0].score:.1f}")
 
 
-@exp_app.command("reproduce")
-def exp_reproduce(experiment_id: str, root: Path = Path("archives")) -> None:
-    result = reproduce_archive(experiment_id, root=root)
+@exp_app.command("verify")
+def exp_verify(experiment_id: str, root: Path = Path("archives")) -> None:
+    # "verify" (not "reproduce"): this only re-checks the archived result hash.
+    # Actually re-running a candidate is pipeline.reproduce_candidate.
+    result = verify_archive(experiment_id, root=root)
     typer.echo(result)
 
 

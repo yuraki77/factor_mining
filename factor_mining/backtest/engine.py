@@ -53,7 +53,17 @@ def _metrics_from_returns(returns: pd.Series, *, interval: str, trade_count: int
     periods = annualization_factor(interval)
     equity = (1.0 + returns).cumprod()
     total_return = float(equity.iloc[-1] - 1.0) if not equity.empty else 0.0
-    ann_return = float((1.0 + returns.mean()) ** periods - 1.0) if not returns.empty else 0.0
+    # Geometric annualized return: annualize the realized compound growth, not
+    # the arithmetic per-period mean. Compounding the mean — (1 + mean) ** periods
+    # — overstates the annualized figure (arithmetic mean ≥ geometric mean) and
+    # diverges further the more volatile the series.
+    n_obs = len(returns)
+    if n_obs > 0 and equity.iloc[-1] > 0.0:
+        ann_return = float(equity.iloc[-1] ** (periods / n_obs) - 1.0)
+    elif n_obs > 0:
+        ann_return = -1.0  # equity wiped out → annualized total loss
+    else:
+        ann_return = 0.0
     ann_vol = float(returns.std(ddof=1) * np.sqrt(periods)) if len(returns) > 1 else 0.0
     sharpe = sharpe_ratio(returns, periods_per_year=periods)
     mdd = max_drawdown(equity)
@@ -494,8 +504,9 @@ def run_backtest(
             "global_cumulative_trials_count": 1,
         }
     observed_sr = metrics_primary.sharpe
-    dsr = deflated_sharpe_ratio(primary_returns, observed_sr=observed_sr, trials_count=counts["effective_trials_count"])
-    _ = haircut_sharpe(observed_sr, trials_count=counts["effective_trials_count"], observations=max(len(primary_returns), 1))
+    periods_per_year = annualization_factor(candidate.interval)
+    dsr = deflated_sharpe_ratio(primary_returns, observed_sr=observed_sr, trials_count=counts["effective_trials_count"], periods_per_year=periods_per_year)
+    _ = haircut_sharpe(observed_sr, trials_count=counts["effective_trials_count"], observations=max(len(primary_returns), 1), periods_per_year=periods_per_year)
     regimes = label_btc_regime(btc_regime_frame if btc_regime_frame is not None else frame, settings.regime)
     if len(regimes) == len(frame):
         regimes = pd.Series(regimes.to_numpy(), index=frame.index).astype(str)
@@ -546,7 +557,7 @@ def run_backtest(
         ic_tstat_nw=newey_west_tstat(ic_series.dropna()),
         rankic_tstat_nw=newey_west_tstat(rankic_series.dropna()),
         sharpe_ci_5_95=ci,
-        probabilistic_sharpe=probabilistic_sharpe_ratio(primary_returns, observed_sr=observed_sr),
+        probabilistic_sharpe=probabilistic_sharpe_ratio(primary_returns, observed_sr=observed_sr, periods_per_year=periods_per_year),
         deflated_sharpe=dsr,
         effective_trials_at_eval=counts["effective_trials_count"],
         global_trials_at_eval=counts["global_cumulative_trials_count"],

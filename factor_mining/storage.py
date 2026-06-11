@@ -11,6 +11,19 @@ from typing import Any
 from factor_mining.models import ResearchSurvivorRecord, TrajectoryRecord, TrialRecord, UTC
 
 
+def _canonical_family(hypothesis_family: str) -> str:
+    """Canonical signal-construction family used to partition the trial ledger.
+
+    Family variants ("mean reversion" vs "mean_reversion", repairs, etc.) must
+    share one multiplicity count (I7) — otherwise each spelling looks like a
+    fresh, unpenalized family and the deflated-Sharpe trial penalty is understated.
+    Lazy import keeps storage free of an import cycle through mining.
+    """
+    from factor_mining.mining import normalize_family
+
+    return normalize_family(hypothesis_family) or hypothesis_family
+
+
 class MetadataStore:
     def __init__(self, sqlite_path: Path) -> None:
         self.sqlite_path = sqlite_path
@@ -18,8 +31,19 @@ class MetadataStore:
         self._init_db()
 
     def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.sqlite_path)
+        # ``timeout`` becomes SQLite's busy_timeout: a writer waits for the lock
+        # to clear instead of immediately raising "database is locked". This DB
+        # is shared cross-process (the mining daemon writes while the gRPC
+        # server / UI read), so contention is expected, not exceptional.
+        conn = sqlite3.connect(self.sqlite_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
+        # WAL lets readers run concurrently with the single writer instead of
+        # blocking each other; NORMAL is the WAL-safe durability setting; the
+        # explicit busy_timeout guards against the C-level ``timeout`` being
+        # bypassed. PRAGMAs run outside any transaction here (fresh connection).
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
     def _init_db(self) -> None:
@@ -116,7 +140,7 @@ class MetadataStore:
                         record.trial_id,
                         record.candidate_id,
                         record.experiment_id,
-                        record.hypothesis_family,
+                        _canonical_family(record.hypothesis_family),
                         record.method_id,
                         record.evaluated_at.astimezone(UTC).isoformat(),
                     ),
@@ -128,7 +152,7 @@ class MetadataStore:
         with closing(self.connect()) as conn:
             family_count = conn.execute(
                 "select count(*) from trials where hypothesis_family = ?",
-                (hypothesis_family,),
+                (_canonical_family(hypothesis_family),),
             ).fetchone()[0]
             rolling_count = conn.execute(
                 "select count(*) from trials where evaluated_at >= ?",
@@ -270,20 +294,24 @@ class MetadataStore:
     ) -> None:
         with closing(self.connect()) as conn:
             with conn:
-                seq = conn.execute(
-                    "select coalesce(max(seq), 0) + 1 from pipeline_events where run_id = ?",
-                    (run_id,),
-                ).fetchone()[0]
+                # Compute seq inside the INSERT so the max(seq) read and the write
+                # are one atomic statement under SQLite's single-writer lock. The
+                # prior read-then-insert let two concurrent writers observe the
+                # same max(seq) and emit duplicate sequence numbers for a run.
                 conn.execute(
                     """
                     insert into pipeline_events
                         (event_id, run_id, seq, phase, level, message, payload_json, created_at)
-                    values (?, ?, ?, ?, ?, ?, ?, ?)
+                    values (
+                        ?, ?,
+                        (select coalesce(max(seq), 0) + 1 from pipeline_events where run_id = ?),
+                        ?, ?, ?, ?, ?
+                    )
                     """,
                     (
                         str(uuid.uuid4()),
                         run_id,
-                        int(seq),
+                        run_id,
                         phase,
                         level,
                         message,

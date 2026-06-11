@@ -379,7 +379,15 @@ def _metrics_from_returns(returns: pd.Series, *, interval: str, trade_count: int
     periods = annualization_factor(interval)
     equity = (1.0 + returns).cumprod()
     total_return = float(equity.iloc[-1] - 1.0) if not equity.empty else 0.0
-    ann_return = float((1.0 + returns.mean()) ** periods - 1.0) if not returns.empty else 0.0
+    # Geometric annualized return — annualize realized compound growth, not the
+    # arithmetic per-period mean (which overstates; see engine._metrics_from_returns).
+    n_obs = len(returns)
+    if n_obs > 0 and equity.iloc[-1] > 0.0:
+        ann_return = float(equity.iloc[-1] ** (periods / n_obs) - 1.0)
+    elif n_obs > 0:
+        ann_return = -1.0  # equity wiped out → annualized total loss
+    else:
+        ann_return = 0.0
     ann_vol = float(returns.std(ddof=1) * np.sqrt(periods)) if len(returns) > 1 else 0.0
     mdd = max_drawdown(equity)
     return MetricsBlock(
