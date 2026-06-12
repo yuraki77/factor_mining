@@ -51,6 +51,35 @@ def test_return_autocorrelation_is_zero_and_warning_free_for_constant_series() -
     assert result == 0.0  # exactly 0.0, not NaN
 
 
+def test_newey_west_bandwidth_accounts_for_rolling_ic_overlap() -> None:
+    """Q4 regression: a rolling-IC series overlaps — adjacent observations share
+    all but one bar of the window — so its autocovariance is non-zero out to
+    ~window lags. The generic ``n**(1/3)`` Newey-West bandwidth (~12 here) ignores
+    that overlap, under-counts the variance, and over-states the IC t-stat — which
+    inflates the G3/G4 gate passes that decide whether a factor is 'real'. WHY it
+    matters: an over-stated t-stat promotes noise to a tradable signal. The
+    overlap-aware bandwidth (the rolling window) must yield a strictly smaller
+    |t-stat| on an overlapping, weakly-trending series."""
+    rng = np.random.default_rng(0)
+    window = 288
+    # Rolling mean of near-zero-mean noise reproduces the overlap structure of a
+    # rolling IC: np.convolve(..., "valid") is the trailing mean over `window`.
+    raw = rng.standard_normal(2000) + 0.03
+    overlapping = np.convolve(raw, np.ones(window) / window, mode="valid")
+    naive = newey_west_tstat(overlapping)                 # auto lag ~ n**(1/3)
+    overlap_aware = newey_west_tstat(overlapping, lag=window)
+    assert abs(naive) > 0.0
+    assert abs(overlap_aware) < abs(naive)
+
+
+def test_newey_west_explicit_lag_is_capped_to_sample() -> None:
+    """The overlap bandwidth (e.g. 288) can exceed a short OOS IC slice; the t-stat
+    must stay finite and defined (lag < n) rather than reaching past the sample."""
+    arr = np.linspace(-1.0, 1.0, 20) + 0.1
+    result = newey_west_tstat(arr, lag=288)
+    assert math.isfinite(result)
+
+
 def test_deflated_sharpe_penalty_is_annualized_to_match_sharpe_units() -> None:
     """Q1 regression: the multiple-testing penalty is a per-period Sharpe quantity
     and must be annualized to match the annualized ``observed_sr`` it is subtracted

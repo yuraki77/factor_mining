@@ -35,6 +35,15 @@ from factor_mining.stats.regime import label_btc_regime
 from factor_mining.trial_ledger import TrialLedger
 
 
+# Rolling IC lookback. Adjacent rolling-IC observations share all but one bar of
+# this window, so the IC series is overlapping (~MA(window-1)) with non-zero
+# autocovariance out to ~window lags. The Newey-West t-stat on that series must
+# use a bandwidth of this horizon — not the generic n**(1/3) rule — or it
+# under-counts the overlap variance and over-states IC significance (Q4). Kept as
+# one constant so the window and the bandwidth can never drift apart.
+_IC_WINDOW_BARS = 288
+
+
 @dataclass(frozen=True)
 class StrategyPath:
     frame: pd.DataFrame
@@ -142,7 +151,7 @@ def compute_oos_window_diagnostics(
         if ic_series is not None:
             w_ic = ic_series.iloc[start:end].dropna()
             if len(w_ic) >= 4:
-                w_ic_tstat = float(newey_west_tstat(w_ic))
+                w_ic_tstat = float(newey_west_tstat(w_ic, lag=_IC_WINDOW_BARS))
         per_window.append(OOSWindowMetrics(
             window_index=i,
             start_bar=start,
@@ -467,8 +476,8 @@ def run_backtest(
     executable_sig = signals.shift(1).fillna(0.0)
     sig_arr = executable_sig.to_numpy(dtype=float)
     fwd_arr = forward_returns.to_numpy(dtype=float)
-    ic_series = pd.Series(rolling_pearson_ic(sig_arr, fwd_arr, window=288, min_periods=10), index=signals.index)
-    rankic_series = pd.Series(rolling_rank_ic(sig_arr, fwd_arr, window=288, min_periods=10), index=signals.index)
+    ic_series = pd.Series(rolling_pearson_ic(sig_arr, fwd_arr, window=_IC_WINDOW_BARS, min_periods=10), index=signals.index)
+    rankic_series = pd.Series(rolling_rank_ic(sig_arr, fwd_arr, window=_IC_WINDOW_BARS, min_periods=10), index=signals.index)
     avg_hold = _avg_holding_period(vol_target_position)
     block_len = settings.bootstrap.block_length_bars(avg_hold)
     ret_arr = primary_returns.to_numpy(dtype=float)
@@ -554,8 +563,8 @@ def run_backtest(
         metrics_primary=metrics_primary,
         metrics_secondary=metrics_secondary,
         metrics_gross=metrics_gross,
-        ic_tstat_nw=newey_west_tstat(ic_series.dropna()),
-        rankic_tstat_nw=newey_west_tstat(rankic_series.dropna()),
+        ic_tstat_nw=newey_west_tstat(ic_series.dropna(), lag=_IC_WINDOW_BARS),
+        rankic_tstat_nw=newey_west_tstat(rankic_series.dropna(), lag=_IC_WINDOW_BARS),
         sharpe_ci_5_95=ci,
         probabilistic_sharpe=probabilistic_sharpe_ratio(primary_returns, observed_sr=observed_sr, periods_per_year=periods_per_year),
         deflated_sharpe=dsr,

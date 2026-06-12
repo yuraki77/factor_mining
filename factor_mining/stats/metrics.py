@@ -48,7 +48,13 @@ def newey_west_tstat(values: Sequence[float], *, lag: int | None = None) -> floa
     n = arr.size
     if n < 3:
         return 0.0
-    lag = int(n ** (1 / 3)) if lag is None else lag
+    lag = int(n ** (1 / 3)) if lag is None else int(lag)
+    # An explicit overlap bandwidth (e.g. a rolling-IC window) can exceed the
+    # sample; Newey-West is only defined for lag < n, so cap it. When the whole
+    # sample fits inside one overlap window this collapses to the maximally
+    # conservative estimator (~one effective observation) — the honest result
+    # rather than a spuriously large t-stat.
+    lag = max(1, min(lag, n - 1))
     centered = arr - arr.mean()
     gamma0 = float(np.dot(centered, centered) / n)
     variance = gamma0
