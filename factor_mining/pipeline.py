@@ -1261,20 +1261,7 @@ def verify_research_survivors(
                 funding_df=context.funding_df,
             )
 
-            from factor_mining.registry import get_method
-            from factor_mining.validation.gatecheck import apply_fdr, apply_risk_stratified_gatechecks, run_gatecheck
-
-            fdr_map = apply_fdr(round_backtests, settings)
-            methods_map = {method.method_id: method for method in METHOD_REGISTRY}
-            round_gatechecks: list[GateCheckResult] = []
-            for backtest in round_backtests:
-                method = methods_map.get(backtest.method_id) or get_method(backtest.method_id)
-                fdr_p = fdr_map.get(
-                    backtest.experiment_id,
-                    combined_ic_tstat_pvalue(backtest.ic_tstat_nw, backtest.rankic_tstat_nw),
-                )
-                round_gatechecks.append(run_gatecheck(backtest, settings, method=method, fdr_adjusted_pvalue=fdr_p))
-            apply_risk_stratified_gatechecks(round_backtests, round_gatechecks, round_evidence, settings)
+            round_gatechecks, fdr_map = _run_gatechecks(round_backtests, round_evidence, settings)
             round_research_gates = apply_research_gate(round_backtests, round_gatechecks, round_evidence)
             persistent_records = build_research_survivor_records(
                 candidates_by_id={candidate.candidate_id: candidate for candidate in round_candidates},
@@ -1328,6 +1315,41 @@ def verify_research_survivors(
     finally:
         _EVENT_SINK = previous_sink
         _RUN_ID = previous_run_id
+
+
+def _run_gatechecks(
+    backtests: list[BacktestResult],
+    evidence: list[FactorEvidenceReport],
+    settings: Settings,
+    *,
+    family_test_counts: dict[str, int] | None = None,
+) -> tuple[list[GateCheckResult], dict[str, float]]:
+    """Family FDR (Q15-aware) + the 16-rule gatecheck + risk stratification for a
+    batch of results, returning the gatechecks and the FDR map. Shared by the
+    per-round (validation) selection gate, the survivor re-eval, and the terminal
+    (final-OOS) holdout gate so the three orchestrations can't drift."""
+    from factor_mining.registry import get_method
+    from factor_mining.validation.gatecheck import (
+        apply_fdr,
+        apply_risk_stratified_gatechecks,
+        run_gatecheck,
+    )
+
+    # Only pass the override when set, so the per-round/survivor calls remain
+    # byte-identical to the pre-extraction apply_fdr(backtests, settings).
+    fdr_overrides = {"family_test_counts": family_test_counts} if family_test_counts is not None else {}
+    fdr_map = apply_fdr(backtests, settings, **fdr_overrides)
+    methods_map = {method.method_id: method for method in METHOD_REGISTRY}
+    gatechecks: list[GateCheckResult] = []
+    for backtest in backtests:
+        method = methods_map.get(backtest.method_id) or get_method(backtest.method_id)
+        fdr_p = fdr_map.get(
+            backtest.experiment_id,
+            combined_ic_tstat_pvalue(backtest.ic_tstat_nw, backtest.rankic_tstat_nw),
+        )
+        gatechecks.append(run_gatecheck(backtest, settings, method=method, fdr_adjusted_pvalue=fdr_p))
+    apply_risk_stratified_gatechecks(backtests, gatechecks, evidence, settings)
+    return gatechecks, fdr_map
 
 
 def _run_mining_round(
@@ -1742,18 +1764,7 @@ def _run_mining_round(
 
     # ── GateCheck ───────────────────────────────────────────────────
     t0 = time.perf_counter()
-    from factor_mining.validation.gatecheck import apply_fdr, apply_risk_stratified_gatechecks, run_gatecheck
-    from factor_mining.registry import get_method
-
-    fdr_map = apply_fdr(round_backtests, settings)
-    methods_map = {m.method_id: m for m in METHOD_REGISTRY}
-    round_gatechecks = []
-    for r in round_backtests:
-        method = methods_map.get(r.method_id) or get_method(r.method_id)
-        fdr_p = fdr_map.get(r.experiment_id, combined_ic_tstat_pvalue(r.ic_tstat_nw, r.rankic_tstat_nw))
-        gc = run_gatecheck(r, settings, method=method, fdr_adjusted_pvalue=fdr_p)
-        round_gatechecks.append(gc)
-    apply_risk_stratified_gatechecks(round_backtests, round_gatechecks, round_factor_evidence, settings)
+    round_gatechecks, fdr_map = _run_gatechecks(round_backtests, round_factor_evidence, settings)
 
     n_passed = sum(1 for g in round_gatechecks if g.passed)
     tier_counts = Counter(g.risk_tier for g in round_gatechecks)
