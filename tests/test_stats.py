@@ -1,4 +1,5 @@
 import math
+import warnings
 
 import numpy as np
 
@@ -35,6 +36,19 @@ def test_deflated_sharpe_gets_tighter_as_trials_grow() -> None:
     assert high_trials < low_trials
     assert newey_west_tstat(returns) != 0
     assert abs(return_autocorrelation_lag1(returns)) < 0.5
+
+
+def test_return_autocorrelation_is_zero_and_warning_free_for_constant_series() -> None:
+    """A constant return series has zero variance, so its lag-1 autocorrelation is
+    undefined (0/0). It must short-circuit to 0.0 rather than let ``np.corrcoef``
+    divide by a zero stddev — which returns NaN and emits a RuntimeWarning. WHY it
+    matters: a degenerate backtest (e.g. a single-trade signal) produces a near-flat
+    return series, and a NaN autocorrelation propagates into the reported metric.
+    0.0 ("no autocorrelation") matches rank_ic's convention for an undefined corr."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # a divide-by-zero warning fails the test
+        result = return_autocorrelation_lag1(np.zeros(50))
+    assert result == 0.0  # exactly 0.0, not NaN
 
 
 def test_deflated_sharpe_penalty_is_annualized_to_match_sharpe_units() -> None:

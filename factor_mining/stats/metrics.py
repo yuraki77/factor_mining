@@ -255,6 +255,8 @@ def return_autocorrelation_lag1(returns: Sequence[float]) -> float:
     arr = arr[np.isfinite(arr)]
     if arr.size < 3:
         return 0.0
+    if arr[1:].std() == 0 or arr[:-1].std() == 0:
+        return 0.0  # autocorrelation is undefined for a constant series
     return float(np.corrcoef(arr[1:], arr[:-1])[0, 1])
 
 
