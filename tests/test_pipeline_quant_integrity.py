@@ -1834,6 +1834,39 @@ def test_data_split_plan_final_oos_is_chronological_even_with_alien_regime_tail(
     assert final_regimes == {"high_vol"}
 
 
+def test_data_split_plan_inserts_purge_embargo_gap_between_splits() -> None:
+    """Q10: with a purge/embargo gap the discovery/validation/final splits are
+    separated by >= gap bars that belong to NO split, so the final holdout's first
+    feature window can't reach back into the validation/discovery bars the
+    optimizer tuned on. WHY it matters: contiguous splits leak adjacent-bar
+    information across the train/test boundary and inflate OOS performance."""
+    frame = _frame(2000)
+    gap = 100
+    plan = _build_data_split_plan(frame, purge_bars=gap, embargo_bars=0)
+    assert plan.gaps_honored
+    assert plan.purge_embargo_bars == gap
+    disc = [int(i) for i in plan.discovery_mask[plan.discovery_mask].index]
+    val = [int(i) for i in plan.repair_validation_mask[plan.repair_validation_mask].index]
+    fin = [int(i) for i in plan.final_oos_mask[plan.final_oos_mask].index]
+    assert not (set(disc) & set(val)) and not (set(val) & set(fin)) and not (set(disc) & set(fin))
+    assert min(val) - max(disc) - 1 >= gap   # purged between discovery and validation
+    assert min(fin) - max(val) - 1 >= gap    # purged between validation and final holdout
+
+
+def test_data_split_plan_skips_gap_when_frame_too_short_and_flags_it() -> None:
+    """A short frame can't spare the gap; rather than shred the splits into slivers,
+    the plan falls back to no purge and records gaps_honored=False — so the G11
+    leakage check can flag the un-purged split (Q9) instead of silently pretending
+    it was purged. All three splits stay non-empty and chronological."""
+    frame = _frame(120)
+    plan = _build_data_split_plan(frame, purge_bars=288, embargo_bars=288)
+    assert not plan.gaps_honored
+    assert plan.discovery_mask.sum() > 0
+    assert plan.repair_validation_mask.sum() > 0
+    assert plan.final_oos_mask.sum() > 0
+    assert not bool((plan.repair_mask & plan.final_oos_mask).any())
+
+
 def test_repair_merge_pool_prunes_high_pbo_and_redundant_repairs() -> None:
     parent = CandidateStrategySpec(
         candidate_id="c_parent",

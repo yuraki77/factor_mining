@@ -116,6 +116,8 @@ class DataSplitPlan:
     final_oos_mask: pd.Series
     repair_validation_start_idx: int
     final_oos_start_idx: int
+    purge_embargo_bars: int = 0
+    gaps_honored: bool = True
 
     @property
     def final_oos_start_time(self) -> int | None:
@@ -637,7 +639,12 @@ def reproduce_candidate(
     # Mirror the pipeline's final evaluation: backtest the last-20% OOS slice
     # of the frame against the same slice of the signal (see _slice_tasks +
     # _run_backtests_parallel(final_tasks, final_frame, ..., funding_df)).
-    split_plan = _build_data_split_plan(ctx.frame, regimes=ctx.forward_regimes)
+    split_plan = _build_data_split_plan(
+        ctx.frame,
+        regimes=ctx.forward_regimes,
+        purge_bars=settings.walk_forward.purge_bars_floor,
+        embargo_bars=settings.walk_forward.embargo_bars,
+    )
     mask_arr = split_plan.final_oos_mask.to_numpy()
     final_frame = _masked_frame(ctx.frame, split_plan.final_oos_mask)
     final_signal = pd.Series(
@@ -1192,7 +1199,12 @@ def verify_research_survivors(
                 _log(f"  Skip {key[0]}/{key[1]}: no local parquet data")
                 continue
             _log(f"  {context.symbol}/{context.market}: verifying {len(symbol_candidates)} survivors")
-            split_plan = _build_data_split_plan(context.frame, regimes=context.forward_regimes)
+            split_plan = _build_data_split_plan(
+                context.frame,
+                regimes=context.forward_regimes,
+                purge_bars=settings.walk_forward.purge_bars_floor,
+                embargo_bars=settings.walk_forward.embargo_bars,
+            )
             final_frame = _masked_frame(context.frame, split_plan.final_oos_mask)
             final_regimes = _masked_series(context.forward_regimes, split_plan.final_oos_mask)
             final_funding_rate = _masked_series(context.funding_rate, split_plan.final_oos_mask)
@@ -1347,7 +1359,12 @@ def _run_mining_round(
 
     # ── Backtest ────────────────────────────────────────────────────
     t0 = time.perf_counter()
-    split_plan = _build_data_split_plan(frame, regimes=forward_regimes)
+    split_plan = _build_data_split_plan(
+        frame,
+        regimes=forward_regimes,
+        purge_bars=settings.walk_forward.purge_bars_floor,
+        embargo_bars=settings.walk_forward.embargo_bars,
+    )
     discovery_frame = _masked_frame(frame, split_plan.discovery_mask)
     repair_validation_frame = _masked_frame(frame, split_plan.repair_validation_mask)
     final_frame = _masked_frame(frame, split_plan.final_oos_mask)
@@ -1359,7 +1376,8 @@ def _run_mining_round(
         "  Split: "
         f"discovery={len(discovery_frame):,} bars, "
         f"repair_validation={len(repair_validation_frame):,} bars, "
-        f"final_oos={len(final_frame):,} bars "
+        f"final_oos={len(final_frame):,} bars, "
+        f"purge_embargo={split_plan.purge_embargo_bars} bars (honored={split_plan.gaps_honored}) "
         f"(validation_start_idx={split_plan.repair_validation_start_idx}, "
         f"final_start_idx={split_plan.final_oos_start_idx})"
     )
@@ -2108,6 +2126,8 @@ def _build_data_split_plan(
     frame: pd.DataFrame,
     *,
     regimes: pd.Series | None = None,
+    purge_bars: int = 0,
+    embargo_bars: int = 0,
     discovery_fraction: float = _DISCOVERY_FRACTION,
     repair_validation_fraction: float = _REPAIR_VALIDATION_FRACTION,
     final_oos_fraction: float = _FINAL_OOS_FRACTION,
@@ -2148,12 +2168,34 @@ def _build_data_split_plan(
             validation_start = min(validation_start, max(1, target_discovery_count))
     validation_start = max(1, min(validation_start, final_start))
 
+    # Q10: purge (+ embargo) gap between adjacent splits — bars belonging to NO
+    # split — carved off the END of each upstream split (discovery before
+    # validation, validation before the final holdout), so a downstream split's
+    # feature window can't reach back into the data the optimizer already used
+    # (lookahead across the train/test boundary). Mirrors walk_forward_oos_mask's
+    # purge+embargo inter-fold spacing. All-or-nothing: the full gap is applied at
+    # both boundaries only when each upstream split can spare it (keeps >= gap
+    # bars), so a real run on a long frame purges while a short fixture is left
+    # exactly as-is. gaps_honored records whether it was applied, so the G11
+    # leakage check can flag an un-purged split (Q9) instead of pretending.
+    requested_gap = max(0, int(purge_bars) + int(embargo_bars))
+    discovery_has_room = validation_start - requested_gap >= requested_gap
+    validation_has_room = (
+        validation_count == 0
+        or final_start - validation_start - requested_gap >= requested_gap
+    )
+    apply_gap = requested_gap > 0 and discovery_has_room and validation_has_room
+    gaps_honored = requested_gap == 0 or apply_gap
+    discovery_end = validation_start - requested_gap if apply_gap else validation_start
+    validation_end = (
+        final_start - requested_gap if apply_gap and validation_count > 0 else final_start
+    )
+
     discovery_mask = pd.Series(False, index=frame.index)
     validation_mask = pd.Series(False, index=frame.index)
-    repair_mask = pd.Series(False, index=frame.index)
     final_mask = pd.Series(False, index=frame.index)
-    discovery_mask.iloc[:validation_start] = True
-    validation_mask.iloc[validation_start:final_start] = True
+    discovery_mask.iloc[:discovery_end] = True
+    validation_mask.iloc[validation_start:validation_end] = True
     final_mask.iloc[final_start:final_end] = True
     repair_mask = discovery_mask | validation_mask
     return DataSplitPlan(
@@ -2163,6 +2205,8 @@ def _build_data_split_plan(
         final_oos_mask=final_mask,
         repair_validation_start_idx=validation_start,
         final_oos_start_idx=final_start,
+        purge_embargo_bars=requested_gap,
+        gaps_honored=gaps_honored,
     )
 
 
