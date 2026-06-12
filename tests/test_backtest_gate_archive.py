@@ -352,6 +352,28 @@ def test_risk_stratified_gate_full_pass_requires_strong_evidence_and_low_pbo() -
     assert score.allocation_multiplier == 1.0
 
 
+def test_g11_blocks_when_split_overlap_detected() -> None:
+    """Q9: G11 was vacuous — the pipeline never set its leakage fields, so
+    ``leakage_checks_passed and not split_overlap_detected`` was always True. Now
+    the pipeline wires split_overlap_detected from the split plan's gaps_honored
+    (Q10), so G11 must be able to FAIL: an otherwise gate-ready result whose
+    final-OOS split could not be purged from the optimizer's data must not clear
+    the gate. WHY it matters: an un-purged holdout is leakage-contaminated, and
+    passing it would promote a strategy whose OOS edge is inflated by train/test
+    bleed."""
+    clean = _gate_ready_result(pbo=0.20)
+    clean.split_overlap_detected = False
+    clean_gate = run_gatecheck(clean, Settings(), method=get_method("rule_mining"), fdr_adjusted_pvalue=0.01)
+    assert next(item for item in clean_gate.items if item.rule_id == "G11").status == "pass"
+    assert clean_gate.raw_passed is True
+
+    contaminated = _gate_ready_result(pbo=0.20)
+    contaminated.split_overlap_detected = True
+    dirty_gate = run_gatecheck(contaminated, Settings(), method=get_method("rule_mining"), fdr_adjusted_pvalue=0.01)
+    assert next(item for item in dirty_gate.items if item.rule_id == "G11").status == "fail"
+    assert dirty_gate.raw_passed is False  # G11 is a blocking rule
+
+
 def test_risk_stratified_gate_blocks_weak_evidence_even_with_low_pbo() -> None:
     result = _gate_ready_result(pbo=0.20)
     gate = run_gatecheck(result, Settings(), method=get_method("rule_mining"), fdr_adjusted_pvalue=0.01)

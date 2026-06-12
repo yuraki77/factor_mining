@@ -651,7 +651,7 @@ def reproduce_candidate(
         np.asarray(signal_arr, dtype=float)[mask_arr], index=final_frame.index
     )
 
-    return run_backtest(
+    result = run_backtest(
         final_frame,
         final_signal,
         spec,
@@ -659,6 +659,10 @@ def reproduce_candidate(
         trial_counts={"effective_trials_count": 1, "global_cumulative_trials_count": 1},
         funding=ctx.funding_df,
     )
+    # Q9: surface whether the reproduced final-OOS split was purged (Q10), so the
+    # result is honest about its holdout discipline like the pipeline path.
+    result.split_overlap_detected = not split_plan.gaps_honored
+    return result
 
 
 def _resolve_round_controls(
@@ -1237,6 +1241,10 @@ def verify_research_survivors(
             if round_backtests:
                 _apply_batch_pbo(final_frame, final_tasks, round_backtests, settings, context.funding_df)
 
+            # Q9: wire G11's split-overlap signal to the actual purge geometry.
+            for backtest in round_backtests:
+                backtest.split_overlap_detected = not split_plan.gaps_honored
+
             result_ids = {item.candidate_id for item in round_backtests}
             round_candidates = [
                 candidate for candidate in symbol_candidates
@@ -1664,6 +1672,9 @@ def _run_mining_round(
         for result in final_backtests:
             validation_result = validation_result_by_candidate.get(result.candidate_id)
             result.pbo = validation_result.pbo if validation_result is not None else 1.0
+            # Q9: wire G11's split-overlap signal to the actual purge geometry
+            # (gaps_honored from Q10) instead of leaving it at its vacuous default.
+            result.split_overlap_detected = not split_plan.gaps_honored
             if validation_result is not None:
                 result.global_trials_at_eval = validation_result.global_trials_at_eval
                 result.effective_trials_at_eval = validation_result.effective_trials_at_eval
