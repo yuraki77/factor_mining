@@ -122,6 +122,11 @@ class BacktestResult(BaseModel):
     actual_cost_bps: float = 0.0
     prior_posterior_ic_ratio: float = 1.0
     window_stability: WindowStabilityDiagnostics | None = None
+    # Bounded (downsampled) final-OOS compound-equity path so the product can render
+    # a real chart for any result — including a reproduced run, which returns only
+    # this BacktestResult and no heavyweight detail payload. Empty by default for
+    # backward compatibility with archived results and the cross-repo consumer.
+    equity_curve: list[float] = Field(default_factory=list)
     trial_diagnostics: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 

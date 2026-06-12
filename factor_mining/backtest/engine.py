@@ -43,6 +43,11 @@ from factor_mining.trial_ledger import TrialLedger
 # one constant so the window and the bandwidth can never drift apart.
 _IC_WINDOW_BARS = 288
 
+# Cap on the number of points stored in BacktestResult.equity_curve (I5). Keeps a
+# serialized/archived result small regardless of OOS length while preserving the
+# curve's shape and its exact final value.
+_EQUITY_CURVE_MAX_POINTS = 512
+
 
 @dataclass(frozen=True)
 class StrategyPath:
@@ -428,6 +433,23 @@ def evaluate_strategy_path(
     )
 
 
+def _bounded_equity_curve(returns: pd.Series, *, max_points: int = _EQUITY_CURVE_MAX_POINTS) -> list[float]:
+    """Downsampled compound-equity path (cumprod of 1+r), matching the series
+    ``build_backtest_detail`` charts. Bounded to ``max_points`` so a serialized or
+    archived BacktestResult stays small regardless of OOS length; the first and
+    last points are always kept (stride-sampled interior), so the final compounded
+    value is exact. NaN/inf returns are treated as a flat (0%) bar to preserve the
+    timeline."""
+    clean = returns.replace([np.inf, -np.inf], np.nan).fillna(0.0).to_numpy(dtype=float)
+    if clean.size == 0:
+        return []
+    equity = np.cumprod(1.0 + clean)
+    if equity.size > max_points:
+        idx = np.unique(np.linspace(0, equity.size - 1, max_points).round().astype(int))
+        equity = equity[idx]
+    return [float(value) for value in equity]
+
+
 def run_backtest(
     frame: pd.DataFrame,
     signals: pd.Series,
@@ -563,6 +585,7 @@ def run_backtest(
         metrics_primary=metrics_primary,
         metrics_secondary=metrics_secondary,
         metrics_gross=metrics_gross,
+        equity_curve=_bounded_equity_curve(primary_returns),
         ic_tstat_nw=newey_west_tstat(ic_series.dropna(), lag=_IC_WINDOW_BARS),
         rankic_tstat_nw=newey_west_tstat(rankic_series.dropna(), lag=_IC_WINDOW_BARS),
         sharpe_ci_5_95=ci,

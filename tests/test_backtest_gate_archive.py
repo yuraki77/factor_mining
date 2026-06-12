@@ -2,7 +2,7 @@ import pandas as pd
 import pytest
 
 from factor_mining.archive import archive_experiment, verify_archive
-from factor_mining.backtest.engine import _apply_exit_rules, evaluate_strategy_path, run_backtest, walk_forward_oos_mask
+from factor_mining.backtest.engine import _EQUITY_CURVE_MAX_POINTS, _apply_exit_rules, _bounded_equity_curve, evaluate_strategy_path, run_backtest, walk_forward_oos_mask
 from factor_mining.config import BootstrapConfig, DataConfig, GateCheckConfig, PermutationTestConfig, PositionSizingConfig, Settings, WalkForwardConfig
 from factor_mining.models import BacktestResult, CandidateStrategySpec, DataQualityNote, FactorEvidenceReport, GateCheckResult, MetricsBlock
 from factor_mining.registry import get_method
@@ -136,6 +136,25 @@ def test_backtest_uses_next_bar_execution_and_records_trial(tmp_path) -> None:
     assert result.global_trials_at_eval == 1
     assert result.pbo is None
     assert result.oos_trade_count != 3
+    # I5: every result carries a bounded equity curve so the product (and a
+    # reproduced run, which returns only this BacktestResult) can chart it.
+    assert 0 < len(result.equity_curve) <= _EQUITY_CURVE_MAX_POINTS
+    assert all(value > 0.0 for value in result.equity_curve)
+
+
+def test_bounded_equity_curve_caps_points_and_keeps_endpoints() -> None:
+    """I5: the equity curve is downsampled to a fixed cap so an archived/serialized
+    BacktestResult stays small regardless of OOS length, while the first and last
+    points — and therefore the exact final compounded value — are preserved. WHY it
+    matters: the product charts this curve directly for reproduced runs, so it must
+    be both bounded (no unbounded payload growth) and faithful at the endpoints."""
+    returns = pd.Series([0.001] * 5000)
+    curve = _bounded_equity_curve(returns)
+    assert len(curve) <= _EQUITY_CURVE_MAX_POINTS
+    assert curve[0] == pytest.approx(1.001)
+    assert curve[-1] == pytest.approx(1.001**5000)
+    short = _bounded_equity_curve(pd.Series([0.01, -0.02, 0.03]))
+    assert short == pytest.approx([1.01, 1.01 * 0.98, 1.01 * 0.98 * 1.03])
 
 
 def test_permutation_test_uses_executable_lagged_signal(tmp_path, monkeypatch) -> None:
