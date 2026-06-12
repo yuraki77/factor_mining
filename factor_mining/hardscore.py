@@ -4,7 +4,7 @@ import math
 
 from factor_mining.config import Settings
 from factor_mining.models import BacktestResult, GateCheckResult, HardScoreReport
-from factor_mining.stats.metrics import haircut_sharpe
+from factor_mining.stats.metrics import annualization_factor, haircut_sharpe
 
 
 def hardscore(
@@ -19,6 +19,7 @@ def hardscore(
         result.metrics_primary.sharpe,
         trials_count=max(result.effective_trials_at_eval, 1),
         observations=max(result.metrics_primary.trade_count, 1),
+        periods_per_year=annualization_factor(result.interval),
     )
     failures = [item.rule_id for item in gatecheck.items if item.status == "fail"]
     allocation = gatecheck.allocation_multiplier

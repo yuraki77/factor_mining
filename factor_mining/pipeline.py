@@ -2132,20 +2132,16 @@ def _build_data_split_plan(
         validation_count = max(1, int(round(n_rows * repair_validation_fraction)))
         validation_count = min(validation_count, n_rows - final_count - 1)
     base_final_start = n_rows - final_count
-    final_start = _choose_regime_aware_final_start(
-        regimes,
-        n_rows=n_rows,
-        final_count=final_count,
-        validation_count=validation_count,
-        base_final_start=base_final_start,
-    )
+    # Q7: the final OOS is always the chronologically last segment. A regime-aware
+    # shift used to move it earlier to a "less alien" regime mix, but selecting the
+    # test window by its regime composition is a subtle lookahead — the OOS stops
+    # being the genuine future tail. Honest evaluation beats a friendlier split.
+    final_start = base_final_start
     final_end = min(n_rows, final_start + final_count)
     validation_start = final_start - validation_count
 
-    # Without regime labels, keep the original 60/20/20 behavior. With regime
-    # labels, final_start may move to a nearby contiguous OOS window whose
-    # regime mix is less alien to discovery/validation while still avoiding
-    # non-contiguous masks.
+    # Without regime labels, cap validation_start so discovery keeps roughly
+    # discovery_fraction of the series (the original 60/20/20 shape).
     if regimes is None:
         target_discovery_count = int(round(n_rows * discovery_fraction))
         if validation_count > 0 and target_discovery_count > 0:
@@ -2168,89 +2164,6 @@ def _build_data_split_plan(
         repair_validation_start_idx=validation_start,
         final_oos_start_idx=final_start,
     )
-
-
-def _choose_regime_aware_final_start(
-    regimes: pd.Series | None,
-    *,
-    n_rows: int,
-    final_count: int,
-    validation_count: int,
-    base_final_start: int,
-) -> int:
-    if regimes is None or len(regimes) != n_rows:
-        return base_final_start
-
-    labels = pd.Series(regimes.to_numpy(), index=range(n_rows)).astype(str).fillna("unknown")
-    known = labels[labels != "unknown"]
-    if known.nunique() < 2:
-        return base_final_start
-
-    min_start = max(validation_count + 1, int(n_rows * 0.50))
-    max_start = n_rows - final_count
-    if min_start >= max_start:
-        return base_final_start
-
-    radius = max(final_count, validation_count, n_rows // 10)
-    lower = max(min_start, base_final_start - radius)
-    upper = min(max_start, base_final_start + radius)
-    step = max(1, final_count // 64)
-    candidates = set(range(lower, upper + 1, step))
-    candidates.update({base_final_start, min_start, max_start})
-
-    best_start = base_final_start
-    best_score = float("-inf")
-    for start in sorted(item for item in candidates if min_start <= item <= max_start):
-        discovery_end = start - validation_count
-        if discovery_end <= 0:
-            continue
-        score = _regime_split_score(
-            labels.iloc[:discovery_end],
-            labels.iloc[discovery_end:start],
-            labels.iloc[start:start + final_count],
-            base_final_start=base_final_start,
-            start=start,
-            n_rows=n_rows,
-        )
-        if score > best_score:
-            best_score = score
-            best_start = start
-    return best_start
-
-
-def _regime_split_score(
-    discovery: pd.Series,
-    validation: pd.Series,
-    final: pd.Series,
-    *,
-    base_final_start: int,
-    start: int,
-    n_rows: int,
-) -> float:
-    discovery_set = _known_regime_set(discovery)
-    validation_set = _known_regime_set(validation)
-    final_set = _known_regime_set(final)
-    if not final_set:
-        return -10.0
-
-    discovery_overlap = len(final_set & discovery_set) / max(1, len(final_set))
-    validation_overlap = len(final_set & validation_set) / max(1, len(final_set))
-    final_diversity = min(len(final_set), 3) / 3.0
-    validation_diversity = min(len(validation_set), 3) / 3.0
-    unknown_ratio = float((final == "unknown").mean()) if len(final) else 1.0
-    chronological_penalty = abs(start - base_final_start) / max(1, n_rows)
-    return (
-        2.0 * discovery_overlap
-        + 1.5 * validation_overlap
-        + final_diversity
-        + 0.5 * validation_diversity
-        - 1.0 * unknown_ratio
-        - 0.25 * chronological_penalty
-    )
-
-
-def _known_regime_set(values: pd.Series) -> set[str]:
-    return {str(value) for value in values.dropna().unique() if str(value) != "unknown"}
 
 
 def _masked_frame(frame: pd.DataFrame, mask: pd.Series) -> pd.DataFrame:
@@ -3391,6 +3304,7 @@ def _apply_merge_pool_trial_penalty(
             returns_placeholder,
             observed_sr=result.metrics_primary.sharpe,
             trials_count=result.effective_trials_at_eval,
+            periods_per_year=annualization_factor(result.interval),
         )
         # Write merge-pool trial count back to trial_diagnostics for artifact transparency.
         result.trial_diagnostics["merge_pool_effective_trials"] = effective_trials_count
@@ -4911,6 +4825,7 @@ def _is_repair_candidate(candidate: CandidateStrategySpec) -> bool:
 def _archive_top(result: PipelineResult, settings: Settings, archive_top: int) -> int:
     """Archive the top-scoring experiments across all rounds."""
     from factor_mining.archive import archive_experiment
+    from factor_mining.data.loader import data_extent
 
     archived = 0
     for c, r, s in result.top_candidates[:archive_top]:
@@ -4918,7 +4833,14 @@ def _archive_top(result: PipelineResult, settings: Settings, archive_top: int) -
         if gc is None:
             continue
         try:
-            archive_experiment(result=r, gatecheck=gc, hardscore=s, settings=settings)
+            archive_experiment(
+                result=r,
+                gatecheck=gc,
+                hardscore=s,
+                settings=settings,
+                candidate=c,
+                data_manifest=data_extent(settings, symbol=c.symbol, market=c.market),
+            )
             archived += 1
         except Exception:
             pass

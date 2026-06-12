@@ -98,8 +98,20 @@ def probabilistic_sharpe_ratio(
     returns: Sequence[float],
     *,
     observed_sr: float,
+    periods_per_year: int,
     benchmark_sr: float = 0.0,
 ) -> float:
+    """Probabilistic Sharpe Ratio (Bailey & López de Prado, 2012).
+
+    ``observed_sr`` and ``benchmark_sr`` are the *annualized* Sharpe ratios the
+    rest of the system reports; they are converted back to **per-period units**
+    here because the skewness/kurtosis adjustment and the ``sqrt(n - 1)``
+    scaling are defined on the per-period return distribution. Passing the
+    annualized Sharpe straight into the formula (the prior bug) scaled the
+    ``skew * SR`` term by ``sqrt(periods_per_year)`` and the ``SR**2`` term by
+    ``periods_per_year``, which collapsed the denominator (clamped at 1e-12) and
+    drove the estimate to a meaningless 0/1.
+    """
     arr = np.asarray(returns, dtype=float)
     arr = arr[np.isfinite(arr)]
     n = arr.size
@@ -109,10 +121,13 @@ def probabilistic_sharpe_ratio(
     std = arr.std(ddof=1)
     if std == 0:
         return 0.0
+    scale = math.sqrt(max(int(periods_per_year), 1))
+    sr = observed_sr / scale
+    benchmark = benchmark_sr / scale
     skew = float(np.mean((centered / std) ** 3))
     kurtosis = float(np.mean((centered / std) ** 4))
-    denominator = math.sqrt(max(1e-12, 1 - skew * observed_sr + ((kurtosis - 1) / 4) * observed_sr**2))
-    z_score = (observed_sr - benchmark_sr) * math.sqrt(n - 1) / denominator
+    denominator = math.sqrt(max(1e-12, 1 - skew * sr + ((kurtosis - 1) / 4) * sr**2))
+    z_score = (sr - benchmark) * math.sqrt(n - 1) / denominator
     return normal_cdf(z_score)
 
 
@@ -121,18 +136,40 @@ def deflated_sharpe_ratio(
     *,
     observed_sr: float,
     trials_count: int,
+    periods_per_year: int,
     benchmark_sr: float = 0.0,
 ) -> float:
+    """Deflated Sharpe haircut: ``observed_sr`` minus the expected maximum
+    Sharpe under the null over ``trials_count`` independent trials.
+
+    ``observed_sr``/``benchmark_sr`` are *annualized* Sharpe ratios. The
+    expected-maximum penalty ``sqrt(2 ln N / n)`` is a *per-period* Sharpe
+    quantity, so it is annualized (``× sqrt(periods_per_year)``) before being
+    subtracted. The prior code subtracted the per-period penalty straight from
+    the annualized Sharpe, under-stating the haircut by ``sqrt(periods_per_year)``
+    (≈ 324× on 5m bars) so almost every candidate cleared a positive DSR.
+    """
     arr = np.asarray(returns, dtype=float)
     n = max(len(arr), 1)
-    multiple_test_penalty = math.sqrt(2.0 * math.log(max(trials_count, 1)) / n)
-    return float(observed_sr - benchmark_sr - multiple_test_penalty)
+    per_period_penalty = math.sqrt(2.0 * math.log(max(trials_count, 1)) / n)
+    annualized_penalty = per_period_penalty * math.sqrt(max(int(periods_per_year), 1))
+    return float(observed_sr - benchmark_sr - annualized_penalty)
 
 
-def haircut_sharpe(observed_sr: float, *, trials_count: int, observations: int) -> float:
+def haircut_sharpe(observed_sr: float, *, trials_count: int, observations: int, periods_per_year: int) -> float:
+    """Haircut Sharpe: ``observed_sr`` minus the multiple-testing penalty.
+
+    ``observed_sr`` is the *annualized* Sharpe the rest of the system reports,
+    while the penalty ``sqrt(2 ln N / n)`` is a *per-period* Sharpe quantity, so
+    it is annualized (``× sqrt(periods_per_year)``) before being subtracted —
+    matching :func:`deflated_sharpe_ratio`. The prior code subtracted the raw
+    per-period penalty from the annualized Sharpe, under-stating the haircut by
+    ``sqrt(periods_per_year)`` (≈ 324× on 5m bars).
+    """
     observations = max(observations, 1)
-    penalty = math.sqrt(2.0 * math.log(max(trials_count, 1)) / observations)
-    return float(observed_sr - penalty)
+    per_period_penalty = math.sqrt(2.0 * math.log(max(trials_count, 1)) / observations)
+    annualized_penalty = per_period_penalty * math.sqrt(max(int(periods_per_year), 1))
+    return float(observed_sr - annualized_penalty)
 
 
 def benjamini_hochberg(pvalues: Sequence[float], *, q: float = 0.05, n_tests: int | None = None) -> list[float]:
@@ -218,6 +255,8 @@ def return_autocorrelation_lag1(returns: Sequence[float]) -> float:
     arr = arr[np.isfinite(arr)]
     if arr.size < 3:
         return 0.0
+    if arr[1:].std() == 0 or arr[:-1].std() == 0:
+        return 0.0  # autocorrelation is undefined for a constant series
     return float(np.corrcoef(arr[1:], arr[:-1])[0, 1])
 
 
