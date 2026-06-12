@@ -19,21 +19,38 @@ _BLOCKING_RULES = {"G1", "G2", "G5", "G8", "G10", "G11", "G14", "G15"}
 _FDR_EFFECTIVE_FAMILY_MIN = 10
 
 
-def apply_fdr(results: list[BacktestResult], settings: Settings) -> dict[str, float]:
+def apply_fdr(
+    results: list[BacktestResult],
+    settings: Settings,
+    *,
+    family_test_counts: dict[str, int] | None = None,
+) -> dict[str, float]:
+    """Family-stratified Benjamini-Hochberg FDR on combined-IC p-values.
+
+    ``family_test_counts`` (Q15): when provided, a family's BH ``n_tests`` is
+    raised to its cumulative cross-round trial count, so the multiplicity penalty
+    reflects every candidate ever tested in that family — not just the handful in
+    this batch. Without it (per-round / standalone use) ``n_tests`` falls back to
+    the batch size, floored at ``_FDR_EFFECTIVE_FAMILY_MIN``. Keys are the same
+    ``hypothesis_family`` the results carry.
+    """
     adjusted_by_experiment: dict[str, float] = {}
     results_by_family: dict[str, list[BacktestResult]] = {}
     for result in results:
         results_by_family.setdefault(result.hypothesis_family, []).append(result)
 
-    for family_results in results_by_family.values():
+    for family, family_results in results_by_family.items():
         pvalues = [
             combined_ic_tstat_pvalue(result.ic_tstat_nw, result.rankic_tstat_nw)
             for result in family_results
         ]
+        n_tests = max(len(pvalues), _FDR_EFFECTIVE_FAMILY_MIN)
+        if family_test_counts is not None:
+            n_tests = max(n_tests, int(family_test_counts.get(family, 0)))
         adjusted = benjamini_hochberg(
             pvalues,
             q=settings.gatecheck.fdr_q,
-            n_tests=max(len(pvalues), _FDR_EFFECTIVE_FAMILY_MIN),
+            n_tests=n_tests,
         )
         adjusted_by_experiment.update(
             {

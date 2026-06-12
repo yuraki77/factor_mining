@@ -8,7 +8,7 @@ from factor_mining.models import BacktestResult, CandidateStrategySpec, DataQual
 from factor_mining.registry import get_method
 from factor_mining.storage import MetadataStore
 from factor_mining.trial_ledger import TrialLedger
-from factor_mining.validation.gatecheck import apply_risk_stratified_gatechecks, run_gatecheck
+from factor_mining.validation.gatecheck import apply_fdr, apply_risk_stratified_gatechecks, run_gatecheck
 from factor_mining.hardscore import hardscore
 
 
@@ -372,6 +372,35 @@ def test_g11_blocks_when_split_overlap_detected() -> None:
     dirty_gate = run_gatecheck(contaminated, Settings(), method=get_method("rule_mining"), fdr_adjusted_pvalue=0.01)
     assert next(item for item in dirty_gate.items if item.rule_id == "G11").status == "fail"
     assert dirty_gate.raw_passed is False  # G11 is a blocking rule
+
+
+def _fdr_result(experiment_id: str, ic_tstat: float) -> BacktestResult:
+    return BacktestResult(
+        experiment_id=experiment_id,
+        candidate_id=experiment_id,
+        hypothesis_family="momentum",
+        method_id="rule_mining",
+        symbol="BTCUSDT",
+        market="um_futures",
+        interval="5m",
+        metrics_primary=MetricsBlock(),
+        ic_tstat_nw=ic_tstat,
+        rankic_tstat_nw=ic_tstat,
+    )
+
+
+def test_apply_fdr_cross_round_counts_tighten_pvalues() -> None:
+    """Q15: the multiplicity penalty must reflect every candidate tested in a
+    family across all rounds, not just this batch. Supplying cross-round trial
+    counts raises BH n_tests, so the same observed IC yields a larger (more
+    conservative) adjusted p-value than the per-round default — which is what
+    keeps a family that has been searched for many rounds from clearing G3 on a
+    lucky draw."""
+    results = [_fdr_result("e1", 4.0), _fdr_result("e2", 3.5)]
+    per_round = apply_fdr(results, Settings())
+    cross_round = apply_fdr(results, Settings(), family_test_counts={"momentum": 50})
+    assert cross_round["e1"] > per_round["e1"]
+    assert cross_round["e2"] > per_round["e2"]
 
 
 def test_risk_stratified_gate_blocks_weak_evidence_even_with_low_pbo() -> None:
