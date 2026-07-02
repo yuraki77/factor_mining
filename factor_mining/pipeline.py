@@ -1714,7 +1714,7 @@ def _run_mining_round(
 
         merge_pool_trials = _merge_pool_effective_trials(
             validation_backtests,
-            cumulative_trial_counts,
+            _trial_counts_snapshot(cumulative_trial_counts, trial_counts_lock),
             tested_candidates=len(validation_candidates),
         )
         _apply_merge_pool_trial_penalty(
@@ -3344,6 +3344,21 @@ def _signal_correlation(left: Any, right: Any) -> float:
         return 1.0
     corr = float(np.corrcoef(left_arr, right_arr)[0, 1])
     return corr if np.isfinite(corr) else 1.0
+
+
+def _trial_counts_snapshot(
+    counts: dict[str, int],
+    lock: Any | None,
+) -> dict[str, int]:
+    """Copy the shared cross-thread trial-count dict under its writers' lock.
+
+    Symbol-group threads insert new families concurrently via
+    _record_candidate_trials; iterating the live dict without the lock can
+    observe torn totals or raise RuntimeError mid-iteration."""
+    if lock is None:
+        return counts
+    with lock:
+        return dict(counts)
 
 
 def _merge_pool_effective_trials(

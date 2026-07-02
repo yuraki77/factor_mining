@@ -2192,3 +2192,25 @@ def test_serial_backtest_path_ignores_worker_global_stomp(monkeypatch) -> None:
 
     assert len(results) == 2
     assert frames_seen == [True, True], "serial path leaked to the stomped worker globals"
+
+
+def test_trial_counts_snapshot_serializes_with_writers() -> None:
+    """The merge-pool DSR penalty sums the cross-thread trial-count dict; that
+    read must serialize on the same lock _record_candidate_trials writers use,
+    or the penalty is computed from torn state mid-insert."""
+    lock = threading.Lock()
+    shared = {"momentum": 1}
+    assert lock.acquire()
+    out: list[dict[str, int]] = []
+    reader = threading.Thread(target=lambda: out.append(pipeline._trial_counts_snapshot(shared, lock)))
+    reader.start()
+    reader.join(timeout=0.2)
+    assert reader.is_alive(), "snapshot must block while a writer holds the lock"
+    shared["breakout"] = 5  # the writer finishes its insert before releasing
+    lock.release()
+    reader.join(timeout=2.0)
+    assert not reader.is_alive()
+    assert out[0] == {"momentum": 1, "breakout": 5}
+    assert out[0] is not shared, "snapshot must be a copy, not the live dict"
+    # Single-threaded path (no lock): the live dict is safe to use directly.
+    assert pipeline._trial_counts_snapshot(shared, None) is shared
