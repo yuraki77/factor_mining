@@ -13,6 +13,7 @@ import json
 import threading
 import time
 from collections import Counter
+from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from itertools import combinations, product
@@ -42,6 +43,7 @@ from factor_mining.mining import (
 from factor_mining.near_miss import analyze_near_misses
 from factor_mining.research_gate import apply_research_gate, build_research_survivor_records, research_survivor_payloads
 from factor_mining.models import (
+    UTC,
     BacktestResult,
     CandidateStrategySpec,
     DataQualityNote,
@@ -3787,15 +3789,25 @@ def _update_research_survivor_store(
     results: list[BacktestResult],
     fdr_map: dict[str, float],
     settings: Settings,
+    now: datetime | None = None,
 ) -> None:
     store.upsert_research_survivors(records)
     if not rechecked_candidate_ids:
         return
 
+    now = (now or datetime.now(UTC)).astimezone(UTC)
+    # The stored records carry the preserved paper_trade_start_date (upsert
+    # keeps the original clock); promotion must age against that, not against
+    # this round's freshly built records.
+    stored_by_candidate = {
+        record.candidate_id: record
+        for record in store.list_research_survivors(status=None)
+    }
     gate_by_candidate = {gate.candidate_id: gate for gate in research_gates}
     result_by_candidate = {result.candidate_id: result for result in results}
     min_trades = int(settings.gatecheck.min_oos_trades)
     promotion_fdr = float(settings.gatecheck.research_survivor_promotion_fdr_p)
+    default_required_days = int(settings.gatecheck.research_survivor_min_oos_days)
     for candidate_id in rechecked_candidate_ids:
         gate = gate_by_candidate.get(candidate_id)
         result = result_by_candidate.get(candidate_id)
@@ -3805,9 +3817,16 @@ def _update_research_survivor_store(
         # on OOS trades, never borrowed from the full-slice trade count.
         current_trades = int(result.oos_trade_count)
         fdr_pvalue = float(fdr_map.get(result.experiment_id, combined_ic_tstat_pvalue(result.ic_tstat_nw, result.rankic_tstat_nw)))
+        stored = stored_by_candidate.get(candidate_id)
+        required_days = int(stored.required_oos_days) if stored is not None else default_required_days
+        elapsed_days = (
+            (now - stored.paper_trade_start_date.astimezone(UTC)).days
+            if stored is not None
+            else 0
+        )
         if gate.status == "production_passed":
             store.update_research_survivor_status(candidate_id, "promoted", "production_gate_passed")
-        elif fdr_pvalue < promotion_fdr and current_trades >= min_trades:
+        elif fdr_pvalue < promotion_fdr and current_trades >= min_trades and elapsed_days >= required_days:
             store.update_research_survivor_status(candidate_id, "promoted", "promotion_criteria_met")
         elif gate.status == "rejected" and current_trades >= min_trades:
             store.update_research_survivor_status(candidate_id, "retired", "rejected_after_min_trades")

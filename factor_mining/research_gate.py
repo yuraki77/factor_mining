@@ -161,20 +161,30 @@ def build_research_survivor_records(
         current_trades = int(result.oos_trade_count)
         required_additional = max(0, min_trades - current_trades)
         fdr_pvalue = float(fdr_map.get(result.experiment_id, combined_ic_tstat_pvalue(result.ic_tstat_nw, result.rankic_tstat_nw)))
-        promotion_ready = fdr_pvalue < promotion_fdr and current_trades >= min_trades
+        # This record's paper-trade clock starts at `now`; the store's upsert
+        # preserves an older stored clock, and the authoritative days check
+        # runs against it in _update_research_survivor_store. A freshly built
+        # record therefore can never be promotion_ready when days are required.
+        paper_trade_start = now
+        elapsed_days = (now - paper_trade_start).days
+        promotion_ready = (
+            fdr_pvalue < promotion_fdr
+            and current_trades >= min_trades
+            and elapsed_days >= required_days
+        )
         records.append(
             ResearchSurvivorRecord(
                 candidate_id=gate.candidate_id,
                 experiment_id=gate.experiment_id,
                 status="active",
                 candidate_payload=candidate_payload,
-                paper_trade_start_date=now,
+                paper_trade_start_date=paper_trade_start,
                 last_evaluated_at=now,
                 current_trades=current_trades,
                 required_additional_trades=required_additional,
                 required_oos_days=required_days,
                 recheck_trigger=_recheck_trigger(required_additional),
-                promotion_criteria=f"NW FDR P < {promotion_fdr:.2f} AND trades >= {min_trades}",
+                promotion_criteria=f"NW FDR P < {promotion_fdr:.2f} AND trades >= {min_trades} AND paper_days >= {required_days}",
                 promotion_ready=promotion_ready,
                 survivor_reason=",".join(gate.reasons),
                 research_score=gate.research_score,

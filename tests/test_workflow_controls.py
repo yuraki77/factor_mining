@@ -1,10 +1,12 @@
+from datetime import datetime, timedelta
+
 import numpy as np
 import pandas as pd
 from typer.testing import CliRunner
 
 from factor_mining.cli import app
 from factor_mining.config import DataConfig, Settings
-from factor_mining.models import BacktestResult, CandidateStrategySpec, MetricsBlock, ResearchSurvivorRecord
+from factor_mining.models import UTC, BacktestResult, CandidateStrategySpec, MetricsBlock, ResearchSurvivorRecord
 from factor_mining.pipeline import MarketDataContext, PipelineResult, verify_research_survivors
 from factor_mining.storage import MetadataStore
 from factor_mining.ui import _run_args
@@ -74,6 +76,9 @@ def test_verify_research_survivors_promotes_without_recording_new_trials(tmp_pat
             experiment_id="exp-old",
             status="active",
             candidate_payload=candidate.model_dump(mode="json"),
+            # Aged past required_oos_days: promotion needs a matured
+            # paper-trade clock in addition to FDR + trade criteria (A4).
+            paper_trade_start_date=datetime.now(UTC) - timedelta(days=120),
         )
     ])
 

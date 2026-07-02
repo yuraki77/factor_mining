@@ -214,7 +214,7 @@ def test_research_survivor_record_tracks_underpowered_high_edge_candidate() -> N
     assert records[0].sharpe == 3.93
     assert records[0].dsr == 3.897
     assert round(records[0].cost_margin_bps or 0.0, 2) == 25.77
-    assert records[0].promotion_criteria == "NW FDR P < 0.10 AND trades >= 100"
+    assert records[0].promotion_criteria == "NW FDR P < 0.10 AND trades >= 100 AND paper_days >= 90"
     assert records[0].recheck_trigger == "on_next_round_if_new_trades >= 60"
     assert "statistically_underpowered_survivor" in records[0].survivor_reason
 
@@ -340,3 +340,52 @@ def test_store_update_does_not_promote_on_borrowed_full_slice_trades(tmp_path) -
     loaded = store.list_research_survivors(status=None)
     assert len(loaded) == 1
     assert loaded[0].status == "active"
+
+
+def test_promotion_requires_required_oos_days_elapsed(tmp_path) -> None:
+    """FDR + trades alone must not promote a survivor: it must also have aged
+    required_oos_days since its preserved paper_trade_start_date. Hosted-mode
+    loops re-run on the same data extent, so without the day clock a survivor
+    can be promoted without ever seeing a bar it was not mined on."""
+    from datetime import timedelta
+
+    from factor_mining.pipeline import _update_research_survivor_store
+
+    settings = Settings()
+    candidate, result = _survivor_fixture(oos_trades=150, full_trades=150)
+    research = evaluate_research_gate(result=result, gatecheck=_failed_gate(result.experiment_id), evidence=None)
+    assert research.status == "research_survivor"
+    record = build_research_survivor_records(
+        candidates_by_id={candidate.candidate_id: candidate},
+        results=[result],
+        research_gates=[research],
+        fdr_map={result.experiment_id: 0.01},
+        settings=settings,
+    )[0]
+    # Statistical criteria are met, but a fresh record has zero paper-trade days.
+    assert record.promotion_ready is False
+
+    store = MetadataStore(tmp_path / "meta.sqlite3")
+    store.upsert_research_survivors([record])
+    update_kwargs = dict(
+        store=store,
+        records=[record],
+        rechecked_candidate_ids={candidate.candidate_id},
+        research_gates=[research],
+        results=[result],
+        fdr_map={result.experiment_id: 0.01},
+        settings=settings,
+    )
+
+    _update_research_survivor_store(
+        now=record.paper_trade_start_date + timedelta(days=1), **update_kwargs
+    )
+    assert store.list_research_survivors(status=None)[0].status == "active"
+
+    _update_research_survivor_store(
+        now=record.paper_trade_start_date + timedelta(days=record.required_oos_days + 1),
+        **update_kwargs,
+    )
+    promoted = store.list_research_survivors(status=None)[0]
+    assert promoted.status == "promoted"
+    assert promoted.status_reason == "promotion_criteria_met"
