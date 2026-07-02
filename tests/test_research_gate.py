@@ -264,3 +264,79 @@ def test_research_survivor_store_preserves_paper_trade_start_and_updates_status(
 
     assert promoted[0].status == "promoted"
     assert promoted[0].status_reason == "promotion_criteria_met"
+
+
+def _survivor_fixture(*, oos_trades: int, full_trades: int) -> tuple[CandidateStrategySpec, BacktestResult]:
+    candidate = CandidateStrategySpec(
+        candidate_id="cand-oos-zero",
+        hypothesis_id="hyp-1",
+        method_id="factor_scoring",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+        market="um_futures",
+    )
+    result = _result(candidate.candidate_id).model_copy(update={
+        "metrics_primary": MetricsBlock(sharpe=1.2, trade_count=full_trades),
+        "metrics_gross": MetricsBlock(sharpe=1.6),
+        "break_even_cost_bps": 12.0,
+        "actual_cost_bps": 2.0,
+        "oos_trade_count": oos_trades,
+    })
+    return candidate, result
+
+
+def test_survivor_zero_oos_trades_never_borrows_full_slice_count() -> None:
+    """Promotion progress must be earned on OOS trades. A result whose OOS
+    window produced zero trades must not substitute the full-slice trade
+    count (the old falsy `or` fallback), which flipped promotion_ready on
+    trades the holdout never saw."""
+    settings = Settings()
+    candidate, result = _survivor_fixture(oos_trades=0, full_trades=500)
+    research = evaluate_research_gate(result=result, gatecheck=_failed_gate(result.experiment_id), evidence=None)
+    assert research.status == "research_survivor"
+
+    records = build_research_survivor_records(
+        candidates_by_id={candidate.candidate_id: candidate},
+        results=[result],
+        research_gates=[research],
+        fdr_map={result.experiment_id: 0.01},
+        settings=settings,
+    )
+
+    assert records[0].current_trades == 0
+    assert records[0].required_additional_trades == settings.gatecheck.min_oos_trades
+    assert records[0].promotion_ready is False
+
+
+def test_store_update_does_not_promote_on_borrowed_full_slice_trades(tmp_path) -> None:
+    """The store-side promotion flip must apply the same OOS-only rule: a
+    survivor rechecked with 0 OOS trades stays active regardless of how many
+    trades the full slice produced."""
+    from factor_mining.pipeline import _update_research_survivor_store
+
+    settings = Settings()
+    candidate, result = _survivor_fixture(oos_trades=0, full_trades=500)
+    research = evaluate_research_gate(result=result, gatecheck=_failed_gate(result.experiment_id), evidence=None)
+    record = build_research_survivor_records(
+        candidates_by_id={candidate.candidate_id: candidate},
+        results=[result],
+        research_gates=[research],
+        fdr_map={result.experiment_id: 0.01},
+        settings=settings,
+    )[0]
+    store = MetadataStore(tmp_path / "meta.sqlite3")
+    store.upsert_research_survivors([record])
+
+    _update_research_survivor_store(
+        store=store,
+        records=[record],
+        rechecked_candidate_ids={candidate.candidate_id},
+        research_gates=[research],
+        results=[result],
+        fdr_map={result.experiment_id: 0.01},
+        settings=settings,
+    )
+
+    loaded = store.list_research_survivors(status=None)
+    assert len(loaded) == 1
+    assert loaded[0].status == "active"

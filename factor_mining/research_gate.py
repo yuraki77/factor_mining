@@ -156,7 +156,9 @@ def build_research_survivor_records(
             continue
         candidate = candidates_by_id.get(gate.candidate_id)
         candidate_payload = candidate.model_dump(mode="json") if hasattr(candidate, "model_dump") else {}
-        current_trades = int(result.oos_trade_count or result.metrics_primary.trade_count)
+        # Strictly the OOS count: zero OOS trades means zero promotion progress.
+        # (The old falsy `or` fallback substituted the full-slice trade count.)
+        current_trades = int(result.oos_trade_count)
         required_additional = max(0, min_trades - current_trades)
         fdr_pvalue = float(fdr_map.get(result.experiment_id, combined_ic_tstat_pvalue(result.ic_tstat_nw, result.rankic_tstat_nw)))
         promotion_ready = fdr_pvalue < promotion_fdr and current_trades >= min_trades

@@ -3801,7 +3801,9 @@ def _update_research_survivor_store(
         result = result_by_candidate.get(candidate_id)
         if gate is None or result is None:
             continue
-        current_trades = int(result.oos_trade_count or result.metrics_primary.trade_count)
+        # Strictly the OOS count — promotion/retirement progress must be earned
+        # on OOS trades, never borrowed from the full-slice trade count.
+        current_trades = int(result.oos_trade_count)
         fdr_pvalue = float(fdr_map.get(result.experiment_id, combined_ic_tstat_pvalue(result.ic_tstat_nw, result.rankic_tstat_nw)))
         if gate.status == "production_passed":
             store.update_research_survivor_status(candidate_id, "promoted", "production_gate_passed")
