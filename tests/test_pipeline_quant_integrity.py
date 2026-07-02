@@ -153,13 +153,44 @@ def test_run_pipeline_executes_symbol_rounds_in_parallel(monkeypatch) -> None:
             metrics_primary=MetricsBlock(sharpe=0.0),
             pbo=0.2,
         )
+        gate = GateCheckResult(
+            experiment_id=result.experiment_id,
+            candidate_id=candidate.candidate_id,
+            passed=True,
+            items=[],
+            risk_tier="full_pass",
+        )
         return pipeline.RoundOutput(
             candidates=[candidate],
             backtests=[result],
+            gatechecks=[gate],
             history_entry={"symbol": candidate.symbol},
         )
 
     monkeypatch.setattr(pipeline, "_run_mining_round", fake_round)
+
+    def fake_terminal(*, candidates, gatechecks, **kwargs):
+        passed_ids = {gate.candidate_id for gate in gatechecks if gate.passed}
+        survivors = [candidate for candidate in candidates if candidate.candidate_id in passed_ids]
+        return pipeline.TerminalOutput(
+            candidates=survivors,
+            backtests=[
+                BacktestResult(
+                    experiment_id=f"terminal-{candidate.symbol}",
+                    candidate_id=candidate.candidate_id,
+                    hypothesis_family=candidate.hypothesis_family,
+                    method_id=candidate.method_id,
+                    symbol=candidate.symbol,
+                    market=candidate.market,
+                    interval=candidate.interval,
+                    metrics_primary=MetricsBlock(sharpe=0.0),
+                    pbo=0.2,
+                )
+                for candidate in survivors
+            ],
+        )
+
+    monkeypatch.setattr(pipeline, "_evaluate_final_holdout", fake_terminal)
 
     result = run_pipeline(
         Settings(data=DataConfig(symbols=["BTCUSDT", "ETHUSDT"])),
@@ -169,7 +200,10 @@ def test_run_pipeline_executes_symbol_rounds_in_parallel(monkeypatch) -> None:
         archive_top=0,
     )
 
+    # Both symbol groups' round-gate survivors reach the terminal holdout, and
+    # the run's headline backtests are the terminal outputs.
     assert {backtest.symbol for backtest in result.backtests} == {"BTCUSDT", "ETHUSDT"}
+    assert all(backtest.experiment_id.startswith("terminal-") for backtest in result.backtests)
     assert max_workers_seen == [1, 1]
 
 
@@ -2217,3 +2251,120 @@ def test_trial_counts_snapshot_serializes_with_writers() -> None:
     assert out[0] is not shared, "snapshot must be a copy, not the live dict"
     # Single-threaded path (no lock): the live dict is safe to use directly.
     assert pipeline._trial_counts_snapshot(shared, None) is shared
+
+
+def test_terminal_holdout_evaluates_survivors_once_with_cumulative_fdr(monkeypatch) -> None:
+    """The terminal holdout must (a) evaluate only candidates whose *latest*
+    round gate passed, (b) backtest only the final-OOS window and only once,
+    (c) run FDR at cumulative cross-round family multiplicity (Q15), and
+    (d) raise the DSR penalty to the run-wide effective trial count. This is
+    the only path allowed to read the holdout."""
+    import factor_mining.hardscore as hardscore_module
+    import factor_mining.validation.gatecheck as gatecheck_module
+
+    winner = _candidate("c_pass", "BTCUSDT")
+    loser = _candidate("c_fail", "BTCUSDT")
+    context = _context_for(winner)
+    frame = context.frame
+
+    def _gate(candidate_id: str, passed: bool) -> GateCheckResult:
+        return GateCheckResult(
+            experiment_id=f"exp-{candidate_id}",
+            candidate_id=candidate_id,
+            passed=passed,
+            items=[],
+        )
+
+    # Latest gate wins: winner failed round 1 then passed round 2; loser passed
+    # round 1 then failed round 2.
+    gatechecks = [
+        _gate("c_pass", False),
+        _gate("c_fail", True),
+        _gate("c_pass", True),
+        _gate("c_fail", False),
+    ]
+
+    backtest_window_starts: list[int] = []
+
+    def fake_build_tasks(candidates, frame_arg, *args, trial_counts_by_candidate=None, **kwargs):
+        trial_counts_by_candidate = trial_counts_by_candidate or {}
+        return [
+            (
+                np.ones(len(frame_arg)),
+                item.model_dump(mode="json"),
+                idx,
+                trial_counts_by_candidate.get(item.candidate_id, {}),
+                [],
+            )
+            for idx, item in enumerate(candidates)
+        ]
+
+    def fake_backtests(tasks, frame_arg, settings_arg, max_workers, funding_df=None):
+        backtest_window_starts.append(int(frame_arg["open_time"].iloc[0]))
+        results = []
+        for _signal, candidate_dict, _idx, trial_counts, _notes in tasks:
+            item = CandidateStrategySpec.model_validate(candidate_dict)
+            results.append(
+                BacktestResult(
+                    experiment_id=f"exp-terminal-{item.candidate_id}",
+                    candidate_id=item.candidate_id,
+                    hypothesis_family=item.hypothesis_family,
+                    method_id=item.method_id,
+                    symbol=item.symbol,
+                    market=item.market,
+                    interval=item.interval,
+                    metrics_primary=MetricsBlock(sharpe=1.0, trade_count=50),
+                    ic_tstat_nw=4.0,
+                    rankic_tstat_nw=4.0,
+                    effective_trials_at_eval=int(trial_counts.get("effective_trials_count", 1)),
+                )
+            )
+        return results
+
+    monkeypatch.setattr(pipeline, "_build_tasks", fake_build_tasks)
+    monkeypatch.setattr(pipeline, "_run_backtests_parallel", fake_backtests)
+    monkeypatch.setattr(pipeline, "_apply_batch_pbo", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "build_factor_evidence_reports", lambda **kwargs: [])
+    monkeypatch.setattr(
+        hardscore_module,
+        "hardscore",
+        lambda result, gatecheck, **kwargs: HardScoreReport(
+            experiment_id=result.experiment_id,
+            score=1.0,
+            haircut_sharpe=0.5,
+            fdr_adjusted_pvalue=0.01,
+            prior_posterior_ic_ratio=1.0,
+            effective_trials_count=1,
+            global_cumulative_trials_count=1,
+        ),
+    )
+
+    captured: dict = {}
+    real_apply_fdr = gatecheck_module.apply_fdr
+
+    def spy_apply_fdr(results, settings_arg, **kwargs):
+        captured.update(kwargs)
+        return real_apply_fdr(results, settings_arg, **kwargs)
+
+    monkeypatch.setattr(gatecheck_module, "apply_fdr", spy_apply_fdr)
+
+    out = pipeline._evaluate_final_holdout(
+        candidates=[winner, loser],
+        gatechecks=gatechecks,
+        data_contexts={pipeline._data_key(winner): context},
+        settings=Settings(data=DataConfig(symbols=["BTCUSDT"])),
+        cumulative_trial_counts={"momentum": 37},
+        store=None,
+        max_workers=1,
+        survivor_candidate_ids=set(),
+        tested_candidates=5,
+    )
+
+    base_time = int(frame["open_time"].iloc[0])
+    bar_ms = int(frame["open_time"].iloc[1]) - base_time
+    final_start = base_time + 80 * bar_ms
+    assert backtest_window_starts == [final_start], "terminal must touch only the final window, once"
+    assert [result.candidate_id for result in out.backtests] == ["c_pass"]
+    assert captured.get("family_test_counts") == {"momentum": 37}
+    assert out.backtests[0].effective_trials_at_eval >= 37
+    assert len(out.gatechecks) == 1 and len(out.hardscores) == 1

@@ -120,6 +120,20 @@ class RoundOutput:
 
 
 @dataclass
+class TerminalOutput:
+    """Result of the single terminal final-OOS holdout evaluation (Q3)."""
+
+    candidates: list[CandidateStrategySpec] = field(default_factory=list)
+    backtests: list[BacktestResult] = field(default_factory=list)
+    gatechecks: list[GateCheckResult] = field(default_factory=list)
+    hardscores: list[HardScoreReport] = field(default_factory=list)
+    factor_evidence: list[FactorEvidenceReport] = field(default_factory=list)
+    research_gates: list[ResearchGateResult] = field(default_factory=list)
+    research_survivors: list[dict[str, Any]] = field(default_factory=list)
+    fdr_map: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
 class MarketDataContext:
     symbol: str
     market: str
@@ -1131,15 +1145,37 @@ def _run_pipeline_impl(
 
         current_candidates = new_candidates
 
+    # ── Terminal holdout evaluation (Q3) ────────────────────────────
+    # The single final-OOS pass: rounds gated on the validation slice, so the
+    # holdout answers once, for the survivors only, with cross-round FDR
+    # multiplicity. These terminal results ARE the run's headline results.
+    _step_header(3 + round_num, "Terminal holdout evaluation")
+    terminal = _evaluate_final_holdout(
+        candidates=all_retained_candidates,
+        gatechecks=all_gatechecks,
+        data_contexts=data_contexts,
+        settings=settings,
+        cumulative_trial_counts=cumulative_trial_counts,
+        store=store,
+        max_workers=max_workers,
+        survivor_candidate_ids=survivor_candidate_ids,
+        tested_candidates=len({r.candidate_id for r in all_backtests}),
+        run_id=run_id,
+        stop_event=stop_event,
+    )
+    all_research_survivors.extend(terminal.research_survivors)
+
     # ── Assemble final result ───────────────────────────────────────
-    result.candidates = all_retained_candidates
-    result.backtests = all_backtests
-    result.gatechecks = all_gatechecks
-    result.hardscores = all_hardscores
-    result.factor_evidence = all_factor_evidence
-    result.research_gates = all_research_gates
+    # result.* carry the terminal holdout evaluation; per-round (validation
+    # slice) outputs live in optimization_history and the round artifacts.
+    result.candidates = terminal.candidates
+    result.backtests = terminal.backtests
+    result.gatechecks = terminal.gatechecks
+    result.hardscores = terminal.hardscores
+    result.factor_evidence = terminal.factor_evidence
+    result.research_gates = terminal.research_gates
     result.near_misses = all_near_misses
-    result.n_gatecheck_passed = sum(1 for g in all_gatechecks if g.passed)
+    result.n_gatecheck_passed = sum(1 for g in terminal.gatechecks if g.passed)
     result.total_rounds = round_num
 
     if store:
@@ -1440,6 +1476,182 @@ def _run_gatechecks(
         gatechecks.append(run_gatecheck(backtest, settings, method=method, fdr_adjusted_pvalue=fdr_p))
     apply_risk_stratified_gatechecks(backtests, gatechecks, evidence, settings)
     return gatechecks, fdr_map
+
+
+def _evaluate_final_holdout(
+    *,
+    candidates: list[CandidateStrategySpec],
+    gatechecks: list[GateCheckResult],
+    data_contexts: dict[tuple[str, str], MarketDataContext],
+    settings: Settings,
+    cumulative_trial_counts: dict[str, int],
+    store: MetadataStore | None,
+    max_workers: int | None,
+    survivor_candidate_ids: set[str],
+    tested_candidates: int,
+    run_id: str | None = None,
+    stop_event: threading.Event | None = None,
+) -> TerminalOutput:
+    """Evaluate round-gate survivors on the final-OOS holdout, exactly once per run (Q3).
+
+    Survivors are candidates whose latest round gatecheck passed (full or
+    conditional) on the validation slice. This is the only code path that
+    backtests the final window, and its FDR multiplicity is the cumulative
+    cross-round family trial count (Q15) — the holdout p-values answer for the
+    whole search that produced the survivors, and the DSR penalty is raised to
+    the run-wide effective trial count."""
+    latest_gate_by_candidate: dict[str, GateCheckResult] = {}
+    for gate in gatechecks:
+        latest_gate_by_candidate[gate.candidate_id] = gate
+    survivors = _dedupe_candidates([
+        candidate for candidate in candidates
+        if (gate := latest_gate_by_candidate.get(candidate.candidate_id)) is not None and gate.passed
+    ])
+    output = TerminalOutput()
+    if not survivors:
+        _log("Terminal holdout: no round-gate survivors to evaluate")
+        return output
+    _log(f"Terminal holdout: evaluating {len(survivors)} round-gate survivors on the untouched final-OOS window")
+
+    trial_counts_snapshot = dict(cumulative_trial_counts)
+    run_effective_trials = _merge_pool_effective_trials(
+        [],
+        trial_counts_snapshot,
+        tested_candidates=tested_candidates,
+    )
+
+    for key, group_candidates in _group_candidates_by_data(survivors).items():
+        _check_stop(stop_event)
+        context = data_contexts.get(key)
+        if context is None:
+            _log(f"  Terminal holdout skip {key[0]}/{key[1]}: no data context")
+            continue
+        split_plan = _build_data_split_plan(
+            context.frame,
+            regimes=context.forward_regimes,
+            purge_bars=settings.walk_forward.purge_bars_floor,
+            embargo_bars=settings.walk_forward.embargo_bars,
+        )
+        final_frame = _masked_frame(context.frame, split_plan.final_oos_mask)
+        final_regimes = _masked_series(context.forward_regimes, split_plan.final_oos_mask)
+        final_funding_rate = (
+            _masked_series(context.funding_rate, split_plan.final_oos_mask)
+            if context.funding_rate is not None
+            else None
+        )
+
+        # Read-only trial snapshots (ledger-backed when a store exists); the
+        # terminal evaluation is confirmatory and must not record new trials.
+        counts_by_candidate = _candidate_trial_count_snapshots(group_candidates, store, settings)
+        for candidate in group_candidates:
+            counts = counts_by_candidate.get(candidate.candidate_id)
+            in_memory = int(trial_counts_snapshot.get(candidate.hypothesis_family, 0))
+            if counts is not None and in_memory > 0:
+                counts["family_trials_count"] = max(int(counts["family_trials_count"]), in_memory)
+                counts["effective_trials_count"] = max(int(counts["effective_trials_count"]), in_memory)
+
+        full_tasks = _build_tasks(
+            group_candidates,
+            context.frame,
+            context.features_df,
+            context.feature_meta,
+            context.forward_regimes,
+            context.funding_rate,
+            trial_counts_by_candidate=counts_by_candidate,
+            data_quality_notes=context.data_quality_notes,
+            max_workers=max_workers,
+        )
+        final_tasks = _slice_tasks(full_tasks, split_plan.final_oos_mask)
+        final_backtests = _run_backtests_parallel(final_tasks, final_frame, settings, max_workers, context.funding_df)
+        if not final_backtests:
+            _log(f"  Terminal holdout {context.symbol}/{context.market}: no results")
+            continue
+        _apply_batch_pbo(final_frame, final_tasks, final_backtests, settings, context.funding_df)
+        for result in final_backtests:
+            # Q9: wire G11's split-overlap signal to the actual purge geometry.
+            result.split_overlap_detected = not split_plan.gaps_honored
+        _apply_merge_pool_trial_penalty(
+            final_backtests,
+            effective_trials_count=run_effective_trials,
+            observations=len(final_frame),
+        )
+
+        result_ids = {result.candidate_id for result in final_backtests}
+        group_evaluated = [c for c in group_candidates if c.candidate_id in result_ids]
+        group_evidence = build_factor_evidence_reports(
+            frame=final_frame,
+            tasks=final_tasks,
+            candidates=group_evaluated,
+            results=final_backtests,
+            settings=settings,
+            forward_regimes=final_regimes,
+            funding_rate=final_funding_rate,
+            funding_df=context.funding_df,
+        )
+        group_gatechecks, fdr_map = _run_gatechecks(
+            final_backtests,
+            group_evidence,
+            settings,
+            family_test_counts=_family_test_counts_from_snapshots(group_evaluated, counts_by_candidate),
+        )
+        group_research_gates = apply_research_gate(final_backtests, group_gatechecks, group_evidence)
+        candidates_by_id = {candidate.candidate_id: candidate for candidate in group_evaluated}
+        persistent_records = build_research_survivor_records(
+            candidates_by_id=candidates_by_id,
+            results=final_backtests,
+            research_gates=group_research_gates,
+            fdr_map=fdr_map,
+            settings=settings,
+        )
+        survivor_payloads = research_survivor_payloads(candidates_by_id, final_backtests, group_research_gates)
+        _augment_research_survivor_payloads(survivor_payloads, persistent_records)
+        if store:
+            _update_research_survivor_store(
+                store=store,
+                records=persistent_records,
+                rechecked_candidate_ids=survivor_candidate_ids & result_ids,
+                research_gates=group_research_gates,
+                results=final_backtests,
+                fdr_map=fdr_map,
+                settings=settings,
+                allow_promotion=True,
+            )
+
+        from factor_mining.hardscore import hardscore
+
+        group_hardscores = []
+        for result, gate in zip(final_backtests, group_gatechecks, strict=True):
+            fdr_p = fdr_map.get(
+                result.experiment_id,
+                combined_ic_tstat_pvalue(result.ic_tstat_nw, result.rankic_tstat_nw),
+            )
+            group_hardscores.append(hardscore(result, gate, fdr_adjusted_pvalue=fdr_p, settings=settings))
+
+        n_passed = sum(1 for gate in group_gatechecks if gate.passed)
+        _log(
+            f"  Terminal holdout {context.symbol}/{context.market}: "
+            f"{len(final_backtests)} evaluated, {n_passed} production gate passed "
+            f"(FDR n_tests from cumulative family trials)"
+        )
+
+        output.candidates.extend(group_evaluated)
+        output.backtests.extend(final_backtests)
+        output.gatechecks.extend(group_gatechecks)
+        output.hardscores.extend(group_hardscores)
+        output.factor_evidence.extend(group_evidence)
+        output.research_gates.extend(group_research_gates)
+        output.research_survivors.extend(survivor_payloads)
+        output.fdr_map.update(fdr_map)
+
+    if store:
+        store.save_artifact(f"terminal_holdout_{run_id or uuid.uuid4().hex[:12]}", "terminal_holdout", {
+            "candidates": [c.model_dump(mode="json") for c in output.candidates],
+            "backtests": [r.model_dump(mode="json") for r in output.backtests],
+            "gatechecks": [g.model_dump(mode="json") for g in output.gatechecks],
+            "research_gate": [g.model_dump(mode="json") for g in output.research_gates],
+            "research_survivors": output.research_survivors,
+        })
+    return output
 
 
 def _run_mining_round(
