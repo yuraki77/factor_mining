@@ -1227,7 +1227,7 @@ def _run_pipeline_impl(
             if pruned:
                 _log(f"Pruned {pruned} stale experiment detail artifacts")
 
-    # Archive top experiments across all rounds
+    # Archive top experiments from the terminal holdout evaluation
     archived = 0
     if archive_top > 0:
         archived = _archive_top(result, settings, archive_top)
@@ -1237,8 +1237,8 @@ def _run_pipeline_impl(
     _log(f"PIPELINE COMPLETE in {result.elapsed_s:.0f}s")
     _log(f"  Rounds:       {result.total_rounds}")
     _log(f"  Hypotheses:   {len(result.hypotheses)}")
-    _log(f"  Backtests:    {len(result.backtests)}")
-    _log(f"  GateCheck OK: {result.n_gatecheck_passed}/{len(result.gatechecks)}")
+    _log(f"  Terminal holdout backtests: {len(result.backtests)}")
+    _log(f"  GateCheck OK (holdout): {result.n_gatecheck_passed}/{len(result.gatechecks)}")
     _log(f"  HardScore >0: {sum(1 for s in result.hardscores if s.score > 0)}")
     _log(f"  Archived:     {archived}")
     if result.optimization_history:
@@ -5172,7 +5172,12 @@ def _is_repair_candidate(candidate: CandidateStrategySpec) -> bool:
 
 
 def _archive_top(result: PipelineResult, settings: Settings, archive_top: int) -> int:
-    """Archive the top-scoring experiments across all rounds."""
+    """Archive the top-scoring terminal-holdout experiments.
+
+    result.candidates/backtests/hardscores are the terminal final-OOS outputs
+    (aligned by construction in _evaluate_final_holdout), so archived
+    metrics_primary keeps its meaning for downstream consumers: the final-OOS
+    backtest of the candidate."""
     from factor_mining.archive import archive_experiment
     from factor_mining.data.loader import data_extent
 
