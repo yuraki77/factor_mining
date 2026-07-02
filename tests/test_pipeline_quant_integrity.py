@@ -2158,3 +2158,37 @@ def test_gatecheck_diagnostics_summarizes_failures_and_costs() -> None:
     assert top["search_variant"] == "low_turnover"
     assert top["cost_drag_sharpe"] == 1.5
     assert top["cost_margin_bps"] == -2.0
+
+
+def test_serial_backtest_path_ignores_worker_global_stomp(monkeypatch) -> None:
+    """Symbol groups run in a ThreadPoolExecutor and small batches take the
+    serial (n_workers==1) backtest path. That path must evaluate against the
+    frame it was handed — not the process-worker module globals — otherwise a
+    concurrent symbol group re-initializing the worker context makes this
+    group's candidates silently backtest on the *other symbol's* data."""
+    import factor_mining.backtest.engine as engine_module
+
+    frame_a = _frame(100)
+    frame_b = _frame(100)
+    frame_b["close"] = frame_b["close"] * 2.0
+    frames_seen: list[bool] = []
+
+    def fake_run_backtest(frame, signal, candidate, settings, **kwargs):
+        frames_seen.append(frame is frame_a)
+        # Simulate another symbol-group thread initializing the worker
+        # context with its own frame between this batch's tasks.
+        pipeline._init_worker(frame_b, settings, None)
+        return _result(f"exp-{candidate.candidate_id}", candidate.candidate_id, pbo=0.1, sharpe=1.0)
+
+    monkeypatch.setattr(engine_module, "run_backtest", fake_run_backtest)
+
+    candidates = [_candidate("c_serial_1", "BTCUSDT"), _candidate("c_serial_2", "BTCUSDT")]
+    tasks = [
+        (np.zeros(len(frame_a)), candidate.model_dump(mode="json"), idx, {"effective_trials_count": 1}, [])
+        for idx, candidate in enumerate(candidates)
+    ]
+
+    results = _run_backtests_parallel(tasks, frame_a, Settings(), max_workers=1)
+
+    assert len(results) == 2
+    assert frames_seen == [True, True], "serial path leaked to the stomped worker globals"

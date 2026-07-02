@@ -252,27 +252,38 @@ def _init_worker(frame: pd.DataFrame, settings: Settings, funding_df: pd.DataFra
     _worker_funding = funding_df
 
 
-def _run_one_backtest(args: tuple) -> BacktestResult | Exception:
-    global _worker_frame, _worker_settings
+def _execute_backtest_task(
+    args: tuple,
+    frame: pd.DataFrame,
+    settings: Settings,
+    funding_df: pd.DataFrame | None,
+) -> BacktestResult | Exception:
     signal_arr, candidate_dict, trial_counts, data_quality_note_dicts = args
     from factor_mining.backtest.engine import run_backtest
     from factor_mining.models import CandidateStrategySpec, DataQualityNote
 
     candidate = CandidateStrategySpec.model_validate(candidate_dict)
-    signal = pd.Series(signal_arr, index=_worker_frame.index)
+    signal = pd.Series(signal_arr, index=frame.index)
     data_quality_notes = [DataQualityNote.model_validate(item) for item in data_quality_note_dicts]
     try:
         return run_backtest(
-            _worker_frame,
+            frame,
             signal,
             candidate,
-            _worker_settings,
+            settings,
             trial_counts=trial_counts,
             data_quality_notes=data_quality_notes,
-            funding=_worker_funding,
+            funding=funding_df,
         )
     except Exception as exc:
         return exc
+
+
+def _run_one_backtest(args: tuple) -> BacktestResult | Exception:
+    # Process-pool entry point: the per-process context is set by _init_worker.
+    # In-process (serial) callers must use _execute_backtest_task with explicit
+    # arguments instead — module globals are shared across symbol-group threads.
+    return _execute_backtest_task(args, _worker_frame, _worker_settings, _worker_funding)
 
 
 # ── main pipeline ───────────────────────────────────────────────────
@@ -4796,10 +4807,9 @@ def _run_backtests_parallel(
     slim_tasks = [(arr, cdict, trial_counts, notes) for arr, cdict, _, trial_counts, notes in tasks]
 
     if n_workers <= 1:
-        _init_worker(frame, settings, funding_df)
         for idx, task in enumerate(slim_tasks):
             c = CandidateStrategySpec.model_validate(tasks[idx][1])
-            out = _run_one_backtest(task)
+            out = _execute_backtest_task(task, frame, settings, funding_df)
             if isinstance(out, Exception):
                 _log(f"  [{idx + 1}/{len(tasks)}] {c.candidate_id[:16]}... SKIP: {out}")
             else:
