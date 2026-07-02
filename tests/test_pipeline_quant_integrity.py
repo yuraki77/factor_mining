@@ -153,19 +153,11 @@ def test_run_pipeline_executes_symbol_rounds_in_parallel(monkeypatch) -> None:
             metrics_primary=MetricsBlock(sharpe=0.0),
             pbo=0.2,
         )
-        return {
-            "candidates": [candidate],
-            "backtests": [result],
-            "gatechecks": [],
-            "hardscores": [],
-            "factor_evidence": [],
-            "research_gates": [],
-            "near_misses": [],
-            "new_candidates": [],
-            "research_survivors": [],
-            "detail_artifact_ids": [],
-            "history_entry": {"symbol": candidate.symbol},
-        }
+        return pipeline.RoundOutput(
+            candidates=[candidate],
+            backtests=[result],
+            history_entry={"symbol": candidate.symbol},
+        )
 
     monkeypatch.setattr(pipeline, "_run_mining_round", fake_round)
 
@@ -228,19 +220,12 @@ def test_split_round_controls_disable_repairs_and_stop_on_optimizer_convergence(
             "smooth_span": 48,
             "signal_threshold": 0.25,
         })
-        return {
-            "candidates": [current],
-            "backtests": [result],
-            "gatechecks": [],
-            "hardscores": [],
-            "factor_evidence": [],
-            "research_gates": [],
-            "near_misses": [],
-            "new_candidates": [next_candidate],
-            "research_survivors": [],
-            "detail_artifact_ids": [],
-            "history_entry": {"phase": phase, "num_candidates": 1, "num_backtests": 1},
-        }
+        return pipeline.RoundOutput(
+            candidates=[current],
+            backtests=[result],
+            new_candidates=[next_candidate],
+            history_entry={"phase": phase, "num_candidates": 1, "num_backtests": 1},
+        )
 
     monkeypatch.setattr(pipeline, "_run_mining_round", fake_round)
 
@@ -408,7 +393,7 @@ def test_mining_round_skips_discovery_pbo_and_uses_validation_pbo(monkeypatch) -
     )
 
     assert pbo_frame_lengths == [20]
-    assert round_data["backtests"][0].pbo == 0.2
+    assert round_data.backtests[0].pbo == 0.2
 
 
 def _signal_build_inputs() -> tuple[

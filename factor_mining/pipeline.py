@@ -98,6 +98,28 @@ class PipelineResult:
 
 
 @dataclass
+class RoundOutput:
+    """Typed contract for one mining round of one symbol/market group.
+
+    Replaces the former 11-key dict so the round boundary is explicit: the
+    parent loop, checkpoint early-returns, and tests all construct or consume
+    the same shape, and a missing field is a TypeError instead of a silent
+    KeyError-with-default."""
+
+    candidates: list[CandidateStrategySpec] = field(default_factory=list)
+    backtests: list[BacktestResult] = field(default_factory=list)
+    gatechecks: list[GateCheckResult] = field(default_factory=list)
+    hardscores: list[HardScoreReport] = field(default_factory=list)
+    factor_evidence: list[FactorEvidenceReport] = field(default_factory=list)
+    research_gates: list[ResearchGateResult] = field(default_factory=list)
+    near_misses: list[NearMissAnalysis] = field(default_factory=list)
+    new_candidates: list[CandidateStrategySpec] = field(default_factory=list)
+    research_survivors: list[dict[str, Any]] = field(default_factory=list)
+    detail_artifact_ids: list[str] = field(default_factory=list)
+    history_entry: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class MarketDataContext:
     symbol: str
     market: str
@@ -516,6 +538,52 @@ def _load_stage_checkpoint(
         raise ValueError(f"Checkpoint {artifact_id} fingerprint mismatch")
     payload = artifact.get("payload")
     return payload if isinstance(payload, dict) else None
+
+
+def _checkpointed_stage(
+    store: MetadataStore | None,
+    *,
+    resume_source: str | None,
+    run_id: str | None,
+    round_num: int,
+    symbol: str,
+    market: str,
+    stage: str,
+    fingerprint: dict[str, Any],
+    log_label: str,
+    decode: Callable[[dict], Any],
+    compute: Callable[[], list[Any]],
+    encode: Callable[[Any], dict],
+) -> list[Any]:
+    """Load a stage's items from its resume checkpoint, or compute and save them.
+
+    ``compute`` must include any post-processing that belongs to the stage's
+    persisted state (the checkpoint stores its output verbatim)."""
+    checkpoint = _load_stage_checkpoint(
+        store,
+        resume_source,
+        round_num=round_num,
+        symbol=symbol,
+        market=market,
+        stage=stage,
+        fingerprint=fingerprint,
+    )
+    if checkpoint is not None:
+        items = [decode(item) for item in checkpoint.get("items", [])]
+        _log(f"  {log_label}: resumed {len(items)} from checkpoint")
+        return items
+    items = compute()
+    _save_stage_checkpoint(
+        store,
+        run_id,
+        round_num=round_num,
+        symbol=symbol,
+        market=market,
+        stage=stage,
+        fingerprint=fingerprint,
+        payload={"items": [encode(item) for item in items]},
+    )
+    return items
 
 
 def run_pipeline(
@@ -988,7 +1056,7 @@ def _run_pipeline_impl(
                 trial_counts_lock=trial_counts_lock,
             )
 
-        round_data_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        round_data_by_key: dict[tuple[str, str], RoundOutput] = {}
         if symbol_workers > 1:
             _log(
                 f"  Running {len(runnable_groups)} data groups in parallel "
@@ -1008,18 +1076,18 @@ def _run_pipeline_impl(
         for key, _context, _symbol_candidates in runnable_groups:
             round_data = round_data_by_key[key]
 
-            round_backtests.extend(round_data["backtests"])
-            round_gatechecks.extend(round_data["gatechecks"])
-            round_hardscores.extend(round_data["hardscores"])
-            all_factor_evidence.extend(round_data["factor_evidence"])
-            all_research_gates.extend(round_data["research_gates"])
-            all_near_misses.extend(round_data["near_misses"])
-            round_candidates.extend(round_data["candidates"])
-            new_candidates.extend(round_data["new_candidates"])
-            all_research_survivors.extend(round_data.get("research_survivors", []))
-            all_detail_artifact_ids.extend(round_data.get("detail_artifact_ids", []))
-            if round_data["history_entry"]:
-                child_history.append(round_data["history_entry"])
+            round_backtests.extend(round_data.backtests)
+            round_gatechecks.extend(round_data.gatechecks)
+            round_hardscores.extend(round_data.hardscores)
+            all_factor_evidence.extend(round_data.factor_evidence)
+            all_research_gates.extend(round_data.research_gates)
+            all_near_misses.extend(round_data.near_misses)
+            round_candidates.extend(round_data.candidates)
+            new_candidates.extend(round_data.new_candidates)
+            all_research_survivors.extend(round_data.research_survivors)
+            all_detail_artifact_ids.extend(round_data.detail_artifact_ids)
+            if round_data.history_entry:
+                child_history.append(round_data.history_entry)
 
         all_backtests.extend(round_backtests)
         all_gatechecks.extend(round_gatechecks)
@@ -1402,7 +1470,7 @@ def _run_mining_round(
     run_args: dict[str, Any] | None = None,
     stop_event: threading.Event | None = None,
     trial_counts_lock: Any | None = None,
-) -> dict[str, Any]:
+) -> RoundOutput:
     """Execute one complete mining round: backtest → gatecheck → hardscore → optimize."""
     artifact_scope = artifact_scope or f"round{round_num}"
     _check_stop(stop_event)
@@ -1470,33 +1538,20 @@ def _run_mining_round(
         max_workers=max_workers,
     )
     discovery_tasks = _slice_tasks(full_tasks, split_plan.discovery_mask)
-    discovery_checkpoint = _load_stage_checkpoint(
+    discovery_backtests = _checkpointed_stage(
         store,
-        checkpoint_source if resume_run_id else None,
+        resume_source=checkpoint_source if resume_run_id else None,
+        run_id=run_id,
         round_num=round_num,
         symbol=checkpoint_symbol,
         market=checkpoint_market,
         stage="discovery_backtests",
         fingerprint=checkpoint_fingerprint,
+        log_label="Discovery backtests",
+        decode=BacktestResult.model_validate,
+        compute=lambda: _run_backtests_parallel(discovery_tasks, discovery_frame, settings, max_workers, funding_df),
+        encode=lambda result: result.model_dump(mode="json"),
     )
-    if discovery_checkpoint is not None:
-        discovery_backtests = [
-            BacktestResult.model_validate(item)
-            for item in discovery_checkpoint.get("items", [])
-        ]
-        _log(f"  Discovery backtests: resumed {len(discovery_backtests)} from checkpoint")
-    else:
-        discovery_backtests = _run_backtests_parallel(discovery_tasks, discovery_frame, settings, max_workers, funding_df)
-        _save_stage_checkpoint(
-            store,
-            run_id,
-            round_num=round_num,
-            symbol=checkpoint_symbol,
-            market=checkpoint_market,
-            stage="discovery_backtests",
-            fingerprint=checkpoint_fingerprint,
-            payload={"items": [result.model_dump(mode="json") for result in discovery_backtests]},
-        )
 
     # Align candidates with successful backtests
     discovery_backtest_ids = {r.candidate_id for r in discovery_backtests}
@@ -1510,12 +1565,7 @@ def _run_mining_round(
         _check_stop(stop_event)
 
     if not discovery_backtests:
-        return {
-            "candidates": [], "backtests": [], "gatechecks": [], "hardscores": [],
-            "factor_evidence": [], "research_gates": [], "near_misses": [],
-            "new_candidates": [], "research_survivors": [], "detail_artifact_ids": [],
-            "history_entry": {},
-        }
+        return RoundOutput()
 
     # This lightweight evidence pass feeds deterministic repair candidates before
     # repair validation. Repaired candidates still count as trials and must pass a
@@ -1533,43 +1583,31 @@ def _run_mining_round(
 
     pre_gate_candidates: list[CandidateStrategySpec] = []
     if allow_pre_gate_repair:
-        pre_gate_checkpoint = _load_stage_checkpoint(
+        def _compute_pre_gate_candidates() -> list[CandidateStrategySpec]:
+            return _build_pre_gate_repair_candidates(
+                discovery_candidates,
+                discovery_backtests,
+                initial_factor_evidence,
+            ) + _build_local_grid_tuning_candidates(
+                discovery_candidates,
+                discovery_backtests,
+                initial_factor_evidence,
+            )
+
+        pre_gate_candidates = _checkpointed_stage(
             store,
-            checkpoint_source if resume_run_id else None,
+            resume_source=checkpoint_source if resume_run_id else None,
+            run_id=run_id,
             round_num=round_num,
             symbol=checkpoint_symbol,
             market=checkpoint_market,
             stage="pre_gate_candidates",
             fingerprint=checkpoint_fingerprint,
+            log_label="Pre-Gate repair candidates",
+            decode=CandidateStrategySpec.model_validate,
+            compute=_compute_pre_gate_candidates,
+            encode=lambda candidate: candidate.model_dump(mode="json"),
         )
-        if pre_gate_checkpoint is not None:
-            pre_gate_candidates = [
-                CandidateStrategySpec.model_validate(item)
-                for item in pre_gate_checkpoint.get("items", [])
-            ]
-            _log(f"  Pre-Gate repair candidates: resumed {len(pre_gate_candidates)} from checkpoint")
-        else:
-            pre_gate_repairs = _build_pre_gate_repair_candidates(
-                discovery_candidates,
-                discovery_backtests,
-                initial_factor_evidence,
-            )
-            local_tuning_candidates = _build_local_grid_tuning_candidates(
-                discovery_candidates,
-                discovery_backtests,
-                initial_factor_evidence,
-            )
-            pre_gate_candidates = pre_gate_repairs + local_tuning_candidates
-            _save_stage_checkpoint(
-                store,
-                run_id,
-                round_num=round_num,
-                symbol=checkpoint_symbol,
-                market=checkpoint_market,
-                stage="pre_gate_candidates",
-                fingerprint=checkpoint_fingerprint,
-                payload={"items": [candidate.model_dump(mode="json") for candidate in pre_gate_candidates]},
-            )
     else:
         _log("  Pre-Gate repair skipped for optimization round")
     pre_gate_generated = len(pre_gate_candidates)
@@ -1616,52 +1654,38 @@ def _run_mining_round(
         )
 
     validation_tasks = _slice_tasks(validation_full_tasks, split_plan.repair_validation_mask)
-    validation_checkpoint = _load_stage_checkpoint(
-        store,
-        checkpoint_source if resume_run_id else None,
-        round_num=round_num,
-        symbol=checkpoint_symbol,
-        market=checkpoint_market,
-        stage="validation_backtests",
-        fingerprint=checkpoint_fingerprint,
-    )
-    if validation_checkpoint is not None:
-        validation_backtests = [
-            BacktestResult.model_validate(item)
-            for item in validation_checkpoint.get("items", [])
-        ]
-        _log(f"  Repair validation backtests: resumed {len(validation_backtests)} from checkpoint")
-    else:
-        validation_backtests = _run_backtests_parallel(
+    def _compute_validation_backtests() -> list[BacktestResult]:
+        results = _run_backtests_parallel(
             validation_tasks,
             repair_validation_frame,
             settings,
             max_workers,
             funding_df,
         )
-        if validation_backtests:
-            _apply_batch_pbo(repair_validation_frame, validation_tasks, validation_backtests, settings, funding_df)
-        _save_stage_checkpoint(
-            store,
-            run_id,
-            round_num=round_num,
-            symbol=checkpoint_symbol,
-            market=checkpoint_market,
-            stage="validation_backtests",
-            fingerprint=checkpoint_fingerprint,
-            payload={"items": [result.model_dump(mode="json") for result in validation_backtests]},
-        )
+        if results:
+            _apply_batch_pbo(repair_validation_frame, validation_tasks, results, settings, funding_df)
+        return results
+
+    validation_backtests = _checkpointed_stage(
+        store,
+        resume_source=checkpoint_source if resume_run_id else None,
+        run_id=run_id,
+        round_num=round_num,
+        symbol=checkpoint_symbol,
+        market=checkpoint_market,
+        stage="validation_backtests",
+        fingerprint=checkpoint_fingerprint,
+        log_label="Repair validation backtests",
+        decode=BacktestResult.model_validate,
+        compute=_compute_validation_backtests,
+        encode=lambda result: result.model_dump(mode="json"),
+    )
     pre_gate_ids = {candidate.candidate_id for candidate in pre_gate_candidates}
     pre_gate_completed = sum(1 for result in validation_backtests if result.candidate_id in pre_gate_ids)
     _check_stop(stop_event)
 
     if not validation_backtests:
-        return {
-            "candidates": [], "backtests": [], "gatechecks": [], "hardscores": [],
-            "factor_evidence": [], "research_gates": [], "near_misses": [],
-            "new_candidates": [], "research_survivors": [], "detail_artifact_ids": [],
-            "history_entry": {},
-        }
+        return RoundOutput()
 
     merge_plan = _select_repair_merge_pool(
         original_candidates=discovery_candidates,
@@ -2148,19 +2172,19 @@ def _run_mining_round(
         "trajectory_ids": [t.get("trajectory_id") for t in round_trajectories if isinstance(t, dict)],
     }
 
-    return {
-        "candidates": round_candidates,
-        "backtests": round_backtests,
-        "gatechecks": round_gatechecks,
-        "hardscores": round_hardscores,
-        "factor_evidence": round_factor_evidence,
-        "research_gates": round_research_gates,
-        "near_misses": round_near_misses,
-        "new_candidates": new_candidates,
-        "research_survivors": formal_research_survivors,
-        "detail_artifact_ids": detail_artifact_ids,
-        "history_entry": history_entry,
-    }
+    return RoundOutput(
+        candidates=round_candidates,
+        backtests=round_backtests,
+        gatechecks=round_gatechecks,
+        hardscores=round_hardscores,
+        factor_evidence=round_factor_evidence,
+        research_gates=round_research_gates,
+        near_misses=round_near_misses,
+        new_candidates=new_candidates,
+        research_survivors=formal_research_survivors,
+        detail_artifact_ids=detail_artifact_ids,
+        history_entry=history_entry,
+    )
 
 
 # ── helpers ─────────────────────────────────────────────────────────
