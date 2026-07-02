@@ -1274,7 +1274,16 @@ def verify_research_survivors(
                 funding_df=context.funding_df,
             )
 
-            round_gatechecks, fdr_map = _run_gatechecks(round_backtests, round_evidence, settings)
+            # Q15: survivor rechecks carry the family's cumulative cross-round
+            # trial count into BH multiplicity — a survivor from a heavily
+            # searched family must not clear G3 (or the promotion FDR) on
+            # batch-size multiplicity.
+            round_gatechecks, fdr_map = _run_gatechecks(
+                round_backtests,
+                round_evidence,
+                settings,
+                family_test_counts=_family_test_counts_from_snapshots(symbol_candidates, trial_counts),
+            )
             round_research_gates = apply_research_gate(round_backtests, round_gatechecks, round_evidence)
             persistent_records = build_research_survivor_records(
                 candidates_by_id={candidate.candidate_id: candidate for candidate in round_candidates},
@@ -2352,6 +2361,28 @@ def _candidate_trial_count_snapshots(
         )
         counts_by_candidate[candidate.candidate_id] = counts
     return counts_by_candidate
+
+
+def _family_test_counts_from_snapshots(
+    candidates: list[CandidateStrategySpec],
+    counts_by_candidate: dict[str, dict[str, int]],
+) -> dict[str, int]:
+    """Family → cumulative cross-round trial count for FDR multiplicity (Q15).
+
+    Uses the raw ledger ``family_trials_count`` (actual trials), not the
+    complexity-inflated ``effective_trials_count`` — BH multiplicity reflects
+    how many hypotheses were tested, DSR handles complexity."""
+    family_counts: dict[str, int] = {}
+    for candidate in candidates:
+        counts = counts_by_candidate.get(candidate.candidate_id)
+        if not counts:
+            continue
+        family = candidate.hypothesis_family
+        family_counts[family] = max(
+            family_counts.get(family, 0),
+            int(counts.get("family_trials_count", 0)),
+        )
+    return family_counts
 
 
 def _candidate_complexity_score(candidate: CandidateStrategySpec) -> int:
