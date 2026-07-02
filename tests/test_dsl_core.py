@@ -345,3 +345,52 @@ def test_generated_ast_idempotence_samples_cover_nested_shapes() -> None:
     for expr in expressions:
         c1 = canonicalize(parse(expr))
         assert canonicalize(c1) == c1
+
+
+def test_parse_cross_sectional_flag_is_thread_isolated() -> None:
+    """Symbol-group threads parse concurrently. A parse holding
+    allow_cross_sectional=True must keep its permission for the whole descent
+    even while another thread runs default (False) parses, and the default
+    parses must never observe the True. The old module-global save/restore
+    failed both ways under interleaving; the flag must be context-local.
+
+    RANK sits at the end of a long expression so the allowed parse must hold
+    its flag across a wide window; the spinner thread stomps the flag
+    continuously and a tiny GIL switch interval forces interleaving."""
+    import sys
+    import threading
+
+    long_expr = " + ".join(["TS_MEAN($close, 20)"] * 300) + " + RANK($returns)"
+    stop = threading.Event()
+    errors: list[str] = []
+
+    def default_spinner() -> None:
+        while not stop.is_set():
+            try:
+                parse("RANK($returns)")
+            except ValueError:
+                continue
+            errors.append("default parse accepted a cross-sectional operator")
+            return
+
+    old_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        spinner = threading.Thread(target=default_spinner)
+        spinner.start()
+        try:
+            for _ in range(100):
+                try:
+                    parse(long_expr, allow_cross_sectional=True)
+                except ValueError as exc:
+                    errors.append(f"allowed parse lost its flag mid-parse: {exc}")
+                    break
+                if errors:
+                    break
+        finally:
+            stop.set()
+            spinner.join(timeout=10.0)
+    finally:
+        sys.setswitchinterval(old_interval)
+
+    assert errors == []
