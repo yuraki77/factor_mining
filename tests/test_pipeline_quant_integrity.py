@@ -247,7 +247,12 @@ def test_split_round_controls_disable_repairs_and_stop_on_optimizer_convergence(
     assert result.total_rounds == 3
 
 
-def test_mining_round_skips_discovery_pbo_and_uses_validation_pbo(monkeypatch) -> None:
+def test_mining_round_gates_on_validation_and_never_touches_holdout(monkeypatch) -> None:
+    """Q3 round semantics: the round's gate pool must be the repair-validation
+    evaluation of the merge pool, PBO comes from the validation slice, and no
+    backtest during the round may read the final-OOS window — the optimizer
+    is downstream of round results, so any holdout evaluation here leaks the
+    holdout into the search."""
     import factor_mining.hardscore as hardscore_module
     import factor_mining.optimizers.traditional_optimizer as optimizer_module
     import factor_mining.validation.gatecheck as gatecheck_module
@@ -255,6 +260,7 @@ def test_mining_round_skips_discovery_pbo_and_uses_validation_pbo(monkeypatch) -
     candidate = _candidate("c_btc", "BTCUSDT")
     frame = _frame(100)
     pbo_frame_lengths: list[int] = []
+    backtest_window_starts: list[int] = []
 
     def fake_build_tasks(candidates, frame_arg, *args, trial_counts_by_candidate=None, **kwargs):
         trial_counts_by_candidate = trial_counts_by_candidate or {}
@@ -270,12 +276,13 @@ def test_mining_round_skips_discovery_pbo_and_uses_validation_pbo(monkeypatch) -
         ]
 
     def fake_backtests(tasks, frame_arg, settings, max_workers, funding_df=None):
+        backtest_window_starts.append(int(frame_arg["open_time"].iloc[0]))
         results = []
         for _signal, candidate_dict, _idx, _trial_counts, _notes in tasks:
             item = CandidateStrategySpec.model_validate(candidate_dict)
             results.append(
                 BacktestResult(
-                    experiment_id=f"exp-{len(frame_arg)}-{item.candidate_id}",
+                    experiment_id=f"exp-{int(frame_arg['open_time'].iloc[0])}-{item.candidate_id}",
                     candidate_id=item.candidate_id,
                     hypothesis_family=item.hypothesis_family,
                     method_id=item.method_id,
@@ -394,6 +401,17 @@ def test_mining_round_skips_discovery_pbo_and_uses_validation_pbo(monkeypatch) -
 
     assert pbo_frame_lengths == [20]
     assert round_data.backtests[0].pbo == 0.2
+
+    # The round's gate pool is the validation evaluation (window starts at bar
+    # 60 of 100: discovery 60% / validation 20% / final 20%)...
+    base_time = int(frame["open_time"].iloc[0])
+    bar_ms = int(frame["open_time"].iloc[1]) - base_time
+    validation_start = base_time + 60 * bar_ms
+    final_start = base_time + 80 * bar_ms
+    assert round_data.backtests[0].experiment_id.startswith(f"exp-{validation_start}-")
+    # ...and the final-OOS window must never have been backtested in-round.
+    assert final_start not in backtest_window_starts
+    assert backtest_window_starts == [base_time, validation_start]
 
 
 def _signal_build_inputs() -> tuple[

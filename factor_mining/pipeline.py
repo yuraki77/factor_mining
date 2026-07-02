@@ -1489,9 +1489,9 @@ def _run_mining_round(
     repair_validation_frame = _masked_frame(frame, split_plan.repair_validation_mask)
     final_frame = _masked_frame(frame, split_plan.final_oos_mask)
     discovery_regimes = _masked_series(forward_regimes, split_plan.discovery_mask)
-    final_regimes = _masked_series(forward_regimes, split_plan.final_oos_mask)
+    validation_regimes = _masked_series(forward_regimes, split_plan.repair_validation_mask)
     discovery_funding_rate = _masked_series(funding_rate, split_plan.discovery_mask) if funding_rate is not None else None
-    final_funding_rate = _masked_series(funding_rate, split_plan.final_oos_mask) if funding_rate is not None else None
+    validation_funding_rate = _masked_series(funding_rate, split_plan.repair_validation_mask) if funding_rate is not None else None
     _log(
         "  Split: "
         f"discovery={len(discovery_frame):,} bars, "
@@ -1714,68 +1714,30 @@ def _run_mining_round(
             "diagnostics": repair_merge_diagnostics,
         })
 
-    validation_result_by_candidate = {
-        result.candidate_id: result
-        for result in merge_plan.validation_results
-    }
-
-    final_tasks = _slice_tasks(merge_plan.full_tasks, split_plan.final_oos_mask)
-    final_checkpoint = _load_stage_checkpoint(
-        store,
-        checkpoint_source if resume_run_id else None,
-        round_num=round_num,
-        symbol=checkpoint_symbol,
-        market=checkpoint_market,
-        stage="final_backtests",
-        fingerprint=checkpoint_fingerprint,
-    )
-    if final_checkpoint is not None:
-        final_backtests = [
-            BacktestResult.model_validate(item)
-            for item in final_checkpoint.get("items", [])
-        ]
-        _log(f"  Final OOS backtests: resumed {len(final_backtests)} from checkpoint")
-    else:
-        final_backtests = _run_backtests_parallel(final_tasks, final_frame, settings, max_workers, funding_df)
-        for result in final_backtests:
-            validation_result = validation_result_by_candidate.get(result.candidate_id)
-            result.pbo = validation_result.pbo if validation_result is not None else 1.0
-            # Q9: wire G11's split-overlap signal to the actual purge geometry
-            # (gaps_honored from Q10) instead of leaving it at its vacuous default.
-            result.split_overlap_detected = not split_plan.gaps_honored
-            if validation_result is not None:
-                result.global_trials_at_eval = validation_result.global_trials_at_eval
-                result.effective_trials_at_eval = validation_result.effective_trials_at_eval
-
-        merge_pool_trials = _merge_pool_effective_trials(
-            validation_backtests,
-            _trial_counts_snapshot(cumulative_trial_counts, trial_counts_lock),
-            tested_candidates=len(validation_candidates),
-        )
-        _apply_merge_pool_trial_penalty(
-            final_backtests,
-            effective_trials_count=merge_pool_trials,
-            observations=len(final_frame),
-        )
-        _save_stage_checkpoint(
-            store,
-            run_id,
-            round_num=round_num,
-            symbol=checkpoint_symbol,
-            market=checkpoint_market,
-            stage="final_backtests",
-            fingerprint=checkpoint_fingerprint,
-            payload={"items": [result.model_dump(mode="json") for result in final_backtests]},
-        )
-
-    final_backtest_ids = {result.candidate_id for result in final_backtests}
+    # Q3: rounds gate on the held-aside repair-validation slice. The final-OOS
+    # window is never evaluated (nor read by the optimizer) during rounds; the
+    # terminal holdout evaluation in _run_pipeline_impl touches it exactly once.
+    round_result_ids = {result.candidate_id for result in merge_plan.validation_results}
     round_candidates = [
         candidate for candidate in merge_plan.candidates
-        if candidate.candidate_id in final_backtest_ids
+        if candidate.candidate_id in round_result_ids
     ]
-    round_backtests = final_backtests
-    tasks = final_tasks
-    _log(f"  Final OOS backtests: {len(round_backtests)} completed")
+    round_backtests = merge_plan.validation_results
+    tasks = _slice_tasks(merge_plan.full_tasks, split_plan.repair_validation_mask)
+    for result in round_backtests:
+        # Q9: wire G11's split-overlap signal to the actual purge geometry.
+        result.split_overlap_detected = not split_plan.gaps_honored
+    merge_pool_trials = _merge_pool_effective_trials(
+        merge_plan.validation_results,
+        _trial_counts_snapshot(cumulative_trial_counts, trial_counts_lock),
+        tested_candidates=len(validation_candidates),
+    )
+    _apply_merge_pool_trial_penalty(
+        round_backtests,
+        effective_trials_count=merge_pool_trials,
+        observations=len(repair_validation_frame),
+    )
+    _log(f"  Validation gate pool: {len(round_backtests)} candidates (merge pool of originals + accepted repairs)")
     _check_stop(stop_event)
 
     if store:
@@ -1793,13 +1755,13 @@ def _run_mining_round(
 
     # ── Factor evidence (PR1: diagnostics only, no GateCheck behavior changes) ──
     round_factor_evidence = build_factor_evidence_reports(
-        frame=final_frame,
+        frame=repair_validation_frame,
         tasks=tasks,
         candidates=round_candidates,
         results=round_backtests,
         settings=settings,
-        forward_regimes=final_regimes,
-        funding_rate=final_funding_rate,
+        forward_regimes=validation_regimes,
+        funding_rate=validation_funding_rate,
         funding_df=funding_df,
     )
     _log(f"  Factor evidence: {len(round_factor_evidence)} reports")
@@ -1886,6 +1848,7 @@ def _run_mining_round(
             results=round_backtests,
             fdr_map=fdr_map,
             settings=settings,
+            allow_promotion=False,
         )
         store.save_artifact(f"research_gate_{artifact_scope}", "research_gate", {
             "items": [gate.model_dump(mode="json") for gate in round_research_gates],
@@ -1940,7 +1903,7 @@ def _run_mining_round(
         })
         detail_artifact_ids = _save_experiment_details(
             store,
-            frame=final_frame,
+            frame=repair_validation_frame,
             tasks=tasks,
             candidates=round_candidates,
             results=round_backtests,
@@ -2077,11 +2040,11 @@ def _run_mining_round(
                     children, rejected, warned = _filter_evolutionary_output_correlation(
                         children,
                         {c.candidate_id: c for c in [*round_candidates, *new_candidates, *children]},
-                        final_frame,
+                        repair_validation_frame,
                         features_df,
                         feature_meta,
-                        final_regimes,
-                        final_funding_rate,
+                        validation_regimes,
+                        validation_funding_rate,
                         settings,
                     )
                     evo_corr_rejected += rejected
@@ -2112,11 +2075,11 @@ def _run_mining_round(
                     accepted, rejected, warned = _filter_evolutionary_output_correlation(
                         [child],
                         {c.candidate_id: c for c in [*round_candidates, *new_candidates, child]},
-                        final_frame,
+                        repair_validation_frame,
                         features_df,
                         feature_meta,
-                        final_regimes,
-                        final_funding_rate,
+                        validation_regimes,
+                        validation_funding_rate,
                         settings,
                     )
                     evo_corr_rejected += rejected
@@ -3845,7 +3808,14 @@ def _update_research_survivor_store(
     fdr_map: dict[str, float],
     settings: Settings,
     now: datetime | None = None,
+    allow_promotion: bool = True,
 ) -> None:
+    """Upsert survivor records and maintain rechecked survivors' status.
+
+    ``allow_promotion=False`` (per-round maintenance): upserts and retirements
+    only. Promotions require holdout-grade evidence — the terminal final-OOS
+    evaluation or the survivor-verify path — where the FDR map carries
+    cross-round multiplicity; per-round validation stats must not promote."""
     store.upsert_research_survivors(records)
     if not rechecked_candidate_ids:
         return
@@ -3879,9 +3849,9 @@ def _update_research_survivor_store(
             if stored is not None
             else 0
         )
-        if gate.status == "production_passed":
+        if allow_promotion and gate.status == "production_passed":
             store.update_research_survivor_status(candidate_id, "promoted", "production_gate_passed")
-        elif fdr_pvalue < promotion_fdr and current_trades >= min_trades and elapsed_days >= required_days:
+        elif allow_promotion and fdr_pvalue < promotion_fdr and current_trades >= min_trades and elapsed_days >= required_days:
             store.update_research_survivor_status(candidate_id, "promoted", "promotion_criteria_met")
         elif gate.status == "rejected" and current_trades >= min_trades:
             store.update_research_survivor_status(candidate_id, "retired", "rejected_after_min_trades")
