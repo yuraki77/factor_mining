@@ -55,7 +55,7 @@ def apply_fdr(
         adjusted_by_experiment.update(
             {
                 result.experiment_id: adjusted_value
-                for result, adjusted_value in zip(family_results, adjusted, strict=False)
+                for result, adjusted_value in zip(family_results, adjusted, strict=True)
             }
         )
     return adjusted_by_experiment
@@ -93,7 +93,7 @@ def run_gatecheck(
         result.break_even_cost_bps > settings.gatecheck.break_even_cost_multiple * max(result.actual_cost_bps, 1e-12),
         "Break-even cost has safety margin",
         result.break_even_cost_bps,
-        settings.gatecheck.break_even_cost_multiple * result.actual_cost_bps,
+        settings.gatecheck.break_even_cost_multiple * max(result.actual_cost_bps, 1e-12),
     )
     _warn_item(items, "G9", result.prior_posterior_ic_ratio < settings.gatecheck.prior_posterior_ic_max_ratio, "Prior/posterior IC calibration contributes quality", result.prior_posterior_ic_ratio, settings.gatecheck.prior_posterior_ic_max_ratio)
     _item(items, "G10", result.estimated_capacity_usd >= settings.capacity.min_capacity_usd, "Capacity exceeds minimum tradable capital", result.estimated_capacity_usd, settings.capacity.min_capacity_usd)
@@ -132,7 +132,9 @@ def apply_risk_stratified_gatechecks(
     settings: Settings,
 ) -> list[GateCheckResult]:
     evidence_by_experiment = {report.experiment_id: report for report in evidence_reports}
-    for result, gate in zip(results, gatechecks, strict=False):
+    # strict: a results/gatechecks length mismatch means a caller paired the
+    # wrong batch — stratifying a truncated zip silently mis-tiers results.
+    for result, gate in zip(results, gatechecks, strict=True):
         stratify_gatecheck(
             result=result,
             gatecheck=gate,

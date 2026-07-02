@@ -558,3 +558,21 @@ def test_archive_bundle_writes_candidate_and_data_manifest(tmp_path) -> None:
     assert saved_candidate["params"]["factor_family"] == "momentum"  # params survive the round-trip
     manifest = json.loads((bundle / "manifest.json").read_text())
     assert manifest["data_manifest"]["data_end_ms"] == 1_777_593_300_000  # real extent, not {}
+
+
+def test_risk_stratification_rejects_mispaired_batches() -> None:
+    """A results/gatechecks length mismatch means a caller paired the wrong
+    batch; truncated zipping silently mis-tiers results, so it must raise."""
+    result = BacktestResult(
+        experiment_id="exp-strict",
+        candidate_id="cand-strict",
+        hypothesis_family="momentum",
+        method_id="factor_scoring",
+        symbol="BTCUSDT",
+        market="um_futures",
+        interval="5m",
+        metrics_primary=MetricsBlock(sharpe=1.0, trade_count=100),
+    )
+    gate = run_gatecheck(result, Settings(), method=get_method("factor_scoring"))
+    with pytest.raises(ValueError):
+        apply_risk_stratified_gatechecks([result, result], [gate], [], Settings())

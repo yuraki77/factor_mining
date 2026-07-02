@@ -3421,15 +3421,15 @@ def _apply_merge_pool_trial_penalty(
     effective_trials_count: int,
     observations: int,
 ) -> None:
-    returns_placeholder = np.empty(max(1, int(observations)), dtype=float)
     for result in results:
         result.effective_trials_at_eval = max(int(result.effective_trials_at_eval), effective_trials_count)
         result.global_trials_at_eval = max(int(result.global_trials_at_eval), effective_trials_count)
         result.deflated_sharpe = deflated_sharpe_ratio(
-            returns_placeholder,
+            None,
             observed_sr=result.metrics_primary.sharpe,
             trials_count=result.effective_trials_at_eval,
             periods_per_year=annualization_factor(result.interval),
+            observations=observations,
         )
         # Write merge-pool trial count back to trial_diagnostics for artifact transparency.
         result.trial_diagnostics["merge_pool_effective_trials"] = effective_trials_count

@@ -2,6 +2,7 @@ import math
 import warnings
 
 import numpy as np
+import pytest
 
 from factor_mining.stats.metrics import (
     benjamini_hochberg,
@@ -164,3 +165,17 @@ def test_probabilistic_sharpe_is_invariant_to_annualization() -> None:
     # A sane probability, not a degenerate 0/1 from a collapsed denominator.
     assert 0.0 < psr_from_annualized < 1.0
 
+
+
+def test_deflated_sharpe_observations_matches_series_length() -> None:
+    """Callers that know only the sample size (merge-pool re-penalty) must get
+    the identical haircut as callers passing a series of that length — the
+    penalty depends on n alone, and passing observations avoids fabricating
+    placeholder arrays whose contents look load-bearing."""
+    returns = np.random.default_rng(7).normal(0.0, 0.01, 500)
+    from_series = deflated_sharpe_ratio(returns, observed_sr=1.5, trials_count=64, periods_per_year=365)
+    from_count = deflated_sharpe_ratio(None, observed_sr=1.5, trials_count=64, periods_per_year=365, observations=500)
+    assert from_count == from_series
+
+    with pytest.raises(ValueError):
+        deflated_sharpe_ratio(None, observed_sr=1.5, trials_count=64, periods_per_year=365)

@@ -138,12 +138,13 @@ def probabilistic_sharpe_ratio(
 
 
 def deflated_sharpe_ratio(
-    returns: Sequence[float],
+    returns: Sequence[float] | None,
     *,
     observed_sr: float,
     trials_count: int,
     periods_per_year: int,
     benchmark_sr: float = 0.0,
+    observations: int | None = None,
 ) -> float:
     """Deflated Sharpe haircut: ``observed_sr`` minus the expected maximum
     Sharpe under the null over ``trials_count`` independent trials.
@@ -154,9 +155,17 @@ def deflated_sharpe_ratio(
     subtracted. The prior code subtracted the per-period penalty straight from
     the annualized Sharpe, under-stating the haircut by ``sqrt(periods_per_year)``
     (≈ 324× on 5m bars) so almost every candidate cleared a positive DSR.
+
+    Only the *length* of ``returns`` enters the penalty; callers that know the
+    sample size but not the series (e.g. the merge-pool re-penalty) pass
+    ``observations`` and ``returns=None`` instead of fabricating an array.
     """
-    arr = np.asarray(returns, dtype=float)
-    n = max(len(arr), 1)
+    if observations is not None:
+        n = max(int(observations), 1)
+    else:
+        if returns is None:
+            raise ValueError("deflated_sharpe_ratio needs either returns or observations")
+        n = max(len(np.asarray(returns, dtype=float)), 1)
     per_period_penalty = math.sqrt(2.0 * math.log(max(trials_count, 1)) / n)
     annualized_penalty = per_period_penalty * math.sqrt(max(int(periods_per_year), 1))
     return float(observed_sr - benchmark_sr - annualized_penalty)
