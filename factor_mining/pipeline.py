@@ -3788,10 +3788,6 @@ def _cscv_splits(n_rows: int, settings: Settings) -> list[tuple[np.ndarray, np.n
     return split_defs
 
 
-def _cpcv_splits(n_rows: int, settings: Settings) -> list[tuple[np.ndarray, np.ndarray]]:
-    return _cscv_splits(n_rows, settings)
-
-
 def _data_key(candidate: CandidateStrategySpec) -> tuple[str, str]:
     return candidate.symbol, candidate.market
 
