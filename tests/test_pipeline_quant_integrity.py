@@ -2444,3 +2444,31 @@ def test_cscv_split_subsample_is_not_lexicographically_biased() -> None:
     # Complement-deduped and unique.
     keys = {tuple(np.flatnonzero(train_mask[::100])) for train_mask, _ in splits}
     assert len(keys) == 128
+
+
+def test_merge_pool_penalty_propagates_raised_trials_to_bailey_dsr() -> None:
+    """WHY: the Bailey DSR must reflect the run-wide search width, not the
+    engine-time count, or the terminal holdout would report a probability
+    computed as if far fewer strategies had been tried. It is re-derived from
+    the moments the engine stored on the result, so the raised count must
+    strictly lower it."""
+    result = _result("exp-final", "c_final", pbo=0.2, sharpe=2.0)
+    result.effective_trials_at_eval = 1
+    result.return_skew = -0.3
+    result.return_kurtosis = 4.0
+    result.deflated_sharpe_prob = 0.99  # stale engine-time value
+
+    _apply_merge_pool_trial_penalty([result], effective_trials_count=200, observations=400)
+
+    assert result.deflated_sharpe_prob is not None
+    assert 0.0 <= result.deflated_sharpe_prob < 0.99
+    assert result.trial_diagnostics["dsr_prob"] == result.deflated_sharpe_prob
+    single_trial_equiv = pipeline.deflated_sharpe_probability(
+        observed_sr=result.metrics_primary.sharpe,
+        trials_count=1,
+        periods_per_year=pipeline.annualization_factor(result.interval),
+        observations=400,
+        skew=result.return_skew,
+        kurtosis=result.return_kurtosis,
+    )
+    assert result.deflated_sharpe_prob < single_trial_equiv

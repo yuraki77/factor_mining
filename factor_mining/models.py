@@ -106,6 +106,12 @@ class BacktestResult(BaseModel):
     # Expected-max haircut Sharpe (sqrt(2 ln N / n) penalty), not Bailey's
     # PSR-based DSR — see stats.metrics.deflated_sharpe_ratio. G1 gates on > 0.
     deflated_sharpe: float = 0.0
+    # True Bailey & López de Prado DSR: P(observed SR beats the expected max
+    # of effective_trials_at_eval null trials), skew/kurtosis-adjusted.
+    # Diagnostic — G1 still gates on the haircut above.
+    deflated_sharpe_prob: float | None = None
+    return_skew: float = 0.0
+    return_kurtosis: float = 3.0
     effective_trials_at_eval: int = 0
     global_trials_at_eval: int = 0
     pbo: float | None = None

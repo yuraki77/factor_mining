@@ -6,12 +6,17 @@ import pytest
 
 from factor_mining.stats.metrics import (
     benjamini_hochberg,
+    deflated_sharpe_probability,
     deflated_sharpe_ratio,
+    expected_max_sharpe,
     haircut_sharpe,
+    inverse_normal_cdf,
     newey_west_tstat,
+    normal_cdf,
     permutation_test_mean_ic,
     probabilistic_sharpe_ratio,
     return_autocorrelation_lag1,
+    return_moments,
 )
 
 
@@ -211,3 +216,59 @@ def test_permutation_null_is_calibrated_for_autocorrelated_series() -> None:
         if p <= 0.05:
             rejections += 1
     assert rejections / reps <= 0.125, f"null rejection rate {rejections / reps:.3f} is anti-conservative"
+
+
+def test_inverse_normal_cdf_inverts_normal_cdf() -> None:
+    for p in (0.01, 0.05, 0.5, 0.875, 0.99, 0.999):
+        z = inverse_normal_cdf(p)
+        assert abs(normal_cdf(z) - p) < 1e-9
+
+
+def test_bailey_dsr_equals_psr_for_a_single_trial() -> None:
+    """WHY: with one trial nothing was selected from, so the expected-max
+    threshold is zero and the deflated probability must collapse to the plain
+    PSR — any gap between the two would mean the deflation penalizes searches
+    that never happened."""
+    rng = np.random.default_rng(5)
+    returns = rng.normal(loc=0.0004, scale=0.01, size=600)
+    n, skew, kurt = return_moments(returns)
+    sr = 1.2
+    dsr_prob = deflated_sharpe_probability(
+        observed_sr=sr, trials_count=1, periods_per_year=365,
+        observations=n, skew=skew, kurtosis=kurt,
+    )
+    psr = probabilistic_sharpe_ratio(returns, observed_sr=sr, periods_per_year=365)
+    assert abs(dsr_prob - psr) < 1e-9
+    assert expected_max_sharpe(1, sr_std=0.05) == 0.0
+
+
+def test_bailey_dsr_probability_falls_as_trials_grow() -> None:
+    """WHY: the whole point of the deflation — the same observed Sharpe is
+    less convincing when it is the best of many attempts. The probability
+    must be strictly decreasing in the trial count and stay in [0, 1]."""
+    rng = np.random.default_rng(6)
+    returns = rng.normal(loc=0.0004, scale=0.01, size=600)
+    n, skew, kurt = return_moments(returns)
+    probs = [
+        deflated_sharpe_probability(
+            observed_sr=1.2, trials_count=trials, periods_per_year=365,
+            observations=n, skew=skew, kurtosis=kurt,
+        )
+        for trials in (1, 10, 100, 1000)
+    ]
+    assert all(0.0 <= p <= 1.0 for p in probs)
+    assert probs[0] > probs[1] > probs[2] > probs[3]
+
+
+def test_bailey_dsr_penalizes_negative_skew() -> None:
+    """WHY: the skew/kurtosis adjustment is what the haircut-style DSR lacks —
+    when the observed Sharpe clears the expected-max threshold, a crash-prone
+    (negatively skewed) return stream must earn a lower probability than a
+    symmetric one with the same Sharpe, because its Sharpe estimate is noisier
+    evidence. (Below the threshold the direction reverses: noise makes a
+    sub-threshold result less conclusively bad.)"""
+    kwargs = {"observed_sr": 2.0, "trials_count": 5, "periods_per_year": 365, "observations": 600, "kurtosis": 3.0}
+    symmetric = deflated_sharpe_probability(skew=0.0, **kwargs)
+    crash_prone = deflated_sharpe_probability(skew=-1.5, **kwargs)
+    assert symmetric > 0.5  # the observed SR clears the expected-max threshold here
+    assert crash_prone < symmetric

@@ -58,7 +58,13 @@ from factor_mining.models import (
     TrialRecord,
 )
 from factor_mining.registry import METHOD_REGISTRY
-from factor_mining.stats.metrics import annualization_factor, combined_ic_tstat_pvalue, deflated_sharpe_ratio, sharpe_ratio
+from factor_mining.stats.metrics import (
+    annualization_factor,
+    combined_ic_tstat_pvalue,
+    deflated_sharpe_probability,
+    deflated_sharpe_ratio,
+    sharpe_ratio,
+)
 from factor_mining.storage import MetadataStore
 from factor_mining.trial_ledger import TrialLedger
 
@@ -3664,11 +3670,22 @@ def _apply_merge_pool_trial_penalty(
             periods_per_year=annualization_factor(result.interval),
             observations=observations,
         )
+        # The Bailey DSR is re-derivable from the moments the engine stored on
+        # the result, so the raised trial count propagates to it as well.
+        result.deflated_sharpe_prob = deflated_sharpe_probability(
+            observed_sr=result.metrics_primary.sharpe,
+            trials_count=result.effective_trials_at_eval,
+            periods_per_year=annualization_factor(result.interval),
+            observations=max(2, int(observations)),
+            skew=result.return_skew,
+            kurtosis=result.return_kurtosis,
+        )
         # Write merge-pool trial count back to trial_diagnostics for artifact transparency.
         result.trial_diagnostics["merge_pool_effective_trials"] = effective_trials_count
         result.trial_diagnostics["effective_trials_at_eval"] = result.effective_trials_at_eval
         result.trial_diagnostics["global_trials_at_eval"] = result.global_trials_at_eval
         result.trial_diagnostics["dsr"] = float(result.deflated_sharpe)
+        result.trial_diagnostics["dsr_prob"] = float(result.deflated_sharpe_prob)
 
 
 def _json_dumps_sorted(payload: Any) -> str:

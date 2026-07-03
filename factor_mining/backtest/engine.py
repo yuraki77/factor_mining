@@ -20,6 +20,7 @@ from factor_mining.models import (
 from factor_mining.stats.metrics import (
     _block_bootstrap_sharpes,
     annualization_factor,
+    deflated_sharpe_probability,
     deflated_sharpe_ratio,
     haircut_sharpe,
     max_drawdown,
@@ -27,6 +28,7 @@ from factor_mining.stats.metrics import (
     permutation_test_mean_ic,
     probabilistic_sharpe_ratio,
     return_autocorrelation_lag1,
+    return_moments,
     rolling_pearson_ic,
     rolling_rank_ic,
     sharpe_ratio,
@@ -553,6 +555,15 @@ def run_backtest(
     periods_per_year = annualization_factor(candidate.interval)
     dsr = deflated_sharpe_ratio(primary_returns, observed_sr=observed_sr, trials_count=counts["effective_trials_count"], periods_per_year=periods_per_year)
     _ = haircut_sharpe(observed_sr, trials_count=counts["effective_trials_count"], observations=max(len(primary_returns), 1), periods_per_year=periods_per_year)
+    n_obs, ret_skew, ret_kurt = return_moments(primary_returns)
+    dsr_prob = deflated_sharpe_probability(
+        observed_sr=observed_sr,
+        trials_count=counts["effective_trials_count"],
+        periods_per_year=periods_per_year,
+        observations=max(n_obs, 2),
+        skew=ret_skew,
+        kurtosis=ret_kurt,
+    )
     regimes = label_btc_regime(btc_regime_frame if btc_regime_frame is not None else frame, settings.regime)
     if len(regimes) == len(frame):
         regimes = pd.Series(regimes.to_numpy(), index=frame.index).astype(str)
@@ -606,6 +617,9 @@ def run_backtest(
         sharpe_ci_5_95=ci,
         probabilistic_sharpe=probabilistic_sharpe_ratio(primary_returns, observed_sr=observed_sr, periods_per_year=periods_per_year),
         deflated_sharpe=dsr,
+        deflated_sharpe_prob=dsr_prob,
+        return_skew=ret_skew,
+        return_kurtosis=ret_kurt,
         effective_trials_at_eval=counts["effective_trials_count"],
         global_trials_at_eval=counts["global_cumulative_trials_count"],
         pbo=None,
