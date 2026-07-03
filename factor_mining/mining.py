@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -450,7 +451,19 @@ def default_hypotheses() -> list[HypothesisSpec]:
     return base
 
 
-def generate_hypotheses_with_deepseek(settings: Settings, *, count: int = 5, research_brief: str | None = None) -> list[HypothesisSpec]:
+def generate_hypotheses_with_deepseek(
+    settings: Settings,
+    *,
+    count: int = 5,
+    research_brief: str | None = None,
+    capture: dict[str, Any] | None = None,
+) -> list[HypothesisSpec]:
+    """Generate hypotheses via DeepSeek.
+
+    When *capture* is passed, the raw prompt messages, model, and response are
+    written into it as soon as the API answers (I6) — before any parsing — so
+    the caller can persist the exchange even when validation below raises.
+    """
     provider = provider_from_settings("deepseek", settings)
     if not provider.is_configured:
         raise RuntimeError(f"DeepSeek API key is missing. Set {provider.api_key_env} in .env or your shell.")
@@ -458,20 +471,28 @@ def generate_hypotheses_with_deepseek(settings: Settings, *, count: int = 5, res
         "Generate rigorous first-principles BTC/ETH factor hypotheses for Binance spot and USD-M perpetual 5m data. "
         "Only produce time-series or funding/basis hypotheses suitable for N=2 symbols."
     )
+    messages = [
+        {"role": "system", "content": hypothesis_system_prompt()},
+        {
+            "role": "user",
+            "content": (
+                f"{prompt}\n\nReturn JSON with a top-level 'hypotheses' array of exactly {count} objects. "
+                "Each object must include hypothesis_id, hypothesis_family, economic_mechanism, "
+                "testable_prediction, null_hypothesis, expected_ic_range, expected_decay_halflife_bars."
+            ),
+        },
+    ]
     response = provider.chat_json(
         model=settings.llm.deepseek.hypothesis_model,
-        messages=[
-            {"role": "system", "content": hypothesis_system_prompt()},
-            {
-                "role": "user",
-                "content": (
-                    f"{prompt}\n\nReturn JSON with a top-level 'hypotheses' array of exactly {count} objects. "
-                    "Each object must include hypothesis_id, hypothesis_family, economic_mechanism, "
-                    "testable_prediction, null_hypothesis, expected_ic_range, expected_decay_halflife_bars."
-                ),
-            },
-        ],
+        messages=messages,
     )
+    if capture is not None:
+        capture.update({
+            "provider": "deepseek",
+            "model": settings.llm.deepseek.hypothesis_model,
+            "messages": messages,
+            "response": response,
+        })
     payload = _extract_chat_json(response)
     items = payload.get("hypotheses", payload if isinstance(payload, list) else [])
     hypotheses: list[HypothesisSpec] = []

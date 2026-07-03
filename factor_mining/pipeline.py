@@ -880,9 +880,11 @@ def _run_pipeline_impl(
         result.hypotheses = list(seed_hypotheses)
         _log(f"Using {len(result.hypotheses)} seeded hypotheses")
     elif use_llm:
+        llm_capture: dict[str, Any] = {}
         try:
             result.hypotheses = generate_hypotheses_with_deepseek(
                 settings, count=hypothesis_count, research_brief=research_brief,
+                capture=llm_capture,
             )
             _log(f"DeepSeek generated {len(result.hypotheses)} hypotheses in {time.perf_counter() - t0:.0f}s")
         except Exception as exc:
@@ -890,6 +892,16 @@ def _run_pipeline_impl(
             _log("Falling back to default + discovered hypotheses")
             result.hypotheses = default_hypotheses()
             result.errors.append(f"step1_deepseek: {exc}")
+        finally:
+            # I6: persist the raw exchange whenever the API answered — most
+            # valuable exactly when parsing failed after a successful call.
+            # Checkpoints are prunable; this is the durable audit record.
+            if store and llm_capture:
+                store.save_artifact(
+                    f"llm_hypotheses_raw_{run_id}" if run_id else "llm_hypotheses_raw_latest",
+                    "llm_raw",
+                    {**llm_capture, "requested_count": hypothesis_count},
+                )
     else:
         result.hypotheses = default_hypotheses()
 
