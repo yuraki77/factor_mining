@@ -146,8 +146,14 @@ def deflated_sharpe_ratio(
     benchmark_sr: float = 0.0,
     observations: int | None = None,
 ) -> float:
-    """Deflated Sharpe haircut: ``observed_sr`` minus the expected maximum
+    """Expected-max haircut Sharpe: ``observed_sr`` minus the expected maximum
     Sharpe under the null over ``trials_count`` independent trials.
+
+    Despite the historical name this is NOT Bailey & Lopez de Prado's deflated
+    Sharpe ratio: there is no skewness/kurtosis correction and no variance of
+    the trial SR distribution — only the ``sqrt(2 ln N / n)`` expected-max
+    penalty. G1 gates on this value being positive; treat it as a
+    multiple-testing haircut, not a probability statement.
 
     ``observed_sr``/``benchmark_sr`` are *annualized* Sharpe ratios. The
     expected-maximum penalty ``sqrt(2 ln N / n)`` is a *per-period* Sharpe

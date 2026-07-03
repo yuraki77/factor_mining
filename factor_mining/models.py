@@ -103,6 +103,8 @@ class BacktestResult(BaseModel):
     rankic_tstat_nw: float = 0.0
     sharpe_ci_5_95: tuple[float, float] = (0.0, 0.0)
     probabilistic_sharpe: float = 0.0
+    # Expected-max haircut Sharpe (sqrt(2 ln N / n) penalty), not Bailey's
+    # PSR-based DSR — see stats.metrics.deflated_sharpe_ratio. G1 gates on > 0.
     deflated_sharpe: float = 0.0
     effective_trials_at_eval: int = 0
     global_trials_at_eval: int = 0
