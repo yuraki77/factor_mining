@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 
 class DataConfig(BaseModel):
@@ -25,23 +25,32 @@ class TrialLedgerConfig(BaseModel):
 
 
 class WalkForwardConfig(BaseModel):
-    mode: Literal["rolling"] = "rolling"
-    train_months: int = 12
-    validation_months: int = 3
-    test_months: int = 3
+    """Split-boundary hygiene for the discovery/validation/holdout cut (Q10).
+
+    F2 (P1-3): the rolling walk-forward keys this section used to carry
+    (mode/train/validation/test months, min_folds) described an evaluation
+    that never existed and are gone; the real split is the purged 60/20/20
+    plan in pipeline._build_data_split_plan. If rolling walk-forward is ever
+    implemented, its config belongs to that feature, not here.
+    """
+
     purge_bars_floor: int = 288
     embargo_bars: int = 288
-    min_folds: int = 4
-
-    def purge_bars(self, max_feature_lookback_bars: int) -> int:
-        return max(self.purge_bars_floor, 2 * max_feature_lookback_bars)
 
 
-class CPCVConfig(BaseModel):
+class CSCVConfig(BaseModel):
+    """Combinatorially symmetric CV (CSCV) for PBO — plain contiguous groups,
+    not the purged CPCV the old section name claimed (I2/P2-6)."""
+
     n_groups: int = 8
     test_groups: int = 2
     pbo_threshold: float = 0.40
     ml_pbo_threshold: float = 0.30
+
+
+# Backward-compat alias for external constructors; the yaml alias lives on the
+# Settings field.
+CPCVConfig = CSCVConfig
 
 
 class RegimeConfig(BaseModel):
@@ -69,8 +78,6 @@ class NeweyWestConfig(BaseModel):
 
 class PermutationTestConfig(BaseModel):
     n_permutations: int = 100
-    permute_target: Literal["factor_values"] = "factor_values"
-    test_statistic: Literal["mean_ic"] = "mean_ic"
 
 
 class PositionSizingConfig(BaseModel):
@@ -182,7 +189,10 @@ class Settings(BaseModel):
     data: DataConfig = Field(default_factory=DataConfig)
     trial_ledger: TrialLedgerConfig = Field(default_factory=TrialLedgerConfig)
     walk_forward: WalkForwardConfig = Field(default_factory=WalkForwardConfig)
-    cpcv: CPCVConfig = Field(default_factory=CPCVConfig)
+    cscv: CSCVConfig = Field(
+        default_factory=CSCVConfig,
+        validation_alias=AliasChoices("cscv", "cpcv"),
+    )
     regime: RegimeConfig = Field(default_factory=RegimeConfig)
     bootstrap: BootstrapConfig = Field(default_factory=BootstrapConfig)
     newey_west: NeweyWestConfig = Field(default_factory=NeweyWestConfig)

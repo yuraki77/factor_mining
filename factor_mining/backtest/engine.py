@@ -64,6 +64,9 @@ class StrategyPath:
     avg_participation: float
 
 
+_CALMAR_CAP = 1000.0
+
+
 def _metrics_from_returns(returns: pd.Series, *, interval: str, trade_count: int, pnl: float) -> MetricsBlock:
     returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
     periods = annualization_factor(interval)
@@ -83,7 +86,13 @@ def _metrics_from_returns(returns: pd.Series, *, interval: str, trade_count: int
     ann_vol = float(returns.std(ddof=1) * np.sqrt(periods)) if len(returns) > 1 else 0.0
     sharpe = sharpe_ratio(returns, periods_per_year=periods)
     mdd = max_drawdown(equity)
-    calmar = ann_return / abs(mdd) if mdd < 0 else 0.0
+    # I5 (P2-6): zero drawdown with positive returns used to report calmar=0,
+    # indistinguishable from "no edge". Cap instead of infinity so the field
+    # stays JSON-serializable and sortable.
+    if mdd < 0:
+        calmar = min(ann_return / abs(mdd), _CALMAR_CAP)
+    else:
+        calmar = _CALMAR_CAP if ann_return > 0 else 0.0
     return MetricsBlock(
         total_return=total_return,
         annualized_return=ann_return,
@@ -379,6 +388,50 @@ def _resolve_exit_params(
     return sl, mh, tiers, tr, ta
 
 
+def _pre_gap_flags(frame: pd.DataFrame, interval: str) -> np.ndarray:
+    """True at bars whose NEXT bar is non-contiguous (G1/P2-2): any 1-bar
+    forward quantity computed at such a bar spans a data outage and is not a
+    per-interval return."""
+    open_times = frame["open_time"].to_numpy(dtype=np.int64)
+    flags = np.zeros(open_times.size, dtype=bool)
+    if open_times.size < 2:
+        return flags
+    interval_ms = round(365 * 86_400_000 / annualization_factor(interval))
+    flags[:-1] = np.diff(open_times) > 1.5 * interval_ms
+    return flags
+
+
+def _freeze_reopen_entries(position: pd.Series, reopen_indices: np.ndarray) -> pd.Series:
+    """Block NEW risk on the first bar after a data gap (G1/P2-2): the signal
+    there was built on pre-gap information and a fill at the reopen print is
+    fantasy. Exits and reductions stay allowed — the position is clamped to
+    the interval between zero and the previous bar's position."""
+    if reopen_indices.size == 0:
+        return position
+    pos = position.copy()
+    for idx in reopen_indices:
+        if idx <= 0 or idx >= len(pos):
+            continue
+        prev = float(pos.iloc[idx - 1])
+        lo, hi = min(0.0, prev), max(0.0, prev)
+        pos.iloc[idx] = float(np.clip(pos.iloc[idx], lo, hi))
+    return pos
+
+
+def realized_vol_series(frame: pd.DataFrame, settings: Settings, interval: str) -> pd.Series:
+    """Trailing annualized realized vol used for vol targeting.
+
+    Exposed so the pipeline can compute it once on the full frame and slice
+    the *state* along with the signal (F3/P1-5): re-warming inside every
+    evaluation slice zeroed leverage over each slice's warm-up bars even
+    though the trailing history existed on the full frame."""
+    periods = annualization_factor(interval)
+    bars_per_day = max(1.0, periods / 365.0)
+    vol_window = max(2, int(settings.position_sizing.vol_window_days * bars_per_day))
+    known_open_returns = frame["open"].pct_change().shift(1)
+    return known_open_returns.rolling(vol_window, min_periods=10).std() * np.sqrt(periods)
+
+
 def evaluate_strategy_path(
     frame: pd.DataFrame,
     signals: pd.Series,
@@ -386,6 +439,7 @@ def evaluate_strategy_path(
     settings: Settings,
     *,
     funding: pd.DataFrame | None = None,
+    realized_vol: pd.Series | None = None,
 ) -> StrategyPath:
     frame = frame.sort_values("open_time").reset_index(drop=True).copy()
     signals = pd.Series(signals.to_numpy(dtype=float), index=frame.index).clip(-1, 1).fillna(0.0)
@@ -395,11 +449,11 @@ def evaluate_strategy_path(
 
     open_returns = frame["open"].shift(-1) / frame["open"] - 1.0
     executable_signal = signals.shift(1).fillna(0.0)
-    periods = annualization_factor(candidate.interval)
-    bars_per_day = max(1.0, periods / 365.0)
-    vol_window = max(2, int(settings.position_sizing.vol_window_days * bars_per_day))
-    known_open_returns = frame["open"].pct_change().shift(1)
-    realized_vol = known_open_returns.rolling(vol_window, min_periods=10).std() * np.sqrt(periods)
+    if realized_vol is None:
+        realized_vol = realized_vol_series(frame, settings, candidate.interval)
+    else:
+        # Precomputed full-frame state sliced by the caller; align positionally.
+        realized_vol = pd.Series(np.asarray(realized_vol, dtype=float), index=frame.index)
     leverage = (settings.position_sizing.target_annual_vol / realized_vol.replace(0, np.nan)).clip(
         upper=settings.position_sizing.max_leverage_for(candidate.symbol)
     ).fillna(0.0)
@@ -422,6 +476,11 @@ def evaluate_strategy_path(
             stop_loss_pct=sl_pct, max_hold_bars=max_hold,
             tp_tiers=tiers, trailing_stop_pct=tr_pct, trailing_after_first_tp=tr_after_tp,
         )
+
+    reopen_indices = np.where(_pre_gap_flags(frame, candidate.interval))[0] + 1
+    if reopen_indices.size:
+        vol_target_position = _freeze_reopen_entries(vol_target_position, reopen_indices)
+        fixed_position = _freeze_reopen_entries(fixed_position, reopen_indices)
 
     primary_returns, primary_cost_bps, avg_participation = _strategy_returns(
         frame,
@@ -478,8 +537,10 @@ def run_backtest(
     funding: pd.DataFrame | None = None,
     data_quality_notes: list[DataQualityNote] | None = None,
     btc_regime_frame: pd.DataFrame | None = None,
+    realized_vol: pd.Series | None = None,
+    regime_labels: pd.Series | None = None,
 ) -> BacktestResult:
-    path = evaluate_strategy_path(frame, signals, candidate, settings, funding=funding)
+    path = evaluate_strategy_path(frame, signals, candidate, settings, funding=funding, realized_vol=realized_vol)
     frame = path.frame
     signals = path.signals
     open_returns = path.open_returns
@@ -515,8 +576,16 @@ def run_backtest(
     executable_sig = signals.shift(1).fillna(0.0)
     sig_arr = executable_sig.to_numpy(dtype=float)
     fwd_arr = forward_returns.to_numpy(dtype=float)
-    ic_series = pd.Series(rolling_pearson_ic(sig_arr, fwd_arr, window=_IC_WINDOW_BARS, min_periods=10), index=signals.index)
-    rankic_series = pd.Series(rolling_rank_ic(sig_arr, fwd_arr, window=_IC_WINDOW_BARS, min_periods=10), index=signals.index)
+    # G1 (P2-2): a bar whose next bar sits across a data outage has no 5-minute
+    # forward return — drop those bars from the IC inputs (compacted, then
+    # re-aligned with NaN so downstream .dropna() consumers stay positional).
+    ic_keep = ~_pre_gap_flags(frame, candidate.interval)
+    ic_vals = np.full(sig_arr.size, np.nan)
+    rankic_vals = np.full(sig_arr.size, np.nan)
+    ic_vals[ic_keep] = rolling_pearson_ic(sig_arr[ic_keep], fwd_arr[ic_keep], window=_IC_WINDOW_BARS, min_periods=10)
+    rankic_vals[ic_keep] = rolling_rank_ic(sig_arr[ic_keep], fwd_arr[ic_keep], window=_IC_WINDOW_BARS, min_periods=10)
+    ic_series = pd.Series(ic_vals, index=signals.index)
+    rankic_series = pd.Series(rankic_vals, index=signals.index)
     avg_hold = _avg_holding_period(vol_target_position)
     block_len = settings.bootstrap.block_length_bars(avg_hold)
     ret_arr = primary_returns.to_numpy(dtype=float)
@@ -530,8 +599,8 @@ def run_backtest(
     else:
         ci = (0.0, 0.0)
     permutation_p = permutation_test_mean_ic(
-        executable_sig,
-        forward_returns,
+        sig_arr[ic_keep],
+        fwd_arr[ic_keep],
         n_permutations=settings.permutation_test.n_permutations,
     )
     if trial_ledger is not None:
@@ -564,11 +633,17 @@ def run_backtest(
         skew=ret_skew,
         kurtosis=ret_kurt,
     )
-    regimes = label_btc_regime(btc_regime_frame if btc_regime_frame is not None else frame, settings.regime)
-    if len(regimes) == len(frame):
-        regimes = pd.Series(regimes.to_numpy(), index=frame.index).astype(str)
+    if regime_labels is not None:
+        # F3 (P1-5): labels computed on the full frame and sliced by the
+        # caller, so the slice's early bars carry real trailing regimes
+        # instead of the labeler's in-slice warm-up default.
+        regimes = pd.Series(np.asarray(regime_labels, dtype=object), index=frame.index).astype(str)
     else:
-        regimes = regimes.reindex(frame.index).fillna("sideways").astype(str)
+        regimes = label_btc_regime(btc_regime_frame if btc_regime_frame is not None else frame, settings.regime)
+        if len(regimes) == len(frame):
+            regimes = pd.Series(regimes.to_numpy(), index=frame.index).astype(str)
+        else:
+            regimes = regimes.reindex(frame.index).fillna("sideways").astype(str)
     trade_mask = vol_target_position.diff().abs().fillna(vol_target_position.abs()) > 1e-12
     regime_metrics = {}
     for regime in sorted(set(regimes)):
@@ -632,7 +707,12 @@ def run_backtest(
         avg_holding_period_bars=avg_hold,
         return_autocorr_lag1=return_autocorrelation_lag1(primary_returns),
         data_quality_notes=data_quality_notes or [],
-        oos_trade_count=_oos_trade_count(vol_target_position, frame, settings, candidate),
+        # F1 (P1-4): since the Q3 switch the evaluated frame IS the
+        # out-of-sample slice (validation in rounds, the untouched holdout at
+        # the terminal), so every trade in it is OOS relative to discovery.
+        # The old fold mask degenerated to "last 25% of the slice" on frames
+        # shorter than the configured windows — an arbitrary subset.
+        oos_trade_count=int(trade_mask.sum()),
         actual_cost_bps=path.avg_cost_bps,
         prior_posterior_ic_ratio=observed_ic / expected_ic_mid if expected_ic_mid > 0 else 1.0,
         window_stability=window_stability,
@@ -698,62 +778,6 @@ def _short_allowed(hypothesis_family: str) -> bool:
     """Check boundary conditions: is short-side trading allowed for this family?"""
     b = boundary_conditions(hypothesis_family)
     return bool(b.get("short_allowed", True))
-
-
-def walk_forward_oos_mask(frame: pd.DataFrame, settings: Settings, candidate: CandidateStrategySpec) -> pd.Series:
-    """Return bars belonging to walk-forward test windows.
-
-    For short fixtures that cannot fit the configured train/validation/test windows,
-    the final quarter is treated as the OOS holdout rather than pretending OOS is known.
-    """
-    frame = frame.sort_values("open_time").reset_index(drop=True)
-    mask = pd.Series(False, index=frame.index)
-    n_rows = len(frame)
-    if n_rows == 0:
-        return mask
-
-    interval_ms = _median_interval_ms(frame)
-    if interval_ms is None or interval_ms <= 0:
-        bars_per_month = max(1, int(annualization_factor(candidate.interval) / 12))
-    else:
-        bars_per_month = max(1, int(round(30 * 86_400_000 / interval_ms)))
-
-    train_bars = settings.walk_forward.train_months * bars_per_month
-    validation_bars = settings.walk_forward.validation_months * bars_per_month
-    test_bars = max(1, settings.walk_forward.test_months * bars_per_month)
-    purge_bars = settings.walk_forward.purge_bars(candidate.max_feature_lookback_bars)
-    embargo_bars = max(0, settings.walk_forward.embargo_bars)
-    start = train_bars + validation_bars + purge_bars
-
-    while start < n_rows:
-        end = min(n_rows, start + test_bars)
-        mask.iloc[start:end] = True
-        start = end + embargo_bars + purge_bars
-
-    if not bool(mask.any()):
-        mask.iloc[int(n_rows * 0.75):] = True
-    return mask
-
-
-def _oos_trade_count(
-    position: pd.Series,
-    frame: pd.DataFrame,
-    settings: Settings,
-    candidate: CandidateStrategySpec,
-) -> int:
-    oos_mask = walk_forward_oos_mask(frame, settings, candidate)
-    trade_mask = position.diff().abs().fillna(position.abs()) > 1e-12
-    return int((trade_mask & oos_mask).sum())
-
-
-def _median_interval_ms(frame: pd.DataFrame) -> int | None:
-    if "open_time" not in frame or len(frame) < 2:
-        return None
-    diffs = pd.Series(frame["open_time"]).diff().dropna()
-    diffs = diffs[diffs > 0]
-    if diffs.empty:
-        return None
-    return int(diffs.median())
 
 
 def build_backtest_detail(

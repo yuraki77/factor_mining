@@ -13,15 +13,10 @@ trial_ledger:
   window_days: 90
 
 walk_forward:
-  mode: "rolling"
-  train_months: 12
-  validation_months: 3
-  test_months: 3
   purge_bars_floor: 288
   embargo_bars: 288
-  min_folds: 4
 
-cpcv:
+cscv:
   n_groups: 8
   test_groups: 2
   pbo_threshold: 0.40
@@ -46,8 +41,6 @@ newey_west:
 
 permutation_test:
   n_permutations: 100
-  permute_target: "factor_values"
-  test_statistic: "mean_ic"
 
 position_sizing:
   primary: "vol_target"

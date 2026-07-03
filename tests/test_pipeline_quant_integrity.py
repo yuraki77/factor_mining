@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from factor_mining.config import BootstrapConfig, CPCVConfig, DataConfig, PermutationTestConfig, Settings
+from factor_mining.config import BootstrapConfig, CSCVConfig, DataConfig, PermutationTestConfig, Settings
 from factor_mining.models import (
     BacktestResult,
     CandidateStrategySpec,
@@ -310,7 +310,7 @@ def test_mining_round_gates_on_validation_and_never_touches_holdout(monkeypatch)
             for idx, item in enumerate(candidates)
         ]
 
-    def fake_backtests(tasks, frame_arg, settings, max_workers, funding_df=None):
+    def fake_backtests(tasks, frame_arg, settings, max_workers, funding_df=None, **state):
         backtest_window_starts.append(int(frame_arg["open_time"].iloc[0]))
         results = []
         for _signal, candidate_dict, _idx, _trial_counts, _notes in tasks:
@@ -331,7 +331,7 @@ def test_mining_round_gates_on_validation_and_never_touches_holdout(monkeypatch)
             )
         return results
 
-    def fake_apply_batch_pbo(frame_arg, tasks, results, settings, funding_df):
+    def fake_apply_batch_pbo(frame_arg, tasks, results, settings, funding_df, **state):
         pbo_frame_lengths.append(len(frame_arg))
         for result in results:
             result.pbo = 0.2
@@ -2068,7 +2068,7 @@ def test_unfunded_filter_skips_only_funding_factor_signal_candidates() -> None:
 def test_batch_pbo_is_computed_from_candidate_returns(tmp_path) -> None:
     settings = Settings(
         data=DataConfig(sqlite_path=tmp_path / "meta.sqlite3"),
-        cpcv=CPCVConfig(n_groups=4, test_groups=1),
+        cscv=CSCVConfig(n_groups=4, test_groups=1),
     )
     frame = _frame(220)
     candidate_a = CandidateStrategySpec(
@@ -2300,7 +2300,7 @@ def test_terminal_holdout_evaluates_survivors_once_with_cumulative_fdr(monkeypat
             for idx, item in enumerate(candidates)
         ]
 
-    def fake_backtests(tasks, frame_arg, settings_arg, max_workers, funding_df=None):
+    def fake_backtests(tasks, frame_arg, settings_arg, max_workers, funding_df=None, **state):
         backtest_window_starts.append(int(frame_arg["open_time"].iloc[0]))
         results = []
         for _signal, candidate_dict, _idx, trial_counts, _notes in tasks:
@@ -2376,7 +2376,7 @@ def test_batch_pbo_does_not_punish_never_selected_members(monkeypatch) -> None:
     that is never the in-sample winner must inherit the batch-level PBO, not
     an automatic 1.0 — otherwise being batched with one dominant sibling
     hard-fails G2 (blocking) regardless of the candidate's own merit."""
-    settings = Settings(cpcv=CPCVConfig(n_groups=8))
+    settings = Settings(cscv=CSCVConfig(n_groups=8))
     frame = _frame(400)
 
     def _cand(cid: str) -> CandidateStrategySpec:
@@ -2409,7 +2409,7 @@ def test_batch_pbo_does_not_punish_never_selected_members(monkeypatch) -> None:
     monkeypatch.setattr(
         pipeline,
         "evaluate_strategy_path",
-        lambda frame_arg, signal, candidate, settings_arg, funding=None: _FakePath(returns[candidate.candidate_id]),
+        lambda frame_arg, signal, candidate, settings_arg, funding=None, realized_vol=None: _FakePath(returns[candidate.candidate_id]),
     )
 
     tasks = [
@@ -2433,7 +2433,7 @@ def test_cscv_split_subsample_is_not_lexicographically_biased() -> None:
     """When the unique split pairs exceed the cap, the subset must be sampled,
     not truncated: the first 128 lexicographic train sets all contain the
     earliest groups, so PBO would only ever train on early data."""
-    settings = Settings(cpcv=CPCVConfig(n_groups=16))
+    settings = Settings(cscv=CSCVConfig(n_groups=16))
     splits = _cscv_splits(1600, settings)
 
     assert len(splits) == 128
@@ -2472,3 +2472,27 @@ def test_merge_pool_penalty_propagates_raised_trials_to_bailey_dsr() -> None:
         kurtosis=result.return_kurtosis,
     )
     assert result.deflated_sharpe_prob < single_trial_equiv
+
+
+def test_g1_shadow_calibration_classifies_divergence_without_gating() -> None:
+    """E2/DP-B: the haircut-vs-Bailey-DSR comparison must be recorded per
+    terminal result so the G1 re-pointing decision is made on accumulated
+    evidence — and it must remain observational (no gate reads it)."""
+    both = _result("e1", "c_both", pbo=0.2, sharpe=2.0)
+    both.deflated_sharpe, both.deflated_sharpe_prob = 0.5, 0.99
+    haircut_only = _result("e2", "c_haircut", pbo=0.2, sharpe=1.5)
+    haircut_only.deflated_sharpe, haircut_only.deflated_sharpe_prob = 0.3, 0.60
+    prob_only = _result("e3", "c_prob", pbo=0.2, sharpe=1.2)
+    prob_only.deflated_sharpe, prob_only.deflated_sharpe_prob = -0.1, 0.97
+    neither = _result("e4", "c_neither", pbo=0.2, sharpe=0.2)
+    neither.deflated_sharpe, neither.deflated_sharpe_prob = -0.4, 0.10
+    legacy = _result("e5", "c_legacy", pbo=0.2, sharpe=0.5)
+    legacy.deflated_sharpe, legacy.deflated_sharpe_prob = 0.2, None  # pre-upgrade artifact
+
+    summary = pipeline._g1_calibration_summary([both, haircut_only, prob_only, neither, legacy])
+
+    assert summary["counts"] == {"both_pass": 1, "haircut_only": 2, "prob_only": 1, "neither": 1}
+    assert summary["n_divergent"] == 3
+    assert summary["n_results"] == 5
+    legacy_row = next(row for row in summary["rows"] if row["candidate_id"] == "c_legacy")
+    assert legacy_row["prob_pass"] is False  # missing prob never silently passes

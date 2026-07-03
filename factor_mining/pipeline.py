@@ -260,6 +260,8 @@ class SignalBuildSkip:
 _worker_frame: pd.DataFrame | None = None
 _worker_settings: Settings | None = None
 _worker_funding: pd.DataFrame | None = None
+_worker_realized_vol: pd.Series | None = None
+_worker_regime_labels: pd.Series | None = None
 _EVENT_SINK: Callable[[str, str, str, dict[str, Any] | None], None] | None = None
 _RUN_ID: str | None = None
 
@@ -290,11 +292,19 @@ _DETAIL_ARTIFACT_LIMIT_PER_SCOPE = 96
 _DETAIL_BUCKET_LIMIT = 24
 
 
-def _init_worker(frame: pd.DataFrame, settings: Settings, funding_df: pd.DataFrame | None = None) -> None:
-    global _worker_frame, _worker_settings, _worker_funding
+def _init_worker(
+    frame: pd.DataFrame,
+    settings: Settings,
+    funding_df: pd.DataFrame | None = None,
+    realized_vol: pd.Series | None = None,
+    regime_labels: pd.Series | None = None,
+) -> None:
+    global _worker_frame, _worker_settings, _worker_funding, _worker_realized_vol, _worker_regime_labels
     _worker_frame = frame
     _worker_settings = settings
     _worker_funding = funding_df
+    _worker_realized_vol = realized_vol
+    _worker_regime_labels = regime_labels
 
 
 def _execute_backtest_task(
@@ -302,6 +312,8 @@ def _execute_backtest_task(
     frame: pd.DataFrame,
     settings: Settings,
     funding_df: pd.DataFrame | None,
+    realized_vol: pd.Series | None = None,
+    regime_labels: pd.Series | None = None,
 ) -> BacktestResult | Exception:
     signal_arr, candidate_dict, trial_counts, data_quality_note_dicts = args
     from factor_mining.backtest.engine import run_backtest
@@ -319,6 +331,8 @@ def _execute_backtest_task(
             trial_counts=trial_counts,
             data_quality_notes=data_quality_notes,
             funding=funding_df,
+            realized_vol=realized_vol,
+            regime_labels=regime_labels,
         )
     except Exception as exc:
         return exc
@@ -328,7 +342,10 @@ def _run_one_backtest(args: tuple) -> BacktestResult | Exception:
     # Process-pool entry point: the per-process context is set by _init_worker.
     # In-process (serial) callers must use _execute_backtest_task with explicit
     # arguments instead — module globals are shared across symbol-group threads.
-    return _execute_backtest_task(args, _worker_frame, _worker_settings, _worker_funding)
+    return _execute_backtest_task(
+        args, _worker_frame, _worker_settings, _worker_funding,
+        _worker_realized_vol, _worker_regime_labels,
+    )
 
 
 # ── main pipeline ───────────────────────────────────────────────────
@@ -773,6 +790,11 @@ def reproduce_candidate(
     final_signal = pd.Series(
         np.asarray(signal_arr, dtype=float)[mask_arr], index=final_frame.index
     )
+    # F3: mirror the pipeline's full-frame state slicing so the reproduced
+    # metrics match what the terminal holdout computed.
+    full_state_vol, full_state_regimes = _full_frame_backtest_state(ctx.frame, settings, [spec])
+    final_state_vol = _masked_series(full_state_vol, split_plan.final_oos_mask)
+    final_state_regimes = _masked_series(full_state_regimes, split_plan.final_oos_mask)
 
     result = run_backtest(
         final_frame,
@@ -781,6 +803,8 @@ def reproduce_candidate(
         settings,
         trial_counts=trial_counts or {"effective_trials_count": 1, "global_cumulative_trials_count": 1},
         funding=ctx.funding_df,
+        realized_vol=final_state_vol,
+        regime_labels=final_state_regimes,
     )
     # Q9: surface whether the reproduced final-OOS split was purged (Q10), so the
     # result is honest about its holdout discipline like the pipeline path.
@@ -1387,6 +1411,9 @@ def verify_research_survivors(
                 data_quality_notes=context.data_quality_notes,
                 max_workers=max_workers,
             )
+            full_state_vol, full_state_regimes = _full_frame_backtest_state(context.frame, settings, symbol_candidates)
+            final_state_vol = _masked_series(full_state_vol, split_plan.final_oos_mask)
+            final_state_regimes = _masked_series(full_state_regimes, split_plan.final_oos_mask)
             final_tasks = _slice_tasks(full_tasks, split_plan.final_oos_mask)
             round_backtests = _run_backtests_parallel(
                 final_tasks,
@@ -1394,9 +1421,14 @@ def verify_research_survivors(
                 settings,
                 max_workers,
                 context.funding_df,
+                realized_vol=final_state_vol,
+                regime_labels=final_state_regimes,
             )
             if round_backtests:
-                _apply_batch_pbo(final_frame, final_tasks, round_backtests, settings, context.funding_df)
+                _apply_batch_pbo(
+                    final_frame, final_tasks, round_backtests, settings, context.funding_df,
+                    realized_vol=final_state_vol,
+                )
 
             # Q9: wire G11's split-overlap signal to the actual purge geometry.
             for backtest in round_backtests:
@@ -1601,12 +1633,21 @@ def _evaluate_final_holdout(
             data_quality_notes=context.data_quality_notes,
             max_workers=max_workers,
         )
+        full_state_vol, full_state_regimes = _full_frame_backtest_state(context.frame, settings, group_candidates)
+        final_state_vol = _masked_series(full_state_vol, split_plan.final_oos_mask)
+        final_state_regimes = _masked_series(full_state_regimes, split_plan.final_oos_mask)
         final_tasks = _slice_tasks(full_tasks, split_plan.final_oos_mask)
-        final_backtests = _run_backtests_parallel(final_tasks, final_frame, settings, max_workers, context.funding_df)
+        final_backtests = _run_backtests_parallel(
+            final_tasks, final_frame, settings, max_workers, context.funding_df,
+            realized_vol=final_state_vol, regime_labels=final_state_regimes,
+        )
         if not final_backtests:
             _log(f"  Terminal holdout {context.symbol}/{context.market}: no results")
             continue
-        _apply_batch_pbo(final_frame, final_tasks, final_backtests, settings, context.funding_df)
+        _apply_batch_pbo(
+            final_frame, final_tasks, final_backtests, settings, context.funding_df,
+            realized_vol=final_state_vol,
+        )
         for result in final_backtests:
             # Q9: wire G11's split-overlap signal to the actual purge geometry.
             result.split_overlap_detected = not split_plan.gaps_honored
@@ -1691,7 +1732,53 @@ def _evaluate_final_holdout(
             "research_gate": [g.model_dump(mode="json") for g in output.research_gates],
             "research_survivors": output.research_survivors,
         })
+        # E2: shadow-compare the current G1 metric (haircut > 0) against the
+        # Bailey DSR candidate criterion without changing any gate. The
+        # accumulated artifacts are the evidence base for the deliberate
+        # re-pointing decision (DP-B).
+        store.save_artifact(
+            f"g1_calibration_{run_id or uuid.uuid4().hex[:12]}",
+            "g1_calibration_shadow",
+            _g1_calibration_summary(output.backtests),
+        )
     return output
+
+
+_G1_SHADOW_PROB_THRESHOLD = 0.95
+
+
+def _g1_calibration_summary(results: list[BacktestResult]) -> dict[str, Any]:
+    """Shadow comparison of G1's haircut criterion vs the Bailey DSR
+    probability (E2/DP-B). Purely observational: G1 still gates on the
+    haircut; this records where the two verdicts diverge so the re-pointing
+    decision can be made on accumulated run data instead of a guess."""
+    rows = []
+    counts = {"both_pass": 0, "haircut_only": 0, "prob_only": 0, "neither": 0}
+    for result in results:
+        haircut_pass = result.deflated_sharpe > 0.0
+        prob_pass = (result.deflated_sharpe_prob or 0.0) >= _G1_SHADOW_PROB_THRESHOLD
+        key = (
+            "both_pass" if haircut_pass and prob_pass
+            else "haircut_only" if haircut_pass
+            else "prob_only" if prob_pass
+            else "neither"
+        )
+        counts[key] += 1
+        rows.append({
+            "candidate_id": result.candidate_id,
+            "deflated_sharpe": float(result.deflated_sharpe),
+            "deflated_sharpe_prob": result.deflated_sharpe_prob,
+            "effective_trials_at_eval": int(result.effective_trials_at_eval),
+            "haircut_pass": haircut_pass,
+            "prob_pass": prob_pass,
+        })
+    return {
+        "prob_threshold": _G1_SHADOW_PROB_THRESHOLD,
+        "counts": counts,
+        "n_results": len(rows),
+        "n_divergent": counts["haircut_only"] + counts["prob_only"],
+        "rows": rows,
+    }
 
 
 def _run_mining_round(
@@ -1744,6 +1831,14 @@ def _run_mining_round(
     validation_regimes = _masked_series(forward_regimes, split_plan.repair_validation_mask)
     discovery_funding_rate = _masked_series(funding_rate, split_plan.discovery_mask) if funding_rate is not None else None
     validation_funding_rate = _masked_series(funding_rate, split_plan.repair_validation_mask) if funding_rate is not None else None
+    # F3 (P1-5): vol-target and regime-label state is computed once on the
+    # full frame and sliced with each stage's mask, so a slice's early bars
+    # carry real trailing state instead of re-warming from nothing.
+    full_state_vol, full_state_regimes = _full_frame_backtest_state(frame, settings, current_candidates)
+    discovery_state_vol = _masked_series(full_state_vol, split_plan.discovery_mask)
+    discovery_state_regimes = _masked_series(full_state_regimes, split_plan.discovery_mask)
+    validation_state_vol = _masked_series(full_state_vol, split_plan.repair_validation_mask)
+    validation_state_regimes = _masked_series(full_state_regimes, split_plan.repair_validation_mask)
     _log(
         "  Split: "
         f"discovery={len(discovery_frame):,} bars, "
@@ -1801,7 +1896,10 @@ def _run_mining_round(
         fingerprint=checkpoint_fingerprint,
         log_label="Discovery backtests",
         decode=BacktestResult.model_validate,
-        compute=lambda: _run_backtests_parallel(discovery_tasks, discovery_frame, settings, max_workers, funding_df),
+        compute=lambda: _run_backtests_parallel(
+            discovery_tasks, discovery_frame, settings, max_workers, funding_df,
+            realized_vol=discovery_state_vol, regime_labels=discovery_state_regimes,
+        ),
         encode=lambda result: result.model_dump(mode="json"),
     )
 
@@ -1913,9 +2011,14 @@ def _run_mining_round(
             settings,
             max_workers,
             funding_df,
+            realized_vol=validation_state_vol,
+            regime_labels=validation_state_regimes,
         )
         if results:
-            _apply_batch_pbo(repair_validation_frame, validation_tasks, results, settings, funding_df)
+            _apply_batch_pbo(
+                repair_validation_frame, validation_tasks, results, settings, funding_df,
+                realized_vol=validation_state_vol,
+            )
         return results
 
     validation_backtests = _checkpointed_stage(
@@ -2455,8 +2558,7 @@ def _build_data_split_plan(
     # split — carved off the END of each upstream split (discovery before
     # validation, validation before the final holdout), so a downstream split's
     # feature window can't reach back into the data the optimizer already used
-    # (lookahead across the train/test boundary). Mirrors walk_forward_oos_mask's
-    # purge+embargo inter-fold spacing. All-or-nothing: the full gap is applied at
+    # (lookahead across the train/test boundary). All-or-nothing: the full gap is applied at
     # both boundaries only when each upstream split can spare it (keeps >= gap
     # bars), so a real run on a long frame purges while a short fixture is left
     # exactly as-is. gaps_honored records whether it was applied, so the G11
@@ -2499,6 +2601,22 @@ def _masked_frame(frame: pd.DataFrame, mask: pd.Series) -> pd.DataFrame:
 
 def _masked_series(series: pd.Series, mask: pd.Series) -> pd.Series:
     return pd.Series(series.to_numpy(), index=mask.index).loc[mask.to_numpy()].reset_index(drop=True)
+
+
+def _full_frame_backtest_state(
+    frame: pd.DataFrame,
+    settings: Settings,
+    candidates: list[CandidateStrategySpec],
+) -> tuple[pd.Series, pd.Series]:
+    """Vol-target and regime-label state over the FULL frame (F3/P1-5).
+
+    Sliced by the caller with the same mask as the frame, so each evaluation
+    slice starts with real trailing state instead of a fresh warm-up."""
+    from factor_mining.backtest.engine import realized_vol_series
+    from factor_mining.stats.regime import label_btc_regime
+
+    interval = candidates[0].interval if candidates else settings.data.default_interval
+    return realized_vol_series(frame, settings, interval), label_btc_regime(frame, settings.regime)
 
 
 def _slice_tasks(tasks: list[tuple], mask: pd.Series) -> list[tuple]:
@@ -3711,6 +3829,7 @@ def _apply_batch_pbo(
     results: list[BacktestResult],
     settings: Settings,
     funding_df: pd.DataFrame | None,
+    realized_vol: pd.Series | None = None,
 ) -> None:
     """CSCV probability of backtest overfitting for a batch of candidates.
 
@@ -3737,6 +3856,7 @@ def _apply_batch_pbo(
             candidate,
             settings,
             funding=funding_df,
+            realized_vol=realized_vol,
         )
         returns_by_candidate[candidate_id] = path.strategy_returns.reset_index(drop=True)
         periods_by_candidate[candidate_id] = annualization_factor(candidate.interval)
@@ -3788,7 +3908,7 @@ def _apply_batch_pbo(
 
 
 def _cscv_splits(n_rows: int, settings: Settings) -> list[tuple[np.ndarray, np.ndarray]]:
-    n_groups = min(settings.cpcv.n_groups, n_rows)
+    n_groups = min(settings.cscv.n_groups, n_rows)
     if n_groups % 2 == 1:
         n_groups -= 1
     if n_groups < 4:
@@ -4564,9 +4684,11 @@ def _apply_transform(
         mu = raw.rolling(window, min_periods=20).mean()
         sigma = raw.rolling(window, min_periods=20).std().replace(0, np.nan)
         z = ((raw - mu) / sigma).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        # Apply smoothing (e.g. 1 hour = 12 bars) to prevent rapid flipping
-        smooth_z = z.ewm(span=12, min_periods=1).mean()
-        sig = direction * np.tanh(smooth_z / scale)
+        # I3 (P2-6): smoothing is solely the candidate's smooth_span, applied in
+        # _apply_signal_controls like every other transform. The old hardcoded
+        # 12-bar EWM here meant "smoothing off" (smooth_span=1) never was, and
+        # smooth_span=12 silently double-smoothed.
+        sig = direction * np.tanh(z / scale)
         return _apply_signal_controls(sig.fillna(0.0), params)
     elif transform == "rank":
         window = params.get("zscore_window", 288)
@@ -5155,8 +5277,14 @@ def _run_backtests_parallel(
     settings: Settings,
     max_workers: int | None,
     funding_df: pd.DataFrame | None = None,
+    realized_vol: pd.Series | None = None,
+    regime_labels: pd.Series | None = None,
 ) -> list[BacktestResult]:
-    """Execute backtests in parallel, collecting successful results."""
+    """Execute backtests in parallel, collecting successful results.
+
+    ``realized_vol``/``regime_labels`` are full-frame state sliced by the
+    caller to the same mask as ``frame`` (F3/P1-5); they are per-frame, not
+    per-task, so they travel via the worker initializer."""
     n_workers = min(max_workers or os.cpu_count() or 4, len(tasks))
     result_by_idx: dict[int, BacktestResult] = {}
 
@@ -5165,14 +5293,14 @@ def _run_backtests_parallel(
     if n_workers <= 1:
         for idx, task in enumerate(slim_tasks):
             c = CandidateStrategySpec.model_validate(tasks[idx][1])
-            out = _execute_backtest_task(task, frame, settings, funding_df)
+            out = _execute_backtest_task(task, frame, settings, funding_df, realized_vol, regime_labels)
             if isinstance(out, Exception):
                 _log(f"  [{idx + 1}/{len(tasks)}] {c.candidate_id[:16]}... SKIP: {out}")
             else:
                 result_by_idx[idx] = out
         return [result_by_idx[i] for i in sorted(result_by_idx)]
 
-    with ProcessPoolExecutor(max_workers=n_workers, initializer=_init_worker, initargs=(frame, settings, funding_df)) as executor:
+    with ProcessPoolExecutor(max_workers=n_workers, initializer=_init_worker, initargs=(frame, settings, funding_df, realized_vol, regime_labels)) as executor:
         future_to_idx = {executor.submit(_run_one_backtest, t): tasks[i][2] for i, t in enumerate(slim_tasks)}
         for future in as_completed(future_to_idx):
             idx = future_to_idx[future]

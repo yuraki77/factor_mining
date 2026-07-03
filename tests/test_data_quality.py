@@ -353,3 +353,47 @@ def test_checkpoint_fingerprint_detects_content_change_with_identical_shape() ->
     assert original["open_time_min"] == changed["open_time_min"]
     assert original["open_time_max"] == changed["open_time_max"]
     assert original != changed
+
+
+def test_supplemental_alignment_never_uses_future_stamped_records() -> None:
+    """G2 (P2-5): the bar at open_time T must receive the last supplemental
+    record stamped <= T. A record stamped after T leaking backward would be
+    lookahead no signal lag can repair."""
+    import pandas as pd
+
+    from factor_mining.data.loader import _aligned_dataset_series
+
+    frame = pd.DataFrame({"open_time": [0, 300, 600, 900]})
+    dataset = pd.DataFrame({"timestamp": [299, 601], "value": [1.0, 2.0]})
+
+    aligned = _aligned_dataset_series(frame, dataset, "timestamp", "value")
+
+    # Bar 0: nothing stamped yet. Bar 300: sees the 299 record. Bar 600: the
+    # 601 record is in the future — must still carry 1.0. Bar 900: sees 2.0.
+    assert pd.isna(aligned.iloc[0])
+    assert aligned.iloc[1] == 1.0
+    assert aligned.iloc[2] == 1.0
+    assert aligned.iloc[3] == 2.0
+
+
+def test_funding_event_zscore_changes_only_at_event_boundaries() -> None:
+    """G2 (P2-5): funding statistics are computed on event snapshots, not on
+    forward-filled per-bar copies — and a bar before an event's calc_time
+    must not reflect that event."""
+    import pandas as pd
+
+    from factor_mining.data.loader import funding_event_zscore_to_frame
+
+    frame = pd.DataFrame({"open_time": list(range(0, 3000, 300))})
+    funding = pd.DataFrame({
+        "calc_time": [500, 1500, 2500],
+        "last_funding_rate": [0.01, 0.03, -0.02],
+    })
+
+    z = funding_event_zscore_to_frame(frame, funding, lookback_events=3)
+
+    # Bars before the first event stay 0 (no backfill of future events).
+    assert (z.iloc[:2] == 0.0).all()
+    # Value is constant between events (event-indexed stats, ffilled).
+    assert z.iloc[2] == z.iloc[3] == z.iloc[4]
+    assert z.iloc[6] == z.iloc[7] == z.iloc[8]

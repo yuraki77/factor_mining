@@ -2,8 +2,8 @@ import pandas as pd
 import pytest
 
 from factor_mining.archive import archive_experiment, verify_archive
-from factor_mining.backtest.engine import _EQUITY_CURVE_MAX_POINTS, _apply_exit_rules, _bounded_equity_curve, evaluate_strategy_path, run_backtest, walk_forward_oos_mask
-from factor_mining.config import BootstrapConfig, DataConfig, GateCheckConfig, PermutationTestConfig, PositionSizingConfig, Settings, WalkForwardConfig
+from factor_mining.backtest.engine import _EQUITY_CURVE_MAX_POINTS, _apply_exit_rules, _bounded_equity_curve, evaluate_strategy_path, run_backtest
+from factor_mining.config import BootstrapConfig, DataConfig, GateCheckConfig, PermutationTestConfig, PositionSizingConfig, Settings
 from factor_mining.models import BacktestResult, CandidateStrategySpec, DataQualityNote, FactorEvidenceReport, GateCheckResult, MetricsBlock
 from factor_mining.registry import get_method
 from factor_mining.storage import MetadataStore
@@ -36,32 +36,27 @@ def make_frame(n: int = 400) -> pd.DataFrame:
     )
 
 
-def test_walk_forward_oos_mask_purges_between_test_windows() -> None:
-    month_ms = 30 * 86_400_000
-    frame = pd.DataFrame({"open_time": [1_700_000_000_000 + idx * month_ms for idx in range(15)]})
-    settings = Settings(
-        walk_forward=WalkForwardConfig(
-            train_months=0,
-            validation_months=0,
-            test_months=2,
-            purge_bars_floor=2,
-            embargo_bars=3,
-        )
-    )
+def test_oos_trade_count_covers_the_whole_evaluated_slice(tmp_path) -> None:
+    """F1 (P1-4): since the Q3 switch the evaluated frame IS the OOS slice, so
+    every trade in it must count. The deleted fold mask degenerated to "last
+    25% of the slice" on short frames, so a strategy whose trades happened
+    early reported ~zero OOS trades — starving G7 and survivor promotion of
+    evidence that actually existed."""
+    settings = small_settings(tmp_path)
+    frame = make_frame(200)
+    # Trade activity only in the FIRST quarter of the slice; flat afterwards.
+    signals = pd.Series([1.0, 0.0] * 25 + [0.0] * 150, dtype=float)
     candidate = CandidateStrategySpec(
-        candidate_id="c-wf",
+        candidate_id="c-oos",
         hypothesis_id="h1",
-        method_id="factor_scoring",
+        method_id="rule_mining",
         hypothesis_family="momentum",
         symbol="BTCUSDT",
-        max_feature_lookback_bars=1,
+        params={"expected_ic_mid": 0.02},
     )
-
-    mask = walk_forward_oos_mask(frame, settings, candidate)
-    oos_indices = list(mask[mask].index)
-
-    assert oos_indices[:4] == [2, 3, 9, 10]
-    assert oos_indices[2] - oos_indices[1] - 1 == 5
+    result = run_backtest(frame, signals, candidate, settings)
+    assert result.oos_trade_count > 0
+    assert result.oos_trade_count == result.metrics_primary.trade_count
 
 
 def test_gatecheck_result_carries_candidate_id() -> None:
@@ -576,3 +571,274 @@ def test_risk_stratification_rejects_mispaired_batches() -> None:
     gate = run_gatecheck(result, Settings(), method=get_method("factor_scoring"))
     with pytest.raises(ValueError):
         apply_risk_stratified_gatechecks([result, result], [gate], [], Settings())
+
+
+def test_g3_fdr_failure_warns_but_does_not_block_by_decision() -> None:
+    """P1-1 decision (2026-07): G3 is intentionally non-blocking. FDR
+    multiplicity already binds at the terminal holdout (cumulative n_tests)
+    and at survivor promotion (fdr_pvalue < promotion_fdr); blocking the gate
+    on G3 too would double-penalize underpowered-but-real signals the
+    survivor path exists to accumulate evidence for. If G3 is ever added to
+    _BLOCKING_RULES this test must be revisited alongside that rationale."""
+    from factor_mining.validation.gatecheck import _BLOCKING_RULES
+
+    assert "G3" not in _BLOCKING_RULES
+    result = _gate_ready_result(pbo=0.2)
+    gate = run_gatecheck(result, Settings(), method=get_method("rule_mining"), fdr_adjusted_pvalue=0.9)
+    g3 = next(item for item in gate.items if item.rule_id == "G3")
+    assert g3.status == "warn"
+    assert gate.raw_passed
+
+
+def test_sliced_full_frame_vol_state_removes_per_slice_warmup(tmp_path) -> None:
+    """F3 (P1-5): every evaluation slice used to re-warm its vol estimate from
+    nothing, zeroing leverage over the slice's warm-up bars even though the
+    trailing history existed on the full frame. With the full-frame state
+    sliced alongside the signal, the position must be active from the first
+    executable bar of the slice."""
+    from factor_mining.backtest.engine import realized_vol_series
+
+    settings = small_settings(tmp_path)
+    rng_prices = [100.0]
+    for idx in range(599):
+        rng_prices.append(rng_prices[-1] * (1.0 + (0.002 if idx % 3 else -0.001)))
+    full = make_frame(600)
+    full["open"] = rng_prices
+    full["close"] = [p * 1.0005 for p in rng_prices]
+
+    signals_full = pd.Series([1.0] * 600)
+    start = 400
+    sliced_frame = full.iloc[start:].reset_index(drop=True)
+    sliced_signal = signals_full.iloc[start:].reset_index(drop=True)
+    candidate = CandidateStrategySpec(
+        candidate_id="c-f3",
+        hypothesis_id="h1",
+        method_id="rule_mining",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+    )
+
+    rewarmed = evaluate_strategy_path(sliced_frame, sliced_signal, candidate, settings)
+    sliced_vol = realized_vol_series(full, settings, "5m").iloc[start:].reset_index(drop=True)
+    carried = evaluate_strategy_path(
+        sliced_frame, sliced_signal, candidate, settings, realized_vol=sliced_vol
+    )
+
+    first_active_rewarmed = int((rewarmed.position.abs() > 1e-12).idxmax())
+    first_active_carried = int((carried.position.abs() > 1e-12).idxmax())
+    assert first_active_rewarmed >= 10  # in-slice warm-up (min_periods)
+    assert first_active_carried <= 2  # trailing state carried into the slice
+
+
+def test_regime_labels_flow_from_caller_into_regime_metrics(tmp_path) -> None:
+    """F3 (P1-5): regime-conditional metrics must use labels computed on the
+    full frame and sliced by the caller — the in-slice labeler needs a 60-day
+    warm-up and quietly pushed every early bar into 'sideways'."""
+    settings = small_settings(tmp_path)
+    frame = make_frame(120)
+    signals = pd.Series([1.0] * 120)
+    candidate = CandidateStrategySpec(
+        candidate_id="c-f3r",
+        hypothesis_id="h1",
+        method_id="rule_mining",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+    )
+    labels = pd.Series(["bull" if i < 60 else "bear" for i in range(120)])
+
+    with_labels = run_backtest(frame, signals, candidate, settings, regime_labels=labels)
+    without_labels = run_backtest(frame, signals, candidate, settings)
+
+    assert set(with_labels.regime_conditional_metrics) == {"bull", "bear"}
+    assert set(without_labels.regime_conditional_metrics) == {"sideways"}
+
+
+def _gap_frame(n: int = 120, gap_after: int = 59, gap_bars: int = 72) -> pd.DataFrame:
+    """5m frame with a data outage: bar ``gap_after``'s next bar is ``gap_bars``
+    intervals later (a 6h outage for the defaults)."""
+    frame = make_frame(n)
+    open_times = frame["open_time"].to_numpy().copy()
+    open_times[gap_after + 1:] += gap_bars * 300_000
+    frame["open_time"] = open_times
+    return frame
+
+
+def test_cross_gap_returns_are_excluded_from_ic_inputs(tmp_path, monkeypatch) -> None:
+    """G1 (P2-2): the 1-bar 'return' spanning a 6-hour outage is not a
+    5-minute quantity; feeding it to IC/permutation inputs lets one outage
+    print dominate the correlation. The pre-gap bar must be dropped from the
+    compacted IC inputs."""
+    captured = {}
+
+    def fake_rolling_ic(signals, forward_returns, window=288, min_periods=10):
+        captured["fwd"] = list(forward_returns)
+        return pd.Series(forward_returns).fillna(0.0).to_numpy() * 0.0
+
+    monkeypatch.setattr("factor_mining.backtest.engine.rolling_pearson_ic", fake_rolling_ic)
+    settings = small_settings(tmp_path)
+    frame = _gap_frame(120, gap_after=59)
+    # Make the cross-gap print huge so its exclusion is unambiguous.
+    frame.loc[60:, "open"] = frame.loc[60:, "open"] * 2.0
+    signals = pd.Series([float(idx % 5) for idx in range(120)])
+    candidate = CandidateStrategySpec(
+        candidate_id="c-gap-ic",
+        hypothesis_id="h1",
+        method_id="rule_mining",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+    )
+
+    run_backtest(frame, signals, candidate, settings)
+
+    cross_gap_return = frame.loc[60, "open"] / frame.loc[59, "open"] - 1.0
+    assert len(captured["fwd"]) == 119  # pre-gap bar dropped
+    assert not any(abs(v - cross_gap_return) < 1e-12 for v in captured["fwd"])
+
+
+def test_reopen_bar_blocks_new_entries_but_allows_exits(tmp_path) -> None:
+    """G1 (P2-2): a fill on the first print after an outage, from a signal
+    built on pre-gap information, is fantasy — new risk must wait one bar.
+    Exits stay allowed: holding losers because the market was down is worse
+    than the fantasy fill."""
+    settings = small_settings(tmp_path)
+    candidate = CandidateStrategySpec(
+        candidate_id="c-gap-entry",
+        hypothesis_id="h1",
+        method_id="rule_mining",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+    )
+    frame = _gap_frame(120, gap_after=59)
+
+    # Entry case: flat before the gap, signal turns on at the pre-gap bar →
+    # the executable entry lands exactly on the reopen bar (60).
+    entry_signal = pd.Series([0.0] * 59 + [1.0] * 61)
+    entry_path = evaluate_strategy_path(frame, entry_signal, candidate, settings)
+    assert abs(entry_path.position.iloc[60]) < 1e-12  # no fill into the reopen print
+    assert abs(entry_path.position.iloc[61]) > 1e-12  # entry executes one bar later
+
+    # Exit case: long before the gap, signal turns off at the pre-gap bar →
+    # the exit on the reopen bar must still execute.
+    exit_signal = pd.Series([1.0] * 59 + [0.0] * 61)
+    exit_path = evaluate_strategy_path(frame, exit_signal, candidate, settings)
+    assert abs(exit_path.position.iloc[59]) > 1e-12
+    assert abs(exit_path.position.iloc[60]) < 1e-12
+
+
+def test_rerun_verify_stores_verdict_and_detects_metric_drift(tmp_path, monkeypatch) -> None:
+    """H1 (P1-8): 'verified' must mean the archived claim was actually
+    re-produced, not merely that the JSON bytes were un-corrupted. The rerun
+    must use the archived data pin and trial counts, compare the
+    reproducible metrics within tolerance, and leave a durable verdict in
+    the archive dir — mismatches included, honestly."""
+    import json
+
+    from factor_mining.archive import rerun_verify_archive
+    from factor_mining.models import CandidateStrategySpec
+
+    result = BacktestResult(
+        experiment_id="exp-rerun",
+        candidate_id="c1",
+        hypothesis_family="momentum",
+        method_id="rule_mining",
+        symbol="BTCUSDT",
+        market="um_futures",
+        interval="5m",
+        metrics_primary=MetricsBlock(sharpe=2.0, total_return=0.5, max_drawdown=-0.1, trade_count=200),
+        effective_trials_at_eval=64,
+        global_trials_at_eval=128,
+    )
+    gate = GateCheckResult(experiment_id=result.experiment_id, passed=True, items=[], allocation_multiplier=1.0)
+    score = hardscore(result, gate, fdr_adjusted_pvalue=0.01, settings=Settings())
+    candidate = CandidateStrategySpec(
+        candidate_id="c1",
+        hypothesis_id="h1",
+        method_id="rule_mining",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+        market="um_futures",
+        interval="5m",
+    )
+    root = tmp_path / "archives"
+    archive_experiment(
+        result=result, gatecheck=gate, hardscore=score, settings=Settings(),
+        candidate=candidate, data_manifest={"data_end_ms": 1_777_593_300_000}, root=root,
+    )
+
+    captured = {}
+
+    def fake_reproduce(spec, settings, *, data_end_ms=None, trial_counts=None):
+        captured["data_end_ms"] = data_end_ms
+        captured["trial_counts"] = trial_counts
+        return result.model_copy(deep=True)
+
+    monkeypatch.setattr("factor_mining.pipeline.reproduce_candidate", fake_reproduce)
+
+    verdict = rerun_verify_archive("exp-rerun", Settings(), root=root)
+
+    assert verdict["status"] == "verified"
+    assert captured["data_end_ms"] == 1_777_593_300_000  # archived pin honored
+    assert captured["trial_counts"] == {
+        "effective_trials_count": 64,
+        "global_cumulative_trials_count": 128,
+    }
+    stored = json.loads((root / "exp-rerun" / "verify_verdict.json").read_text(encoding="utf-8"))
+    assert stored["status"] == "verified"
+    assert stored["fields"]["sharpe"]["within_tolerance"]
+
+    drifted = result.model_copy(deep=True)
+    drifted.metrics_primary.sharpe = 1.5
+    monkeypatch.setattr(
+        "factor_mining.pipeline.reproduce_candidate",
+        lambda spec, settings, *, data_end_ms=None, trial_counts=None: drifted,
+    )
+
+    verdict = rerun_verify_archive("exp-rerun", Settings(), root=root)
+
+    assert verdict["status"] == "mismatch"
+    assert not verdict["fields"]["sharpe"]["within_tolerance"]
+    assert verdict["fields"]["total_return"]["within_tolerance"]
+    stored = json.loads((root / "exp-rerun" / "verify_verdict.json").read_text(encoding="utf-8"))
+    assert stored["status"] == "mismatch"  # the durable verdict reflects drift honestly
+
+
+def test_calmar_distinguishes_zero_drawdown_gains_from_no_edge() -> None:
+    """I5 (P2-6): calmar=0 at zero drawdown hid infinite-Calmar cases —
+    a monotonically profitable series must not report the same Calmar as a
+    flat one. Capped (not infinite) so the field stays serializable."""
+    from factor_mining.backtest.engine import _CALMAR_CAP, _metrics_from_returns
+
+    gains = _metrics_from_returns(pd.Series([0.001] * 50), interval="5m", trade_count=1, pnl=1.0)
+    flat = _metrics_from_returns(pd.Series([0.0] * 50), interval="5m", trade_count=0, pnl=0.0)
+
+    assert gains.max_drawdown == 0.0
+    assert gains.calmar == _CALMAR_CAP
+    assert flat.calmar == 0.0
+
+
+def test_tanh_zscore_smoothing_is_solely_smooth_span() -> None:
+    """I3 (P2-6): tanh_zscore hardcoded a 12-bar EWM, so 'smoothing off'
+    (smooth_span=1) never was, and smooth_span=12 silently double-smoothed.
+    The candidate's smooth_span must be the only smoothing knob."""
+    import numpy as np
+
+    from factor_mining.pipeline import _apply_transform
+
+    rng = np.random.default_rng(11)
+    raw = pd.Series(rng.normal(size=400))
+
+    unsmoothed = _apply_transform(raw, 1, "tanh_zscore", {"smooth_span": 1})
+    smoothed = _apply_transform(raw, 1, "tanh_zscore", {"smooth_span": 12})
+
+    # With smoothing off the signal must be strictly noisier than smoothed.
+    unsmoothed_flips = int((np.sign(unsmoothed).diff().abs() > 0).sum())
+    smoothed_flips = int((np.sign(smoothed).diff().abs() > 0).sum())
+    assert unsmoothed_flips > smoothed_flips
+    # And it must equal the raw tanh(z) with no EWM applied anywhere: applying
+    # any hidden smoothing would break this equality.
+    window, scale = 288, 2.0
+    mu = raw.rolling(window, min_periods=20).mean()
+    sigma = raw.rolling(window, min_periods=20).std().replace(0, np.nan)
+    z = ((raw - mu) / sigma).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    expected = np.tanh(z / scale)
+    assert np.allclose(unsmoothed.to_numpy(), expected.to_numpy())

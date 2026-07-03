@@ -335,10 +335,22 @@ def hardscore_run() -> None:
 
 
 @exp_app.command("verify")
-def exp_verify(experiment_id: str, root: Path = Path("archives")) -> None:
-    # "verify" (not "reproduce"): this only re-checks the archived result hash.
-    # Actually re-running a candidate is pipeline.reproduce_candidate.
-    result = verify_archive(experiment_id, root=root)
+def exp_verify(
+    experiment_id: str,
+    root: Path = Path("archives"),
+    rerun: bool = typer.Option(
+        False,
+        "--rerun",
+        help="Re-run the archived candidate (pinned data + archived trial counts) and compare metrics_primary; stores verify_verdict.json.",
+    ),
+) -> None:
+    if rerun:
+        from factor_mining.archive import rerun_verify_archive
+
+        result = rerun_verify_archive(experiment_id, load_settings(), root=root)
+    else:
+        # Hash-only integrity check; --rerun performs the real reproduction.
+        result = verify_archive(experiment_id, root=root)
     typer.echo(result)
 
 

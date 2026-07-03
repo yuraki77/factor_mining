@@ -15,6 +15,14 @@ if TYPE_CHECKING:
 _FULL_ALLOCATION = 1.0
 _CONDITIONAL_ALLOCATION = 0.25
 _CONDITIONAL_REVIEW_DAYS = 60
+# G3 (family-FDR p-value) is deliberately NOT blocking (P1-1 decision, 2026-07):
+# FDR multiplicity already binds where selection happens — the terminal holdout
+# runs BH with n_tests raised to cumulative cross-round family trial counts,
+# and survivor promotion requires fdr_pvalue < promotion_fdr. Making G3 also
+# block the round/terminal gate would double-penalize discovery: candidates
+# with real but underpowered signals could never accumulate the OOS evidence
+# the survivor path exists to collect. G3 stays a warn item feeding the
+# research-gate evidence flags.
 _BLOCKING_RULES = {"G1", "G2", "G5", "G8", "G10", "G11", "G14", "G15"}
 _FDR_EFFECTIVE_FAMILY_MIN = 10
 
@@ -84,7 +92,7 @@ def run_gatecheck(
     _warn_item(items, "G4", result.ic_tstat_nw > settings.gatecheck.ic_tstat_nw_min, "Newey-West IC t-stat contributes strength", result.ic_tstat_nw, settings.gatecheck.ic_tstat_nw_min)
     _warn_item(items, "G4R", result.rankic_tstat_nw > settings.gatecheck.rankic_tstat_nw_min, "Newey-West RankIC t-stat contributes strength", result.rankic_tstat_nw, settings.gatecheck.rankic_tstat_nw_min)
     _item(items, "G5", result.sharpe_ci_5_95[0] > settings.gatecheck.sharpe_ci_5_min, "Bootstrap Sharpe 5th percentile is positive", result.sharpe_ci_5_95[0], settings.gatecheck.sharpe_ci_5_min)
-    pbo_threshold = settings.cpcv.ml_pbo_threshold if method.is_ml else settings.cpcv.pbo_threshold
+    pbo_threshold = settings.cscv.ml_pbo_threshold if method.is_ml else settings.cscv.pbo_threshold
     _item(items, "G2", (result.pbo if result.pbo is not None else 1.0) < pbo_threshold, "PBO below method threshold", result.pbo, pbo_threshold)
     _warn_item(items, "G7", result.oos_trade_count >= settings.gatecheck.min_oos_trades, "OOS trade count supports high statistical reliability", result.oos_trade_count, settings.gatecheck.min_oos_trades)
     _item(

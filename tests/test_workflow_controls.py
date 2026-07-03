@@ -103,7 +103,7 @@ def test_verify_research_survivors_promotes_without_recording_new_trials(tmp_pat
         data_quality_notes=[],
     )
 
-    def fake_backtests(tasks, final_frame, settings_arg, max_workers, funding_df=None):
+    def fake_backtests(tasks, final_frame, settings_arg, max_workers, funding_df=None, **state):
         return [BacktestResult(
             experiment_id="exp-new",
             candidate_id=candidate.candidate_id,
@@ -198,7 +198,7 @@ def test_verify_research_survivors_applies_cross_round_fdr_counts(tmp_path, monk
         data_quality_notes=[],
     )
 
-    def fake_backtests(tasks, final_frame, settings_arg, max_workers, funding_df=None):
+    def fake_backtests(tasks, final_frame, settings_arg, max_workers, funding_df=None, **state):
         return [BacktestResult(
             experiment_id="exp-new",
             candidate_id=candidate.candidate_id,
