@@ -2,7 +2,7 @@ import pandas as pd
 import pytest
 
 from factor_mining.archive import archive_experiment, verify_archive
-from factor_mining.backtest.engine import _EQUITY_CURVE_MAX_POINTS, _apply_exit_rules, _bounded_equity_curve, evaluate_strategy_path, run_backtest, walk_forward_oos_mask
+from factor_mining.backtest.engine import _EQUITY_CURVE_MAX_POINTS, _apply_exit_rules, _bounded_equity_curve, evaluate_strategy_path, run_backtest
 from factor_mining.config import BootstrapConfig, DataConfig, GateCheckConfig, PermutationTestConfig, PositionSizingConfig, Settings, WalkForwardConfig
 from factor_mining.models import BacktestResult, CandidateStrategySpec, DataQualityNote, FactorEvidenceReport, GateCheckResult, MetricsBlock
 from factor_mining.registry import get_method
@@ -36,32 +36,27 @@ def make_frame(n: int = 400) -> pd.DataFrame:
     )
 
 
-def test_walk_forward_oos_mask_purges_between_test_windows() -> None:
-    month_ms = 30 * 86_400_000
-    frame = pd.DataFrame({"open_time": [1_700_000_000_000 + idx * month_ms for idx in range(15)]})
-    settings = Settings(
-        walk_forward=WalkForwardConfig(
-            train_months=0,
-            validation_months=0,
-            test_months=2,
-            purge_bars_floor=2,
-            embargo_bars=3,
-        )
-    )
+def test_oos_trade_count_covers_the_whole_evaluated_slice(tmp_path) -> None:
+    """F1 (P1-4): since the Q3 switch the evaluated frame IS the OOS slice, so
+    every trade in it must count. The deleted fold mask degenerated to "last
+    25% of the slice" on short frames, so a strategy whose trades happened
+    early reported ~zero OOS trades — starving G7 and survivor promotion of
+    evidence that actually existed."""
+    settings = small_settings(tmp_path)
+    frame = make_frame(200)
+    # Trade activity only in the FIRST quarter of the slice; flat afterwards.
+    signals = pd.Series([1.0, 0.0] * 25 + [0.0] * 150, dtype=float)
     candidate = CandidateStrategySpec(
-        candidate_id="c-wf",
+        candidate_id="c-oos",
         hypothesis_id="h1",
-        method_id="factor_scoring",
+        method_id="rule_mining",
         hypothesis_family="momentum",
         symbol="BTCUSDT",
-        max_feature_lookback_bars=1,
+        params={"expected_ic_mid": 0.02},
     )
-
-    mask = walk_forward_oos_mask(frame, settings, candidate)
-    oos_indices = list(mask[mask].index)
-
-    assert oos_indices[:4] == [2, 3, 9, 10]
-    assert oos_indices[2] - oos_indices[1] - 1 == 5
+    result = run_backtest(frame, signals, candidate, settings)
+    assert result.oos_trade_count > 0
+    assert result.oos_trade_count == result.metrics_primary.trade_count
 
 
 def test_gatecheck_result_carries_candidate_id() -> None:

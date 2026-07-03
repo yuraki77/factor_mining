@@ -632,7 +632,12 @@ def run_backtest(
         avg_holding_period_bars=avg_hold,
         return_autocorr_lag1=return_autocorrelation_lag1(primary_returns),
         data_quality_notes=data_quality_notes or [],
-        oos_trade_count=_oos_trade_count(vol_target_position, frame, settings, candidate),
+        # F1 (P1-4): since the Q3 switch the evaluated frame IS the
+        # out-of-sample slice (validation in rounds, the untouched holdout at
+        # the terminal), so every trade in it is OOS relative to discovery.
+        # The old fold mask degenerated to "last 25% of the slice" on frames
+        # shorter than the configured windows — an arbitrary subset.
+        oos_trade_count=int(trade_mask.sum()),
         actual_cost_bps=path.avg_cost_bps,
         prior_posterior_ic_ratio=observed_ic / expected_ic_mid if expected_ic_mid > 0 else 1.0,
         window_stability=window_stability,
@@ -698,62 +703,6 @@ def _short_allowed(hypothesis_family: str) -> bool:
     """Check boundary conditions: is short-side trading allowed for this family?"""
     b = boundary_conditions(hypothesis_family)
     return bool(b.get("short_allowed", True))
-
-
-def walk_forward_oos_mask(frame: pd.DataFrame, settings: Settings, candidate: CandidateStrategySpec) -> pd.Series:
-    """Return bars belonging to walk-forward test windows.
-
-    For short fixtures that cannot fit the configured train/validation/test windows,
-    the final quarter is treated as the OOS holdout rather than pretending OOS is known.
-    """
-    frame = frame.sort_values("open_time").reset_index(drop=True)
-    mask = pd.Series(False, index=frame.index)
-    n_rows = len(frame)
-    if n_rows == 0:
-        return mask
-
-    interval_ms = _median_interval_ms(frame)
-    if interval_ms is None or interval_ms <= 0:
-        bars_per_month = max(1, int(annualization_factor(candidate.interval) / 12))
-    else:
-        bars_per_month = max(1, int(round(30 * 86_400_000 / interval_ms)))
-
-    train_bars = settings.walk_forward.train_months * bars_per_month
-    validation_bars = settings.walk_forward.validation_months * bars_per_month
-    test_bars = max(1, settings.walk_forward.test_months * bars_per_month)
-    purge_bars = settings.walk_forward.purge_bars(candidate.max_feature_lookback_bars)
-    embargo_bars = max(0, settings.walk_forward.embargo_bars)
-    start = train_bars + validation_bars + purge_bars
-
-    while start < n_rows:
-        end = min(n_rows, start + test_bars)
-        mask.iloc[start:end] = True
-        start = end + embargo_bars + purge_bars
-
-    if not bool(mask.any()):
-        mask.iloc[int(n_rows * 0.75):] = True
-    return mask
-
-
-def _oos_trade_count(
-    position: pd.Series,
-    frame: pd.DataFrame,
-    settings: Settings,
-    candidate: CandidateStrategySpec,
-) -> int:
-    oos_mask = walk_forward_oos_mask(frame, settings, candidate)
-    trade_mask = position.diff().abs().fillna(position.abs()) > 1e-12
-    return int((trade_mask & oos_mask).sum())
-
-
-def _median_interval_ms(frame: pd.DataFrame) -> int | None:
-    if "open_time" not in frame or len(frame) < 2:
-        return None
-    diffs = pd.Series(frame["open_time"]).diff().dropna()
-    diffs = diffs[diffs > 0]
-    if diffs.empty:
-        return None
-    return int(diffs.median())
 
 
 def build_backtest_detail(

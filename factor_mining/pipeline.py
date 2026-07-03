@@ -2501,8 +2501,7 @@ def _build_data_split_plan(
     # split — carved off the END of each upstream split (discovery before
     # validation, validation before the final holdout), so a downstream split's
     # feature window can't reach back into the data the optimizer already used
-    # (lookahead across the train/test boundary). Mirrors walk_forward_oos_mask's
-    # purge+embargo inter-fold spacing. All-or-nothing: the full gap is applied at
+    # (lookahead across the train/test boundary). All-or-nothing: the full gap is applied at
     # both boundaries only when each upstream split can spare it (keeps >= gap
     # bars), so a real run on a long frame purges while a short fixture is left
     # exactly as-is. gaps_honored records whether it was applied, so the G11
