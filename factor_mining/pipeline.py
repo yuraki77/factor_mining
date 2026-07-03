@@ -691,6 +691,7 @@ def reproduce_candidate(
     settings: Settings,
     *,
     data_end_ms: int | None = None,
+    trial_counts: dict[str, int] | None = None,
 ) -> BacktestResult:
     """Faithfully re-run a single archived candidate's final-OOS backtest.
 
@@ -703,9 +704,14 @@ def reproduce_candidate(
     (``_build_signal_for``) and final-OOS split (``_build_data_split_plan``), so
     there is no second, drift-prone implementation of the signal/feature math.
     The reproducible, validated quantities are ``metrics_primary`` (total return
-    / Sharpe / max drawdown). Trial-context stats (deflated Sharpe, PBO,
-    effective trials) depend on the full mining population and are NOT
-    reconstructed here — treat those fields on the result as placeholders.
+    / Sharpe / max drawdown). Trial-context stats depend on the full mining
+    population: pass ``trial_counts`` from the archived result (e.g.
+    ``{"effective_trials_count": archived.effective_trials_at_eval,
+    "global_cumulative_trials_count": archived.global_trials_at_eval}``) to
+    re-derive the deflated-Sharpe haircut — the penalty is deterministic in
+    the counts and sample size. Without it the trial-context fields default to
+    single-trial placeholders. PBO is batch-relative and is never
+    reconstructed here.
 
     Pin fidelity: with ``data_end_ms`` the frame is truncated *before* feature
     and regime generation (forward-looking quantities can't be sliced after), so
@@ -752,7 +758,7 @@ def reproduce_candidate(
         final_signal,
         spec,
         settings,
-        trial_counts={"effective_trials_count": 1, "global_cumulative_trials_count": 1},
+        trial_counts=trial_counts or {"effective_trials_count": 1, "global_cumulative_trials_count": 1},
         funding=ctx.funding_df,
     )
     # Q9: surface whether the reproduced final-OOS split was purged (Q10), so the
