@@ -19,26 +19,43 @@ _BLOCKING_RULES = {"G1", "G2", "G5", "G8", "G10", "G11", "G14", "G15"}
 _FDR_EFFECTIVE_FAMILY_MIN = 10
 
 
-def apply_fdr(results: list[BacktestResult], settings: Settings) -> dict[str, float]:
+def apply_fdr(
+    results: list[BacktestResult],
+    settings: Settings,
+    *,
+    family_test_counts: dict[str, int] | None = None,
+) -> dict[str, float]:
+    """Family-stratified Benjamini-Hochberg FDR on combined-IC p-values.
+
+    ``family_test_counts`` (Q15): when provided, a family's BH ``n_tests`` is
+    raised to its cumulative cross-round trial count, so the multiplicity penalty
+    reflects every candidate ever tested in that family — not just the handful in
+    this batch. Without it (per-round / standalone use) ``n_tests`` falls back to
+    the batch size, floored at ``_FDR_EFFECTIVE_FAMILY_MIN``. Keys are the same
+    ``hypothesis_family`` the results carry.
+    """
     adjusted_by_experiment: dict[str, float] = {}
     results_by_family: dict[str, list[BacktestResult]] = {}
     for result in results:
         results_by_family.setdefault(result.hypothesis_family, []).append(result)
 
-    for family_results in results_by_family.values():
+    for family, family_results in results_by_family.items():
         pvalues = [
             combined_ic_tstat_pvalue(result.ic_tstat_nw, result.rankic_tstat_nw)
             for result in family_results
         ]
+        n_tests = max(len(pvalues), _FDR_EFFECTIVE_FAMILY_MIN)
+        if family_test_counts is not None:
+            n_tests = max(n_tests, int(family_test_counts.get(family, 0)))
         adjusted = benjamini_hochberg(
             pvalues,
             q=settings.gatecheck.fdr_q,
-            n_tests=max(len(pvalues), _FDR_EFFECTIVE_FAMILY_MIN),
+            n_tests=n_tests,
         )
         adjusted_by_experiment.update(
             {
                 result.experiment_id: adjusted_value
-                for result, adjusted_value in zip(family_results, adjusted, strict=False)
+                for result, adjusted_value in zip(family_results, adjusted, strict=True)
             }
         )
     return adjusted_by_experiment
@@ -76,7 +93,7 @@ def run_gatecheck(
         result.break_even_cost_bps > settings.gatecheck.break_even_cost_multiple * max(result.actual_cost_bps, 1e-12),
         "Break-even cost has safety margin",
         result.break_even_cost_bps,
-        settings.gatecheck.break_even_cost_multiple * result.actual_cost_bps,
+        settings.gatecheck.break_even_cost_multiple * max(result.actual_cost_bps, 1e-12),
     )
     _warn_item(items, "G9", result.prior_posterior_ic_ratio < settings.gatecheck.prior_posterior_ic_max_ratio, "Prior/posterior IC calibration contributes quality", result.prior_posterior_ic_ratio, settings.gatecheck.prior_posterior_ic_max_ratio)
     _item(items, "G10", result.estimated_capacity_usd >= settings.capacity.min_capacity_usd, "Capacity exceeds minimum tradable capital", result.estimated_capacity_usd, settings.capacity.min_capacity_usd)
@@ -115,7 +132,9 @@ def apply_risk_stratified_gatechecks(
     settings: Settings,
 ) -> list[GateCheckResult]:
     evidence_by_experiment = {report.experiment_id: report for report in evidence_reports}
-    for result, gate in zip(results, gatechecks, strict=False):
+    # strict: a results/gatechecks length mismatch means a caller paired the
+    # wrong batch — stratifying a truncated zip silently mis-tiers results.
+    for result, gate in zip(results, gatechecks, strict=True):
         stratify_gatecheck(
             result=result,
             gatecheck=gate,

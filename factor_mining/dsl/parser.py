@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import math
 import re
 from typing import Any
@@ -31,7 +32,12 @@ _TOKEN_RE = re.compile(
 )
 
 
-_ALLOW_CROSS_SECTIONAL = False
+# Per-context (thread/task-local) flag: symbol-group threads parse
+# concurrently, so a module-level bool with save/restore would let one
+# thread's True leak into another's validation (or clobber it mid-parse).
+_ALLOW_CROSS_SECTIONAL: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "dsl_allow_cross_sectional", default=False
+)
 
 
 def parse(source: str, *, allow_cross_sectional: bool = False) -> dict[str, Any]:
@@ -40,9 +46,7 @@ def parse(source: str, *, allow_cross_sectional: bool = False) -> dict[str, Any]
     The phase-2 parser intentionally accepts only whitelisted ``$`` leaves,
     catalog operators, discrete window constants, and snapped free constants.
     """
-    global _ALLOW_CROSS_SECTIONAL
-    previous_allow_cross_sectional = _ALLOW_CROSS_SECTIONAL
-    _ALLOW_CROSS_SECTIONAL = allow_cross_sectional
+    token = _ALLOW_CROSS_SECTIONAL.set(allow_cross_sectional)
     try:
         tokens = _tokenize(source)
         if not tokens:
@@ -58,7 +62,7 @@ def parse(source: str, *, allow_cross_sectional: bool = False) -> dict[str, Any]
             raise ValueError(f"too many free constants: {free_constants} > {MAX_FREE_CONSTANTS}")
         return ast
     finally:
-        _ALLOW_CROSS_SECTIONAL = previous_allow_cross_sectional
+        _ALLOW_CROSS_SECTIONAL.reset(token)
 
 
 def _tokenize(source: str) -> list[dict[str, Any]]:
@@ -177,7 +181,7 @@ def _parse_func_call(tokens: list[dict[str, Any]], pos: int, raw_name: str) -> t
     name = ALIASES.get(raw_name.upper(), raw_name.upper())
     if name not in OPERATORS:
         _fail(tokens, pos, f"unknown operator {raw_name!r}")
-    if OPERATORS[name].cross_sectional and not _ALLOW_CROSS_SECTIONAL:
+    if OPERATORS[name].cross_sectional and not _ALLOW_CROSS_SECTIONAL.get():
         _fail(tokens, pos, f"cross-sectional operator {name!r} is not available in single-symbol mode")
     pos += 1
     pos = _expect(tokens, pos, "op", "(")

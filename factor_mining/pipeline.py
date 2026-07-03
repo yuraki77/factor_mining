@@ -7,12 +7,14 @@ and stop early on convergence.
 
 from __future__ import annotations
 
+import math
 import os
 import hashlib
 import json
 import threading
 import time
 from collections import Counter
+from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from itertools import combinations, product
@@ -42,6 +44,7 @@ from factor_mining.mining import (
 from factor_mining.near_miss import analyze_near_misses
 from factor_mining.research_gate import apply_research_gate, build_research_survivor_records, research_survivor_payloads
 from factor_mining.models import (
+    UTC,
     BacktestResult,
     CandidateStrategySpec,
     DataQualityNote,
@@ -96,6 +99,42 @@ class PipelineResult:
 
 
 @dataclass
+class RoundOutput:
+    """Typed contract for one mining round of one symbol/market group.
+
+    Replaces the former 11-key dict so the round boundary is explicit: the
+    parent loop, checkpoint early-returns, and tests all construct or consume
+    the same shape, and a missing field is a TypeError instead of a silent
+    KeyError-with-default."""
+
+    candidates: list[CandidateStrategySpec] = field(default_factory=list)
+    backtests: list[BacktestResult] = field(default_factory=list)
+    gatechecks: list[GateCheckResult] = field(default_factory=list)
+    hardscores: list[HardScoreReport] = field(default_factory=list)
+    factor_evidence: list[FactorEvidenceReport] = field(default_factory=list)
+    research_gates: list[ResearchGateResult] = field(default_factory=list)
+    near_misses: list[NearMissAnalysis] = field(default_factory=list)
+    new_candidates: list[CandidateStrategySpec] = field(default_factory=list)
+    research_survivors: list[dict[str, Any]] = field(default_factory=list)
+    detail_artifact_ids: list[str] = field(default_factory=list)
+    history_entry: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class TerminalOutput:
+    """Result of the single terminal final-OOS holdout evaluation (Q3)."""
+
+    candidates: list[CandidateStrategySpec] = field(default_factory=list)
+    backtests: list[BacktestResult] = field(default_factory=list)
+    gatechecks: list[GateCheckResult] = field(default_factory=list)
+    hardscores: list[HardScoreReport] = field(default_factory=list)
+    factor_evidence: list[FactorEvidenceReport] = field(default_factory=list)
+    research_gates: list[ResearchGateResult] = field(default_factory=list)
+    research_survivors: list[dict[str, Any]] = field(default_factory=list)
+    fdr_map: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
 class MarketDataContext:
     symbol: str
     market: str
@@ -116,6 +155,8 @@ class DataSplitPlan:
     final_oos_mask: pd.Series
     repair_validation_start_idx: int
     final_oos_start_idx: int
+    purge_embargo_bars: int = 0
+    gaps_honored: bool = True
 
     @property
     def final_oos_start_time(self) -> int | None:
@@ -250,27 +291,38 @@ def _init_worker(frame: pd.DataFrame, settings: Settings, funding_df: pd.DataFra
     _worker_funding = funding_df
 
 
-def _run_one_backtest(args: tuple) -> BacktestResult | Exception:
-    global _worker_frame, _worker_settings
+def _execute_backtest_task(
+    args: tuple,
+    frame: pd.DataFrame,
+    settings: Settings,
+    funding_df: pd.DataFrame | None,
+) -> BacktestResult | Exception:
     signal_arr, candidate_dict, trial_counts, data_quality_note_dicts = args
     from factor_mining.backtest.engine import run_backtest
     from factor_mining.models import CandidateStrategySpec, DataQualityNote
 
     candidate = CandidateStrategySpec.model_validate(candidate_dict)
-    signal = pd.Series(signal_arr, index=_worker_frame.index)
+    signal = pd.Series(signal_arr, index=frame.index)
     data_quality_notes = [DataQualityNote.model_validate(item) for item in data_quality_note_dicts]
     try:
         return run_backtest(
-            _worker_frame,
+            frame,
             signal,
             candidate,
-            _worker_settings,
+            settings,
             trial_counts=trial_counts,
             data_quality_notes=data_quality_notes,
-            funding=_worker_funding,
+            funding=funding_df,
         )
     except Exception as exc:
         return exc
+
+
+def _run_one_backtest(args: tuple) -> BacktestResult | Exception:
+    # Process-pool entry point: the per-process context is set by _init_worker.
+    # In-process (serial) callers must use _execute_backtest_task with explicit
+    # arguments instead — module globals are shared across symbol-group threads.
+    return _execute_backtest_task(args, _worker_frame, _worker_settings, _worker_funding)
 
 
 # ── main pipeline ───────────────────────────────────────────────────
@@ -503,6 +555,52 @@ def _load_stage_checkpoint(
     return payload if isinstance(payload, dict) else None
 
 
+def _checkpointed_stage(
+    store: MetadataStore | None,
+    *,
+    resume_source: str | None,
+    run_id: str | None,
+    round_num: int,
+    symbol: str,
+    market: str,
+    stage: str,
+    fingerprint: dict[str, Any],
+    log_label: str,
+    decode: Callable[[dict], Any],
+    compute: Callable[[], list[Any]],
+    encode: Callable[[Any], dict],
+) -> list[Any]:
+    """Load a stage's items from its resume checkpoint, or compute and save them.
+
+    ``compute`` must include any post-processing that belongs to the stage's
+    persisted state (the checkpoint stores its output verbatim)."""
+    checkpoint = _load_stage_checkpoint(
+        store,
+        resume_source,
+        round_num=round_num,
+        symbol=symbol,
+        market=market,
+        stage=stage,
+        fingerprint=fingerprint,
+    )
+    if checkpoint is not None:
+        items = [decode(item) for item in checkpoint.get("items", [])]
+        _log(f"  {log_label}: resumed {len(items)} from checkpoint")
+        return items
+    items = compute()
+    _save_stage_checkpoint(
+        store,
+        run_id,
+        round_num=round_num,
+        symbol=symbol,
+        market=market,
+        stage=stage,
+        fingerprint=fingerprint,
+        payload={"items": [encode(item) for item in items]},
+    )
+    return items
+
+
 def run_pipeline(
     settings: Settings,
     *,
@@ -593,6 +691,7 @@ def reproduce_candidate(
     settings: Settings,
     *,
     data_end_ms: int | None = None,
+    trial_counts: dict[str, int] | None = None,
 ) -> BacktestResult:
     """Faithfully re-run a single archived candidate's final-OOS backtest.
 
@@ -605,9 +704,14 @@ def reproduce_candidate(
     (``_build_signal_for``) and final-OOS split (``_build_data_split_plan``), so
     there is no second, drift-prone implementation of the signal/feature math.
     The reproducible, validated quantities are ``metrics_primary`` (total return
-    / Sharpe / max drawdown). Trial-context stats (deflated Sharpe, PBO,
-    effective trials) depend on the full mining population and are NOT
-    reconstructed here — treat those fields on the result as placeholders.
+    / Sharpe / max drawdown). Trial-context stats depend on the full mining
+    population: pass ``trial_counts`` from the archived result (e.g.
+    ``{"effective_trials_count": archived.effective_trials_at_eval,
+    "global_cumulative_trials_count": archived.global_trials_at_eval}``) to
+    re-derive the deflated-Sharpe haircut — the penalty is deterministic in
+    the counts and sample size. Without it the trial-context fields default to
+    single-trial placeholders. PBO is batch-relative and is never
+    reconstructed here.
 
     Pin fidelity: with ``data_end_ms`` the frame is truncated *before* feature
     and regime generation (forward-looking quantities can't be sliced after), so
@@ -637,21 +741,30 @@ def reproduce_candidate(
     # Mirror the pipeline's final evaluation: backtest the last-20% OOS slice
     # of the frame against the same slice of the signal (see _slice_tasks +
     # _run_backtests_parallel(final_tasks, final_frame, ..., funding_df)).
-    split_plan = _build_data_split_plan(ctx.frame, regimes=ctx.forward_regimes)
+    split_plan = _build_data_split_plan(
+        ctx.frame,
+        regimes=ctx.forward_regimes,
+        purge_bars=settings.walk_forward.purge_bars_floor,
+        embargo_bars=settings.walk_forward.embargo_bars,
+    )
     mask_arr = split_plan.final_oos_mask.to_numpy()
     final_frame = _masked_frame(ctx.frame, split_plan.final_oos_mask)
     final_signal = pd.Series(
         np.asarray(signal_arr, dtype=float)[mask_arr], index=final_frame.index
     )
 
-    return run_backtest(
+    result = run_backtest(
         final_frame,
         final_signal,
         spec,
         settings,
-        trial_counts={"effective_trials_count": 1, "global_cumulative_trials_count": 1},
+        trial_counts=trial_counts or {"effective_trials_count": 1, "global_cumulative_trials_count": 1},
         funding=ctx.funding_df,
     )
+    # Q9: surface whether the reproduced final-OOS split was purged (Q10), so the
+    # result is honest about its holdout discipline like the pipeline path.
+    result.split_overlap_detected = not split_plan.gaps_honored
+    return result
 
 
 def _resolve_round_controls(
@@ -964,7 +1077,7 @@ def _run_pipeline_impl(
                 trial_counts_lock=trial_counts_lock,
             )
 
-        round_data_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        round_data_by_key: dict[tuple[str, str], RoundOutput] = {}
         if symbol_workers > 1:
             _log(
                 f"  Running {len(runnable_groups)} data groups in parallel "
@@ -984,18 +1097,18 @@ def _run_pipeline_impl(
         for key, _context, _symbol_candidates in runnable_groups:
             round_data = round_data_by_key[key]
 
-            round_backtests.extend(round_data["backtests"])
-            round_gatechecks.extend(round_data["gatechecks"])
-            round_hardscores.extend(round_data["hardscores"])
-            all_factor_evidence.extend(round_data["factor_evidence"])
-            all_research_gates.extend(round_data["research_gates"])
-            all_near_misses.extend(round_data["near_misses"])
-            round_candidates.extend(round_data["candidates"])
-            new_candidates.extend(round_data["new_candidates"])
-            all_research_survivors.extend(round_data.get("research_survivors", []))
-            all_detail_artifact_ids.extend(round_data.get("detail_artifact_ids", []))
-            if round_data["history_entry"]:
-                child_history.append(round_data["history_entry"])
+            round_backtests.extend(round_data.backtests)
+            round_gatechecks.extend(round_data.gatechecks)
+            round_hardscores.extend(round_data.hardscores)
+            all_factor_evidence.extend(round_data.factor_evidence)
+            all_research_gates.extend(round_data.research_gates)
+            all_near_misses.extend(round_data.near_misses)
+            round_candidates.extend(round_data.candidates)
+            new_candidates.extend(round_data.new_candidates)
+            all_research_survivors.extend(round_data.research_survivors)
+            all_detail_artifact_ids.extend(round_data.detail_artifact_ids)
+            if round_data.history_entry:
+                child_history.append(round_data.history_entry)
 
         all_backtests.extend(round_backtests)
         all_gatechecks.extend(round_gatechecks)
@@ -1039,15 +1152,37 @@ def _run_pipeline_impl(
 
         current_candidates = new_candidates
 
+    # ── Terminal holdout evaluation (Q3) ────────────────────────────
+    # The single final-OOS pass: rounds gated on the validation slice, so the
+    # holdout answers once, for the survivors only, with cross-round FDR
+    # multiplicity. These terminal results ARE the run's headline results.
+    _step_header(3 + round_num, "Terminal holdout evaluation")
+    terminal = _evaluate_final_holdout(
+        candidates=all_retained_candidates,
+        gatechecks=all_gatechecks,
+        data_contexts=data_contexts,
+        settings=settings,
+        cumulative_trial_counts=cumulative_trial_counts,
+        store=store,
+        max_workers=max_workers,
+        survivor_candidate_ids=survivor_candidate_ids,
+        tested_candidates=len({r.candidate_id for r in all_backtests}),
+        run_id=run_id,
+        stop_event=stop_event,
+    )
+    all_research_survivors.extend(terminal.research_survivors)
+
     # ── Assemble final result ───────────────────────────────────────
-    result.candidates = all_retained_candidates
-    result.backtests = all_backtests
-    result.gatechecks = all_gatechecks
-    result.hardscores = all_hardscores
-    result.factor_evidence = all_factor_evidence
-    result.research_gates = all_research_gates
+    # result.* carry the terminal holdout evaluation; per-round (validation
+    # slice) outputs live in optimization_history and the round artifacts.
+    result.candidates = terminal.candidates
+    result.backtests = terminal.backtests
+    result.gatechecks = terminal.gatechecks
+    result.hardscores = terminal.hardscores
+    result.factor_evidence = terminal.factor_evidence
+    result.research_gates = terminal.research_gates
     result.near_misses = all_near_misses
-    result.n_gatecheck_passed = sum(1 for g in all_gatechecks if g.passed)
+    result.n_gatecheck_passed = sum(1 for g in terminal.gatechecks if g.passed)
     result.total_rounds = round_num
 
     if store:
@@ -1099,7 +1234,7 @@ def _run_pipeline_impl(
             if pruned:
                 _log(f"Pruned {pruned} stale experiment detail artifacts")
 
-    # Archive top experiments across all rounds
+    # Archive top experiments from the terminal holdout evaluation
     archived = 0
     if archive_top > 0:
         archived = _archive_top(result, settings, archive_top)
@@ -1109,8 +1244,8 @@ def _run_pipeline_impl(
     _log(f"PIPELINE COMPLETE in {result.elapsed_s:.0f}s")
     _log(f"  Rounds:       {result.total_rounds}")
     _log(f"  Hypotheses:   {len(result.hypotheses)}")
-    _log(f"  Backtests:    {len(result.backtests)}")
-    _log(f"  GateCheck OK: {result.n_gatecheck_passed}/{len(result.gatechecks)}")
+    _log(f"  Terminal holdout backtests: {len(result.backtests)}")
+    _log(f"  GateCheck OK (holdout): {result.n_gatecheck_passed}/{len(result.gatechecks)}")
     _log(f"  HardScore >0: {sum(1 for s in result.hardscores if s.score > 0)}")
     _log(f"  Archived:     {archived}")
     if result.optimization_history:
@@ -1192,7 +1327,12 @@ def verify_research_survivors(
                 _log(f"  Skip {key[0]}/{key[1]}: no local parquet data")
                 continue
             _log(f"  {context.symbol}/{context.market}: verifying {len(symbol_candidates)} survivors")
-            split_plan = _build_data_split_plan(context.frame, regimes=context.forward_regimes)
+            split_plan = _build_data_split_plan(
+                context.frame,
+                regimes=context.forward_regimes,
+                purge_bars=settings.walk_forward.purge_bars_floor,
+                embargo_bars=settings.walk_forward.embargo_bars,
+            )
             final_frame = _masked_frame(context.frame, split_plan.final_oos_mask)
             final_regimes = _masked_series(context.forward_regimes, split_plan.final_oos_mask)
             final_funding_rate = _masked_series(context.funding_rate, split_plan.final_oos_mask)
@@ -1225,6 +1365,10 @@ def verify_research_survivors(
             if round_backtests:
                 _apply_batch_pbo(final_frame, final_tasks, round_backtests, settings, context.funding_df)
 
+            # Q9: wire G11's split-overlap signal to the actual purge geometry.
+            for backtest in round_backtests:
+                backtest.split_overlap_detected = not split_plan.gaps_honored
+
             result_ids = {item.candidate_id for item in round_backtests}
             round_candidates = [
                 candidate for candidate in symbol_candidates
@@ -1241,20 +1385,16 @@ def verify_research_survivors(
                 funding_df=context.funding_df,
             )
 
-            from factor_mining.registry import get_method
-            from factor_mining.validation.gatecheck import apply_fdr, apply_risk_stratified_gatechecks, run_gatecheck
-
-            fdr_map = apply_fdr(round_backtests, settings)
-            methods_map = {method.method_id: method for method in METHOD_REGISTRY}
-            round_gatechecks: list[GateCheckResult] = []
-            for backtest in round_backtests:
-                method = methods_map.get(backtest.method_id) or get_method(backtest.method_id)
-                fdr_p = fdr_map.get(
-                    backtest.experiment_id,
-                    combined_ic_tstat_pvalue(backtest.ic_tstat_nw, backtest.rankic_tstat_nw),
-                )
-                round_gatechecks.append(run_gatecheck(backtest, settings, method=method, fdr_adjusted_pvalue=fdr_p))
-            apply_risk_stratified_gatechecks(round_backtests, round_gatechecks, round_evidence, settings)
+            # Q15: survivor rechecks carry the family's cumulative cross-round
+            # trial count into BH multiplicity — a survivor from a heavily
+            # searched family must not clear G3 (or the promotion FDR) on
+            # batch-size multiplicity.
+            round_gatechecks, fdr_map = _run_gatechecks(
+                round_backtests,
+                round_evidence,
+                settings,
+                family_test_counts=_family_test_counts_from_snapshots(symbol_candidates, trial_counts),
+            )
             round_research_gates = apply_research_gate(round_backtests, round_gatechecks, round_evidence)
             persistent_records = build_research_survivor_records(
                 candidates_by_id={candidate.candidate_id: candidate for candidate in round_candidates},
@@ -1310,6 +1450,217 @@ def verify_research_survivors(
         _RUN_ID = previous_run_id
 
 
+def _run_gatechecks(
+    backtests: list[BacktestResult],
+    evidence: list[FactorEvidenceReport],
+    settings: Settings,
+    *,
+    family_test_counts: dict[str, int] | None = None,
+) -> tuple[list[GateCheckResult], dict[str, float]]:
+    """Family FDR (Q15-aware) + the 16-rule gatecheck + risk stratification for a
+    batch of results, returning the gatechecks and the FDR map. Shared by the
+    per-round (validation) selection gate, the survivor re-eval, and the terminal
+    (final-OOS) holdout gate so the three orchestrations can't drift."""
+    from factor_mining.registry import get_method
+    from factor_mining.validation.gatecheck import (
+        apply_fdr,
+        apply_risk_stratified_gatechecks,
+        run_gatecheck,
+    )
+
+    # Only pass the override when set, so the per-round/survivor calls remain
+    # byte-identical to the pre-extraction apply_fdr(backtests, settings).
+    fdr_overrides = {"family_test_counts": family_test_counts} if family_test_counts is not None else {}
+    fdr_map = apply_fdr(backtests, settings, **fdr_overrides)
+    methods_map = {method.method_id: method for method in METHOD_REGISTRY}
+    gatechecks: list[GateCheckResult] = []
+    for backtest in backtests:
+        method = methods_map.get(backtest.method_id) or get_method(backtest.method_id)
+        fdr_p = fdr_map.get(
+            backtest.experiment_id,
+            combined_ic_tstat_pvalue(backtest.ic_tstat_nw, backtest.rankic_tstat_nw),
+        )
+        gatechecks.append(run_gatecheck(backtest, settings, method=method, fdr_adjusted_pvalue=fdr_p))
+    apply_risk_stratified_gatechecks(backtests, gatechecks, evidence, settings)
+    return gatechecks, fdr_map
+
+
+def _evaluate_final_holdout(
+    *,
+    candidates: list[CandidateStrategySpec],
+    gatechecks: list[GateCheckResult],
+    data_contexts: dict[tuple[str, str], MarketDataContext],
+    settings: Settings,
+    cumulative_trial_counts: dict[str, int],
+    store: MetadataStore | None,
+    max_workers: int | None,
+    survivor_candidate_ids: set[str],
+    tested_candidates: int,
+    run_id: str | None = None,
+    stop_event: threading.Event | None = None,
+) -> TerminalOutput:
+    """Evaluate round-gate survivors on the final-OOS holdout, exactly once per run (Q3).
+
+    Survivors are candidates whose latest round gatecheck passed (full or
+    conditional) on the validation slice. This is the only code path that
+    backtests the final window, and its FDR multiplicity is the cumulative
+    cross-round family trial count (Q15) — the holdout p-values answer for the
+    whole search that produced the survivors, and the DSR penalty is raised to
+    the run-wide effective trial count."""
+    latest_gate_by_candidate: dict[str, GateCheckResult] = {}
+    for gate in gatechecks:
+        latest_gate_by_candidate[gate.candidate_id] = gate
+    survivors = _dedupe_candidates([
+        candidate for candidate in candidates
+        if (gate := latest_gate_by_candidate.get(candidate.candidate_id)) is not None and gate.passed
+    ])
+    output = TerminalOutput()
+    if not survivors:
+        _log("Terminal holdout: no round-gate survivors to evaluate")
+        return output
+    _log(f"Terminal holdout: evaluating {len(survivors)} round-gate survivors on the untouched final-OOS window")
+
+    trial_counts_snapshot = dict(cumulative_trial_counts)
+    run_effective_trials = _merge_pool_effective_trials(
+        [],
+        trial_counts_snapshot,
+        tested_candidates=tested_candidates,
+    )
+
+    for key, group_candidates in _group_candidates_by_data(survivors).items():
+        _check_stop(stop_event)
+        context = data_contexts.get(key)
+        if context is None:
+            _log(f"  Terminal holdout skip {key[0]}/{key[1]}: no data context")
+            continue
+        split_plan = _build_data_split_plan(
+            context.frame,
+            regimes=context.forward_regimes,
+            purge_bars=settings.walk_forward.purge_bars_floor,
+            embargo_bars=settings.walk_forward.embargo_bars,
+        )
+        final_frame = _masked_frame(context.frame, split_plan.final_oos_mask)
+        final_regimes = _masked_series(context.forward_regimes, split_plan.final_oos_mask)
+        final_funding_rate = (
+            _masked_series(context.funding_rate, split_plan.final_oos_mask)
+            if context.funding_rate is not None
+            else None
+        )
+
+        # Read-only trial snapshots (ledger-backed when a store exists); the
+        # terminal evaluation is confirmatory and must not record new trials.
+        counts_by_candidate = _candidate_trial_count_snapshots(group_candidates, store, settings)
+        for candidate in group_candidates:
+            counts = counts_by_candidate.get(candidate.candidate_id)
+            in_memory = int(trial_counts_snapshot.get(candidate.hypothesis_family, 0))
+            if counts is not None and in_memory > 0:
+                counts["family_trials_count"] = max(int(counts["family_trials_count"]), in_memory)
+                counts["effective_trials_count"] = max(int(counts["effective_trials_count"]), in_memory)
+
+        full_tasks = _build_tasks(
+            group_candidates,
+            context.frame,
+            context.features_df,
+            context.feature_meta,
+            context.forward_regimes,
+            context.funding_rate,
+            trial_counts_by_candidate=counts_by_candidate,
+            data_quality_notes=context.data_quality_notes,
+            max_workers=max_workers,
+        )
+        final_tasks = _slice_tasks(full_tasks, split_plan.final_oos_mask)
+        final_backtests = _run_backtests_parallel(final_tasks, final_frame, settings, max_workers, context.funding_df)
+        if not final_backtests:
+            _log(f"  Terminal holdout {context.symbol}/{context.market}: no results")
+            continue
+        _apply_batch_pbo(final_frame, final_tasks, final_backtests, settings, context.funding_df)
+        for result in final_backtests:
+            # Q9: wire G11's split-overlap signal to the actual purge geometry.
+            result.split_overlap_detected = not split_plan.gaps_honored
+        _apply_merge_pool_trial_penalty(
+            final_backtests,
+            effective_trials_count=run_effective_trials,
+            observations=len(final_frame),
+        )
+
+        result_ids = {result.candidate_id for result in final_backtests}
+        group_evaluated = [c for c in group_candidates if c.candidate_id in result_ids]
+        group_evidence = build_factor_evidence_reports(
+            frame=final_frame,
+            tasks=final_tasks,
+            candidates=group_evaluated,
+            results=final_backtests,
+            settings=settings,
+            forward_regimes=final_regimes,
+            funding_rate=final_funding_rate,
+            funding_df=context.funding_df,
+        )
+        group_gatechecks, fdr_map = _run_gatechecks(
+            final_backtests,
+            group_evidence,
+            settings,
+            family_test_counts=_family_test_counts_from_snapshots(group_evaluated, counts_by_candidate),
+        )
+        group_research_gates = apply_research_gate(final_backtests, group_gatechecks, group_evidence)
+        candidates_by_id = {candidate.candidate_id: candidate for candidate in group_evaluated}
+        persistent_records = build_research_survivor_records(
+            candidates_by_id=candidates_by_id,
+            results=final_backtests,
+            research_gates=group_research_gates,
+            fdr_map=fdr_map,
+            settings=settings,
+        )
+        survivor_payloads = research_survivor_payloads(candidates_by_id, final_backtests, group_research_gates)
+        _augment_research_survivor_payloads(survivor_payloads, persistent_records)
+        if store:
+            _update_research_survivor_store(
+                store=store,
+                records=persistent_records,
+                rechecked_candidate_ids=survivor_candidate_ids & result_ids,
+                research_gates=group_research_gates,
+                results=final_backtests,
+                fdr_map=fdr_map,
+                settings=settings,
+                allow_promotion=True,
+            )
+
+        from factor_mining.hardscore import hardscore
+
+        group_hardscores = []
+        for result, gate in zip(final_backtests, group_gatechecks, strict=True):
+            fdr_p = fdr_map.get(
+                result.experiment_id,
+                combined_ic_tstat_pvalue(result.ic_tstat_nw, result.rankic_tstat_nw),
+            )
+            group_hardscores.append(hardscore(result, gate, fdr_adjusted_pvalue=fdr_p, settings=settings))
+
+        n_passed = sum(1 for gate in group_gatechecks if gate.passed)
+        _log(
+            f"  Terminal holdout {context.symbol}/{context.market}: "
+            f"{len(final_backtests)} evaluated, {n_passed} production gate passed "
+            f"(FDR n_tests from cumulative family trials)"
+        )
+
+        output.candidates.extend(group_evaluated)
+        output.backtests.extend(final_backtests)
+        output.gatechecks.extend(group_gatechecks)
+        output.hardscores.extend(group_hardscores)
+        output.factor_evidence.extend(group_evidence)
+        output.research_gates.extend(group_research_gates)
+        output.research_survivors.extend(survivor_payloads)
+        output.fdr_map.update(fdr_map)
+
+    if store:
+        store.save_artifact(f"terminal_holdout_{run_id or uuid.uuid4().hex[:12]}", "terminal_holdout", {
+            "candidates": [c.model_dump(mode="json") for c in output.candidates],
+            "backtests": [r.model_dump(mode="json") for r in output.backtests],
+            "gatechecks": [g.model_dump(mode="json") for g in output.gatechecks],
+            "research_gate": [g.model_dump(mode="json") for g in output.research_gates],
+            "research_survivors": output.research_survivors,
+        })
+    return output
+
+
 def _run_mining_round(
     *,
     current_candidates: list[CandidateStrategySpec],
@@ -1338,7 +1689,7 @@ def _run_mining_round(
     run_args: dict[str, Any] | None = None,
     stop_event: threading.Event | None = None,
     trial_counts_lock: Any | None = None,
-) -> dict[str, Any]:
+) -> RoundOutput:
     """Execute one complete mining round: backtest → gatecheck → hardscore → optimize."""
     artifact_scope = artifact_scope or f"round{round_num}"
     _check_stop(stop_event)
@@ -1347,19 +1698,25 @@ def _run_mining_round(
 
     # ── Backtest ────────────────────────────────────────────────────
     t0 = time.perf_counter()
-    split_plan = _build_data_split_plan(frame, regimes=forward_regimes)
+    split_plan = _build_data_split_plan(
+        frame,
+        regimes=forward_regimes,
+        purge_bars=settings.walk_forward.purge_bars_floor,
+        embargo_bars=settings.walk_forward.embargo_bars,
+    )
     discovery_frame = _masked_frame(frame, split_plan.discovery_mask)
     repair_validation_frame = _masked_frame(frame, split_plan.repair_validation_mask)
     final_frame = _masked_frame(frame, split_plan.final_oos_mask)
     discovery_regimes = _masked_series(forward_regimes, split_plan.discovery_mask)
-    final_regimes = _masked_series(forward_regimes, split_plan.final_oos_mask)
+    validation_regimes = _masked_series(forward_regimes, split_plan.repair_validation_mask)
     discovery_funding_rate = _masked_series(funding_rate, split_plan.discovery_mask) if funding_rate is not None else None
-    final_funding_rate = _masked_series(funding_rate, split_plan.final_oos_mask) if funding_rate is not None else None
+    validation_funding_rate = _masked_series(funding_rate, split_plan.repair_validation_mask) if funding_rate is not None else None
     _log(
         "  Split: "
         f"discovery={len(discovery_frame):,} bars, "
         f"repair_validation={len(repair_validation_frame):,} bars, "
-        f"final_oos={len(final_frame):,} bars "
+        f"final_oos={len(final_frame):,} bars, "
+        f"purge_embargo={split_plan.purge_embargo_bars} bars (honored={split_plan.gaps_honored}) "
         f"(validation_start_idx={split_plan.repair_validation_start_idx}, "
         f"final_start_idx={split_plan.final_oos_start_idx})"
     )
@@ -1400,33 +1757,20 @@ def _run_mining_round(
         max_workers=max_workers,
     )
     discovery_tasks = _slice_tasks(full_tasks, split_plan.discovery_mask)
-    discovery_checkpoint = _load_stage_checkpoint(
+    discovery_backtests = _checkpointed_stage(
         store,
-        checkpoint_source if resume_run_id else None,
+        resume_source=checkpoint_source if resume_run_id else None,
+        run_id=run_id,
         round_num=round_num,
         symbol=checkpoint_symbol,
         market=checkpoint_market,
         stage="discovery_backtests",
         fingerprint=checkpoint_fingerprint,
+        log_label="Discovery backtests",
+        decode=BacktestResult.model_validate,
+        compute=lambda: _run_backtests_parallel(discovery_tasks, discovery_frame, settings, max_workers, funding_df),
+        encode=lambda result: result.model_dump(mode="json"),
     )
-    if discovery_checkpoint is not None:
-        discovery_backtests = [
-            BacktestResult.model_validate(item)
-            for item in discovery_checkpoint.get("items", [])
-        ]
-        _log(f"  Discovery backtests: resumed {len(discovery_backtests)} from checkpoint")
-    else:
-        discovery_backtests = _run_backtests_parallel(discovery_tasks, discovery_frame, settings, max_workers, funding_df)
-        _save_stage_checkpoint(
-            store,
-            run_id,
-            round_num=round_num,
-            symbol=checkpoint_symbol,
-            market=checkpoint_market,
-            stage="discovery_backtests",
-            fingerprint=checkpoint_fingerprint,
-            payload={"items": [result.model_dump(mode="json") for result in discovery_backtests]},
-        )
 
     # Align candidates with successful backtests
     discovery_backtest_ids = {r.candidate_id for r in discovery_backtests}
@@ -1440,12 +1784,7 @@ def _run_mining_round(
         _check_stop(stop_event)
 
     if not discovery_backtests:
-        return {
-            "candidates": [], "backtests": [], "gatechecks": [], "hardscores": [],
-            "factor_evidence": [], "research_gates": [], "near_misses": [],
-            "new_candidates": [], "research_survivors": [], "detail_artifact_ids": [],
-            "history_entry": {},
-        }
+        return RoundOutput()
 
     # This lightweight evidence pass feeds deterministic repair candidates before
     # repair validation. Repaired candidates still count as trials and must pass a
@@ -1463,43 +1802,31 @@ def _run_mining_round(
 
     pre_gate_candidates: list[CandidateStrategySpec] = []
     if allow_pre_gate_repair:
-        pre_gate_checkpoint = _load_stage_checkpoint(
+        def _compute_pre_gate_candidates() -> list[CandidateStrategySpec]:
+            return _build_pre_gate_repair_candidates(
+                discovery_candidates,
+                discovery_backtests,
+                initial_factor_evidence,
+            ) + _build_local_grid_tuning_candidates(
+                discovery_candidates,
+                discovery_backtests,
+                initial_factor_evidence,
+            )
+
+        pre_gate_candidates = _checkpointed_stage(
             store,
-            checkpoint_source if resume_run_id else None,
+            resume_source=checkpoint_source if resume_run_id else None,
+            run_id=run_id,
             round_num=round_num,
             symbol=checkpoint_symbol,
             market=checkpoint_market,
             stage="pre_gate_candidates",
             fingerprint=checkpoint_fingerprint,
+            log_label="Pre-Gate repair candidates",
+            decode=CandidateStrategySpec.model_validate,
+            compute=_compute_pre_gate_candidates,
+            encode=lambda candidate: candidate.model_dump(mode="json"),
         )
-        if pre_gate_checkpoint is not None:
-            pre_gate_candidates = [
-                CandidateStrategySpec.model_validate(item)
-                for item in pre_gate_checkpoint.get("items", [])
-            ]
-            _log(f"  Pre-Gate repair candidates: resumed {len(pre_gate_candidates)} from checkpoint")
-        else:
-            pre_gate_repairs = _build_pre_gate_repair_candidates(
-                discovery_candidates,
-                discovery_backtests,
-                initial_factor_evidence,
-            )
-            local_tuning_candidates = _build_local_grid_tuning_candidates(
-                discovery_candidates,
-                discovery_backtests,
-                initial_factor_evidence,
-            )
-            pre_gate_candidates = pre_gate_repairs + local_tuning_candidates
-            _save_stage_checkpoint(
-                store,
-                run_id,
-                round_num=round_num,
-                symbol=checkpoint_symbol,
-                market=checkpoint_market,
-                stage="pre_gate_candidates",
-                fingerprint=checkpoint_fingerprint,
-                payload={"items": [candidate.model_dump(mode="json") for candidate in pre_gate_candidates]},
-            )
     else:
         _log("  Pre-Gate repair skipped for optimization round")
     pre_gate_generated = len(pre_gate_candidates)
@@ -1546,52 +1873,38 @@ def _run_mining_round(
         )
 
     validation_tasks = _slice_tasks(validation_full_tasks, split_plan.repair_validation_mask)
-    validation_checkpoint = _load_stage_checkpoint(
-        store,
-        checkpoint_source if resume_run_id else None,
-        round_num=round_num,
-        symbol=checkpoint_symbol,
-        market=checkpoint_market,
-        stage="validation_backtests",
-        fingerprint=checkpoint_fingerprint,
-    )
-    if validation_checkpoint is not None:
-        validation_backtests = [
-            BacktestResult.model_validate(item)
-            for item in validation_checkpoint.get("items", [])
-        ]
-        _log(f"  Repair validation backtests: resumed {len(validation_backtests)} from checkpoint")
-    else:
-        validation_backtests = _run_backtests_parallel(
+    def _compute_validation_backtests() -> list[BacktestResult]:
+        results = _run_backtests_parallel(
             validation_tasks,
             repair_validation_frame,
             settings,
             max_workers,
             funding_df,
         )
-        if validation_backtests:
-            _apply_batch_pbo(repair_validation_frame, validation_tasks, validation_backtests, settings, funding_df)
-        _save_stage_checkpoint(
-            store,
-            run_id,
-            round_num=round_num,
-            symbol=checkpoint_symbol,
-            market=checkpoint_market,
-            stage="validation_backtests",
-            fingerprint=checkpoint_fingerprint,
-            payload={"items": [result.model_dump(mode="json") for result in validation_backtests]},
-        )
+        if results:
+            _apply_batch_pbo(repair_validation_frame, validation_tasks, results, settings, funding_df)
+        return results
+
+    validation_backtests = _checkpointed_stage(
+        store,
+        resume_source=checkpoint_source if resume_run_id else None,
+        run_id=run_id,
+        round_num=round_num,
+        symbol=checkpoint_symbol,
+        market=checkpoint_market,
+        stage="validation_backtests",
+        fingerprint=checkpoint_fingerprint,
+        log_label="Repair validation backtests",
+        decode=BacktestResult.model_validate,
+        compute=_compute_validation_backtests,
+        encode=lambda result: result.model_dump(mode="json"),
+    )
     pre_gate_ids = {candidate.candidate_id for candidate in pre_gate_candidates}
     pre_gate_completed = sum(1 for result in validation_backtests if result.candidate_id in pre_gate_ids)
     _check_stop(stop_event)
 
     if not validation_backtests:
-        return {
-            "candidates": [], "backtests": [], "gatechecks": [], "hardscores": [],
-            "factor_evidence": [], "research_gates": [], "near_misses": [],
-            "new_candidates": [], "research_survivors": [], "detail_artifact_ids": [],
-            "history_entry": {},
-        }
+        return RoundOutput()
 
     merge_plan = _select_repair_merge_pool(
         original_candidates=discovery_candidates,
@@ -1620,65 +1933,30 @@ def _run_mining_round(
             "diagnostics": repair_merge_diagnostics,
         })
 
-    validation_result_by_candidate = {
-        result.candidate_id: result
-        for result in merge_plan.validation_results
-    }
-
-    final_tasks = _slice_tasks(merge_plan.full_tasks, split_plan.final_oos_mask)
-    final_checkpoint = _load_stage_checkpoint(
-        store,
-        checkpoint_source if resume_run_id else None,
-        round_num=round_num,
-        symbol=checkpoint_symbol,
-        market=checkpoint_market,
-        stage="final_backtests",
-        fingerprint=checkpoint_fingerprint,
-    )
-    if final_checkpoint is not None:
-        final_backtests = [
-            BacktestResult.model_validate(item)
-            for item in final_checkpoint.get("items", [])
-        ]
-        _log(f"  Final OOS backtests: resumed {len(final_backtests)} from checkpoint")
-    else:
-        final_backtests = _run_backtests_parallel(final_tasks, final_frame, settings, max_workers, funding_df)
-        for result in final_backtests:
-            validation_result = validation_result_by_candidate.get(result.candidate_id)
-            result.pbo = validation_result.pbo if validation_result is not None else 1.0
-            if validation_result is not None:
-                result.global_trials_at_eval = validation_result.global_trials_at_eval
-                result.effective_trials_at_eval = validation_result.effective_trials_at_eval
-
-        merge_pool_trials = _merge_pool_effective_trials(
-            validation_backtests,
-            cumulative_trial_counts,
-            tested_candidates=len(validation_candidates),
-        )
-        _apply_merge_pool_trial_penalty(
-            final_backtests,
-            effective_trials_count=merge_pool_trials,
-            observations=len(final_frame),
-        )
-        _save_stage_checkpoint(
-            store,
-            run_id,
-            round_num=round_num,
-            symbol=checkpoint_symbol,
-            market=checkpoint_market,
-            stage="final_backtests",
-            fingerprint=checkpoint_fingerprint,
-            payload={"items": [result.model_dump(mode="json") for result in final_backtests]},
-        )
-
-    final_backtest_ids = {result.candidate_id for result in final_backtests}
+    # Q3: rounds gate on the held-aside repair-validation slice. The final-OOS
+    # window is never evaluated (nor read by the optimizer) during rounds; the
+    # terminal holdout evaluation in _run_pipeline_impl touches it exactly once.
+    round_result_ids = {result.candidate_id for result in merge_plan.validation_results}
     round_candidates = [
         candidate for candidate in merge_plan.candidates
-        if candidate.candidate_id in final_backtest_ids
+        if candidate.candidate_id in round_result_ids
     ]
-    round_backtests = final_backtests
-    tasks = final_tasks
-    _log(f"  Final OOS backtests: {len(round_backtests)} completed")
+    round_backtests = merge_plan.validation_results
+    tasks = _slice_tasks(merge_plan.full_tasks, split_plan.repair_validation_mask)
+    for result in round_backtests:
+        # Q9: wire G11's split-overlap signal to the actual purge geometry.
+        result.split_overlap_detected = not split_plan.gaps_honored
+    merge_pool_trials = _merge_pool_effective_trials(
+        merge_plan.validation_results,
+        _trial_counts_snapshot(cumulative_trial_counts, trial_counts_lock),
+        tested_candidates=len(validation_candidates),
+    )
+    _apply_merge_pool_trial_penalty(
+        round_backtests,
+        effective_trials_count=merge_pool_trials,
+        observations=len(repair_validation_frame),
+    )
+    _log(f"  Validation gate pool: {len(round_backtests)} candidates (merge pool of originals + accepted repairs)")
     _check_stop(stop_event)
 
     if store:
@@ -1696,13 +1974,13 @@ def _run_mining_round(
 
     # ── Factor evidence (PR1: diagnostics only, no GateCheck behavior changes) ──
     round_factor_evidence = build_factor_evidence_reports(
-        frame=final_frame,
+        frame=repair_validation_frame,
         tasks=tasks,
         candidates=round_candidates,
         results=round_backtests,
         settings=settings,
-        forward_regimes=final_regimes,
-        funding_rate=final_funding_rate,
+        forward_regimes=validation_regimes,
+        funding_rate=validation_funding_rate,
         funding_df=funding_df,
     )
     _log(f"  Factor evidence: {len(round_factor_evidence)} reports")
@@ -1713,18 +1991,7 @@ def _run_mining_round(
 
     # ── GateCheck ───────────────────────────────────────────────────
     t0 = time.perf_counter()
-    from factor_mining.validation.gatecheck import apply_fdr, apply_risk_stratified_gatechecks, run_gatecheck
-    from factor_mining.registry import get_method
-
-    fdr_map = apply_fdr(round_backtests, settings)
-    methods_map = {m.method_id: m for m in METHOD_REGISTRY}
-    round_gatechecks = []
-    for r in round_backtests:
-        method = methods_map.get(r.method_id) or get_method(r.method_id)
-        fdr_p = fdr_map.get(r.experiment_id, combined_ic_tstat_pvalue(r.ic_tstat_nw, r.rankic_tstat_nw))
-        gc = run_gatecheck(r, settings, method=method, fdr_adjusted_pvalue=fdr_p)
-        round_gatechecks.append(gc)
-    apply_risk_stratified_gatechecks(round_backtests, round_gatechecks, round_factor_evidence, settings)
+    round_gatechecks, fdr_map = _run_gatechecks(round_backtests, round_factor_evidence, settings)
 
     n_passed = sum(1 for g in round_gatechecks if g.passed)
     tier_counts = Counter(g.risk_tier for g in round_gatechecks)
@@ -1800,6 +2067,7 @@ def _run_mining_round(
             results=round_backtests,
             fdr_map=fdr_map,
             settings=settings,
+            allow_promotion=False,
         )
         store.save_artifact(f"research_gate_{artifact_scope}", "research_gate", {
             "items": [gate.model_dump(mode="json") for gate in round_research_gates],
@@ -1854,7 +2122,7 @@ def _run_mining_round(
         })
         detail_artifact_ids = _save_experiment_details(
             store,
-            frame=final_frame,
+            frame=repair_validation_frame,
             tasks=tasks,
             candidates=round_candidates,
             results=round_backtests,
@@ -1991,11 +2259,11 @@ def _run_mining_round(
                     children, rejected, warned = _filter_evolutionary_output_correlation(
                         children,
                         {c.candidate_id: c for c in [*round_candidates, *new_candidates, *children]},
-                        final_frame,
+                        repair_validation_frame,
                         features_df,
                         feature_meta,
-                        final_regimes,
-                        final_funding_rate,
+                        validation_regimes,
+                        validation_funding_rate,
                         settings,
                     )
                     evo_corr_rejected += rejected
@@ -2026,11 +2294,11 @@ def _run_mining_round(
                     accepted, rejected, warned = _filter_evolutionary_output_correlation(
                         [child],
                         {c.candidate_id: c for c in [*round_candidates, *new_candidates, child]},
-                        final_frame,
+                        repair_validation_frame,
                         features_df,
                         feature_meta,
-                        final_regimes,
-                        final_funding_rate,
+                        validation_regimes,
+                        validation_funding_rate,
                         settings,
                     )
                     evo_corr_rejected += rejected
@@ -2086,19 +2354,19 @@ def _run_mining_round(
         "trajectory_ids": [t.get("trajectory_id") for t in round_trajectories if isinstance(t, dict)],
     }
 
-    return {
-        "candidates": round_candidates,
-        "backtests": round_backtests,
-        "gatechecks": round_gatechecks,
-        "hardscores": round_hardscores,
-        "factor_evidence": round_factor_evidence,
-        "research_gates": round_research_gates,
-        "near_misses": round_near_misses,
-        "new_candidates": new_candidates,
-        "research_survivors": formal_research_survivors,
-        "detail_artifact_ids": detail_artifact_ids,
-        "history_entry": history_entry,
-    }
+    return RoundOutput(
+        candidates=round_candidates,
+        backtests=round_backtests,
+        gatechecks=round_gatechecks,
+        hardscores=round_hardscores,
+        factor_evidence=round_factor_evidence,
+        research_gates=round_research_gates,
+        near_misses=round_near_misses,
+        new_candidates=new_candidates,
+        research_survivors=formal_research_survivors,
+        detail_artifact_ids=detail_artifact_ids,
+        history_entry=history_entry,
+    )
 
 
 # ── helpers ─────────────────────────────────────────────────────────
@@ -2108,6 +2376,8 @@ def _build_data_split_plan(
     frame: pd.DataFrame,
     *,
     regimes: pd.Series | None = None,
+    purge_bars: int = 0,
+    embargo_bars: int = 0,
     discovery_fraction: float = _DISCOVERY_FRACTION,
     repair_validation_fraction: float = _REPAIR_VALIDATION_FRACTION,
     final_oos_fraction: float = _FINAL_OOS_FRACTION,
@@ -2148,12 +2418,34 @@ def _build_data_split_plan(
             validation_start = min(validation_start, max(1, target_discovery_count))
     validation_start = max(1, min(validation_start, final_start))
 
+    # Q10: purge (+ embargo) gap between adjacent splits — bars belonging to NO
+    # split — carved off the END of each upstream split (discovery before
+    # validation, validation before the final holdout), so a downstream split's
+    # feature window can't reach back into the data the optimizer already used
+    # (lookahead across the train/test boundary). Mirrors walk_forward_oos_mask's
+    # purge+embargo inter-fold spacing. All-or-nothing: the full gap is applied at
+    # both boundaries only when each upstream split can spare it (keeps >= gap
+    # bars), so a real run on a long frame purges while a short fixture is left
+    # exactly as-is. gaps_honored records whether it was applied, so the G11
+    # leakage check can flag an un-purged split (Q9) instead of pretending.
+    requested_gap = max(0, int(purge_bars) + int(embargo_bars))
+    discovery_has_room = validation_start - requested_gap >= requested_gap
+    validation_has_room = (
+        validation_count == 0
+        or final_start - validation_start - requested_gap >= requested_gap
+    )
+    apply_gap = requested_gap > 0 and discovery_has_room and validation_has_room
+    gaps_honored = requested_gap == 0 or apply_gap
+    discovery_end = validation_start - requested_gap if apply_gap else validation_start
+    validation_end = (
+        final_start - requested_gap if apply_gap and validation_count > 0 else final_start
+    )
+
     discovery_mask = pd.Series(False, index=frame.index)
     validation_mask = pd.Series(False, index=frame.index)
-    repair_mask = pd.Series(False, index=frame.index)
     final_mask = pd.Series(False, index=frame.index)
-    discovery_mask.iloc[:validation_start] = True
-    validation_mask.iloc[validation_start:final_start] = True
+    discovery_mask.iloc[:discovery_end] = True
+    validation_mask.iloc[validation_start:validation_end] = True
     final_mask.iloc[final_start:final_end] = True
     repair_mask = discovery_mask | validation_mask
     return DataSplitPlan(
@@ -2163,6 +2455,8 @@ def _build_data_split_plan(
         final_oos_mask=final_mask,
         repair_validation_start_idx=validation_start,
         final_oos_start_idx=final_start,
+        purge_embargo_bars=requested_gap,
+        gaps_honored=gaps_honored,
     )
 
 
@@ -2273,6 +2567,28 @@ def _candidate_trial_count_snapshots(
         )
         counts_by_candidate[candidate.candidate_id] = counts
     return counts_by_candidate
+
+
+def _family_test_counts_from_snapshots(
+    candidates: list[CandidateStrategySpec],
+    counts_by_candidate: dict[str, dict[str, int]],
+) -> dict[str, int]:
+    """Family → cumulative cross-round trial count for FDR multiplicity (Q15).
+
+    Uses the raw ledger ``family_trials_count`` (actual trials), not the
+    complexity-inflated ``effective_trials_count`` — BH multiplicity reflects
+    how many hypotheses were tested, DSR handles complexity."""
+    family_counts: dict[str, int] = {}
+    for candidate in candidates:
+        counts = counts_by_candidate.get(candidate.candidate_id)
+        if not counts:
+            continue
+        family = candidate.hypothesis_family
+        family_counts[family] = max(
+            family_counts.get(family, 0),
+            int(counts.get("family_trials_count", 0)),
+        )
+    return family_counts
 
 
 def _candidate_complexity_score(candidate: CandidateStrategySpec) -> int:
@@ -3269,6 +3585,21 @@ def _signal_correlation(left: Any, right: Any) -> float:
     return corr if np.isfinite(corr) else 1.0
 
 
+def _trial_counts_snapshot(
+    counts: dict[str, int],
+    lock: Any | None,
+) -> dict[str, int]:
+    """Copy the shared cross-thread trial-count dict under its writers' lock.
+
+    Symbol-group threads insert new families concurrently via
+    _record_candidate_trials; iterating the live dict without the lock can
+    observe torn totals or raise RuntimeError mid-iteration."""
+    if lock is None:
+        return counts
+    with lock:
+        return dict(counts)
+
+
 def _merge_pool_effective_trials(
     validation_results: list[BacktestResult],
     cumulative_trial_counts: dict[str, int],
@@ -3296,15 +3627,15 @@ def _apply_merge_pool_trial_penalty(
     effective_trials_count: int,
     observations: int,
 ) -> None:
-    returns_placeholder = np.empty(max(1, int(observations)), dtype=float)
     for result in results:
         result.effective_trials_at_eval = max(int(result.effective_trials_at_eval), effective_trials_count)
         result.global_trials_at_eval = max(int(result.global_trials_at_eval), effective_trials_count)
         result.deflated_sharpe = deflated_sharpe_ratio(
-            returns_placeholder,
+            None,
             observed_sr=result.metrics_primary.sharpe,
             trials_count=result.effective_trials_at_eval,
             periods_per_year=annualization_factor(result.interval),
+            observations=observations,
         )
         # Write merge-pool trial count back to trial_diagnostics for artifact transparency.
         result.trial_diagnostics["merge_pool_effective_trials"] = effective_trials_count
@@ -3327,6 +3658,9 @@ def _is_int_like(value: Any) -> bool:
         return False
 
 
+_PBO_MIN_SELECTIONS_FOR_OWN_RATE = 3
+
+
 def _apply_batch_pbo(
     frame: pd.DataFrame,
     tasks: list[tuple],
@@ -3334,9 +3668,19 @@ def _apply_batch_pbo(
     settings: Settings,
     funding_df: pd.DataFrame | None,
 ) -> None:
+    """CSCV probability of backtest overfitting for a batch of candidates.
+
+    PBO is a property of the *selection process* (Bailey et al.): the fraction
+    of splits where the in-sample winner lands in the poor OOS half. Every
+    batch member that produced a return series receives that batch-level
+    number — being batched with a dominant sibling is not per-candidate
+    evidence of overfitting. A candidate selected in at least
+    ``_PBO_MIN_SELECTIONS_FOR_OWN_RATE`` splits carries its own
+    poor/selected rate instead (a real per-candidate estimate). Members with
+    no return series keep the conservative 1.0."""
     result_by_candidate = {result.candidate_id: result for result in results}
     returns_by_candidate: dict[str, pd.Series] = {}
-    periods = annualization_factor(settings.data.default_interval)
+    periods_by_candidate: dict[str, int] = {}
 
     for signal_arr, cdict, *_ in tasks:
         candidate_id = cdict["candidate_id"]
@@ -3351,7 +3695,7 @@ def _apply_batch_pbo(
             funding=funding_df,
         )
         returns_by_candidate[candidate_id] = path.strategy_returns.reset_index(drop=True)
-        periods = annualization_factor(candidate.interval)
+        periods_by_candidate[candidate_id] = annualization_factor(candidate.interval)
 
     if len(returns_by_candidate) < 2:
         for result in results:
@@ -3367,14 +3711,15 @@ def _apply_batch_pbo(
 
     selected_count = {candidate_id: 0 for candidate_id in returns_by_candidate}
     poor_oos_count = {candidate_id: 0 for candidate_id in returns_by_candidate}
+    poor_splits = 0
     for train_mask, test_mask in split_defs:
         train_scores = {
-            candidate_id: sharpe_ratio(series.iloc[:n_rows].iloc[train_mask], periods_per_year=periods)
+            candidate_id: sharpe_ratio(series.iloc[:n_rows].iloc[train_mask], periods_per_year=periods_by_candidate[candidate_id])
             for candidate_id, series in returns_by_candidate.items()
         }
         selected_id = max(train_scores, key=train_scores.get)
         test_scores = {
-            candidate_id: sharpe_ratio(series.iloc[:n_rows].iloc[test_mask], periods_per_year=periods)
+            candidate_id: sharpe_ratio(series.iloc[:n_rows].iloc[test_mask], periods_per_year=periods_by_candidate[candidate_id])
             for candidate_id, series in returns_by_candidate.items()
         }
         selected_test_score = test_scores[selected_id]
@@ -3384,10 +3729,18 @@ def _apply_batch_pbo(
         selected_count[selected_id] += 1
         if logit < 0.0:
             poor_oos_count[selected_id] += 1
+            poor_splits += 1
 
+    batch_pbo = poor_splits / len(split_defs)
     for result in results:
-        count = selected_count.get(result.candidate_id, 0)
-        result.pbo = float(poor_oos_count.get(result.candidate_id, 0) / count) if count else 1.0
+        if result.candidate_id not in returns_by_candidate:
+            result.pbo = 1.0
+            continue
+        count = selected_count[result.candidate_id]
+        if count >= _PBO_MIN_SELECTIONS_FOR_OWN_RATE:
+            result.pbo = float(poor_oos_count[result.candidate_id] / count)
+        else:
+            result.pbo = float(batch_pbo)
 
 
 def _cscv_splits(n_rows: int, settings: Settings) -> list[tuple[np.ndarray, np.ndarray]]:
@@ -3405,24 +3758,34 @@ def _cscv_splits(n_rows: int, settings: Settings) -> list[tuple[np.ndarray, np.n
     seen: set[tuple[int, ...]] = set()
     train_group_count = n_groups // 2
     all_groups = set(range(n_groups))
-    for train_group_ids in combinations(range(n_groups), train_group_count):
-        train_tuple = tuple(train_group_ids)
+    max_splits = 128
+    total_pairs = math.comb(n_groups, train_group_count) // 2
+
+    def _add_split(train_tuple: tuple[int, ...]) -> None:
         test_tuple = tuple(sorted(all_groups.difference(train_tuple)))
         pair_key = min(train_tuple, test_tuple)
         if pair_key in seen:
-            continue
+            return
         seen.add(pair_key)
         train_mask = np.isin(group_ids, train_tuple)
         test_mask = np.isin(group_ids, test_tuple)
         if bool(train_mask.any()) and bool(test_mask.any()):
             split_defs.append((train_mask, test_mask))
-        if len(split_defs) >= 128:
-            break
+
+    if total_pairs <= max_splits:
+        for train_group_ids in combinations(range(n_groups), train_group_count):
+            _add_split(tuple(train_group_ids))
+    else:
+        # Sample the split subset uniformly (seeded): truncating the
+        # lexicographic enumeration keeps only train sets built from the
+        # earliest groups, biasing PBO toward early-data training windows.
+        rng = np.random.default_rng(42)
+        attempts = 0
+        while len(split_defs) < max_splits and attempts < max_splits * 50:
+            attempts += 1
+            train_tuple = tuple(sorted(rng.choice(n_groups, size=train_group_count, replace=False).tolist()))
+            _add_split(train_tuple)
     return split_defs
-
-
-def _cpcv_splits(n_rows: int, settings: Settings) -> list[tuple[np.ndarray, np.ndarray]]:
-    return _cscv_splits(n_rows, settings)
 
 
 def _data_key(candidate: CandidateStrategySpec) -> tuple[str, str]:
@@ -3695,25 +4058,51 @@ def _update_research_survivor_store(
     results: list[BacktestResult],
     fdr_map: dict[str, float],
     settings: Settings,
+    now: datetime | None = None,
+    allow_promotion: bool = True,
 ) -> None:
+    """Upsert survivor records and maintain rechecked survivors' status.
+
+    ``allow_promotion=False`` (per-round maintenance): upserts and retirements
+    only. Promotions require holdout-grade evidence — the terminal final-OOS
+    evaluation or the survivor-verify path — where the FDR map carries
+    cross-round multiplicity; per-round validation stats must not promote."""
     store.upsert_research_survivors(records)
     if not rechecked_candidate_ids:
         return
 
+    now = (now or datetime.now(UTC)).astimezone(UTC)
+    # The stored records carry the preserved paper_trade_start_date (upsert
+    # keeps the original clock); promotion must age against that, not against
+    # this round's freshly built records.
+    stored_by_candidate = {
+        record.candidate_id: record
+        for record in store.list_research_survivors(status=None)
+    }
     gate_by_candidate = {gate.candidate_id: gate for gate in research_gates}
     result_by_candidate = {result.candidate_id: result for result in results}
     min_trades = int(settings.gatecheck.min_oos_trades)
     promotion_fdr = float(settings.gatecheck.research_survivor_promotion_fdr_p)
+    default_required_days = int(settings.gatecheck.research_survivor_min_oos_days)
     for candidate_id in rechecked_candidate_ids:
         gate = gate_by_candidate.get(candidate_id)
         result = result_by_candidate.get(candidate_id)
         if gate is None or result is None:
             continue
-        current_trades = int(result.oos_trade_count or result.metrics_primary.trade_count)
+        # Strictly the OOS count — promotion/retirement progress must be earned
+        # on OOS trades, never borrowed from the full-slice trade count.
+        current_trades = int(result.oos_trade_count)
         fdr_pvalue = float(fdr_map.get(result.experiment_id, combined_ic_tstat_pvalue(result.ic_tstat_nw, result.rankic_tstat_nw)))
-        if gate.status == "production_passed":
+        stored = stored_by_candidate.get(candidate_id)
+        required_days = int(stored.required_oos_days) if stored is not None else default_required_days
+        elapsed_days = (
+            (now - stored.paper_trade_start_date.astimezone(UTC)).days
+            if stored is not None
+            else 0
+        )
+        if allow_promotion and gate.status == "production_passed":
             store.update_research_survivor_status(candidate_id, "promoted", "production_gate_passed")
-        elif fdr_pvalue < promotion_fdr and current_trades >= min_trades:
+        elif allow_promotion and fdr_pvalue < promotion_fdr and current_trades >= min_trades and elapsed_days >= required_days:
             store.update_research_survivor_status(candidate_id, "promoted", "promotion_criteria_met")
         elif gate.status == "rejected" and current_trades >= min_trades:
             store.update_research_survivor_status(candidate_id, "retired", "rejected_after_min_trades")
@@ -4730,10 +5119,9 @@ def _run_backtests_parallel(
     slim_tasks = [(arr, cdict, trial_counts, notes) for arr, cdict, _, trial_counts, notes in tasks]
 
     if n_workers <= 1:
-        _init_worker(frame, settings, funding_df)
         for idx, task in enumerate(slim_tasks):
             c = CandidateStrategySpec.model_validate(tasks[idx][1])
-            out = _run_one_backtest(task)
+            out = _execute_backtest_task(task, frame, settings, funding_df)
             if isinstance(out, Exception):
                 _log(f"  [{idx + 1}/{len(tasks)}] {c.candidate_id[:16]}... SKIP: {out}")
             else:
@@ -4823,7 +5211,12 @@ def _is_repair_candidate(candidate: CandidateStrategySpec) -> bool:
 
 
 def _archive_top(result: PipelineResult, settings: Settings, archive_top: int) -> int:
-    """Archive the top-scoring experiments across all rounds."""
+    """Archive the top-scoring terminal-holdout experiments.
+
+    result.candidates/backtests/hardscores are the terminal final-OOS outputs
+    (aligned by construction in _evaluate_final_holdout), so archived
+    metrics_primary keeps its meaning for downstream consumers: the final-OOS
+    backtest of the candidate."""
     from factor_mining.archive import archive_experiment
     from factor_mining.data.loader import data_extent
 

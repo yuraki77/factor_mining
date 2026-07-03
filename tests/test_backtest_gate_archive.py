@@ -2,13 +2,13 @@ import pandas as pd
 import pytest
 
 from factor_mining.archive import archive_experiment, verify_archive
-from factor_mining.backtest.engine import _apply_exit_rules, evaluate_strategy_path, run_backtest, walk_forward_oos_mask
+from factor_mining.backtest.engine import _EQUITY_CURVE_MAX_POINTS, _apply_exit_rules, _bounded_equity_curve, evaluate_strategy_path, run_backtest, walk_forward_oos_mask
 from factor_mining.config import BootstrapConfig, DataConfig, GateCheckConfig, PermutationTestConfig, PositionSizingConfig, Settings, WalkForwardConfig
 from factor_mining.models import BacktestResult, CandidateStrategySpec, DataQualityNote, FactorEvidenceReport, GateCheckResult, MetricsBlock
 from factor_mining.registry import get_method
 from factor_mining.storage import MetadataStore
 from factor_mining.trial_ledger import TrialLedger
-from factor_mining.validation.gatecheck import apply_risk_stratified_gatechecks, run_gatecheck
+from factor_mining.validation.gatecheck import apply_fdr, apply_risk_stratified_gatechecks, run_gatecheck
 from factor_mining.hardscore import hardscore
 
 
@@ -136,6 +136,25 @@ def test_backtest_uses_next_bar_execution_and_records_trial(tmp_path) -> None:
     assert result.global_trials_at_eval == 1
     assert result.pbo is None
     assert result.oos_trade_count != 3
+    # I5: every result carries a bounded equity curve so the product (and a
+    # reproduced run, which returns only this BacktestResult) can chart it.
+    assert 0 < len(result.equity_curve) <= _EQUITY_CURVE_MAX_POINTS
+    assert all(value > 0.0 for value in result.equity_curve)
+
+
+def test_bounded_equity_curve_caps_points_and_keeps_endpoints() -> None:
+    """I5: the equity curve is downsampled to a fixed cap so an archived/serialized
+    BacktestResult stays small regardless of OOS length, while the first and last
+    points — and therefore the exact final compounded value — are preserved. WHY it
+    matters: the product charts this curve directly for reproduced runs, so it must
+    be both bounded (no unbounded payload growth) and faithful at the endpoints."""
+    returns = pd.Series([0.001] * 5000)
+    curve = _bounded_equity_curve(returns)
+    assert len(curve) <= _EQUITY_CURVE_MAX_POINTS
+    assert curve[0] == pytest.approx(1.001)
+    assert curve[-1] == pytest.approx(1.001**5000)
+    short = _bounded_equity_curve(pd.Series([0.01, -0.02, 0.03]))
+    assert short == pytest.approx([1.01, 1.01 * 0.98, 1.01 * 0.98 * 1.03])
 
 
 def test_permutation_test_uses_executable_lagged_signal(tmp_path, monkeypatch) -> None:
@@ -333,6 +352,57 @@ def test_risk_stratified_gate_full_pass_requires_strong_evidence_and_low_pbo() -
     assert score.allocation_multiplier == 1.0
 
 
+def test_g11_blocks_when_split_overlap_detected() -> None:
+    """Q9: G11 was vacuous — the pipeline never set its leakage fields, so
+    ``leakage_checks_passed and not split_overlap_detected`` was always True. Now
+    the pipeline wires split_overlap_detected from the split plan's gaps_honored
+    (Q10), so G11 must be able to FAIL: an otherwise gate-ready result whose
+    final-OOS split could not be purged from the optimizer's data must not clear
+    the gate. WHY it matters: an un-purged holdout is leakage-contaminated, and
+    passing it would promote a strategy whose OOS edge is inflated by train/test
+    bleed."""
+    clean = _gate_ready_result(pbo=0.20)
+    clean.split_overlap_detected = False
+    clean_gate = run_gatecheck(clean, Settings(), method=get_method("rule_mining"), fdr_adjusted_pvalue=0.01)
+    assert next(item for item in clean_gate.items if item.rule_id == "G11").status == "pass"
+    assert clean_gate.raw_passed is True
+
+    contaminated = _gate_ready_result(pbo=0.20)
+    contaminated.split_overlap_detected = True
+    dirty_gate = run_gatecheck(contaminated, Settings(), method=get_method("rule_mining"), fdr_adjusted_pvalue=0.01)
+    assert next(item for item in dirty_gate.items if item.rule_id == "G11").status == "fail"
+    assert dirty_gate.raw_passed is False  # G11 is a blocking rule
+
+
+def _fdr_result(experiment_id: str, ic_tstat: float) -> BacktestResult:
+    return BacktestResult(
+        experiment_id=experiment_id,
+        candidate_id=experiment_id,
+        hypothesis_family="momentum",
+        method_id="rule_mining",
+        symbol="BTCUSDT",
+        market="um_futures",
+        interval="5m",
+        metrics_primary=MetricsBlock(),
+        ic_tstat_nw=ic_tstat,
+        rankic_tstat_nw=ic_tstat,
+    )
+
+
+def test_apply_fdr_cross_round_counts_tighten_pvalues() -> None:
+    """Q15: the multiplicity penalty must reflect every candidate tested in a
+    family across all rounds, not just this batch. Supplying cross-round trial
+    counts raises BH n_tests, so the same observed IC yields a larger (more
+    conservative) adjusted p-value than the per-round default — which is what
+    keeps a family that has been searched for many rounds from clearing G3 on a
+    lucky draw."""
+    results = [_fdr_result("e1", 4.0), _fdr_result("e2", 3.5)]
+    per_round = apply_fdr(results, Settings())
+    cross_round = apply_fdr(results, Settings(), family_test_counts={"momentum": 50})
+    assert cross_round["e1"] > per_round["e1"]
+    assert cross_round["e2"] > per_round["e2"]
+
+
 def test_risk_stratified_gate_blocks_weak_evidence_even_with_low_pbo() -> None:
     result = _gate_ready_result(pbo=0.20)
     gate = run_gatecheck(result, Settings(), method=get_method("rule_mining"), fdr_adjusted_pvalue=0.01)
@@ -488,3 +558,21 @@ def test_archive_bundle_writes_candidate_and_data_manifest(tmp_path) -> None:
     assert saved_candidate["params"]["factor_family"] == "momentum"  # params survive the round-trip
     manifest = json.loads((bundle / "manifest.json").read_text())
     assert manifest["data_manifest"]["data_end_ms"] == 1_777_593_300_000  # real extent, not {}
+
+
+def test_risk_stratification_rejects_mispaired_batches() -> None:
+    """A results/gatechecks length mismatch means a caller paired the wrong
+    batch; truncated zipping silently mis-tiers results, so it must raise."""
+    result = BacktestResult(
+        experiment_id="exp-strict",
+        candidate_id="cand-strict",
+        hypothesis_family="momentum",
+        method_id="factor_scoring",
+        symbol="BTCUSDT",
+        market="um_futures",
+        interval="5m",
+        metrics_primary=MetricsBlock(sharpe=1.0, trade_count=100),
+    )
+    gate = run_gatecheck(result, Settings(), method=get_method("factor_scoring"))
+    with pytest.raises(ValueError):
+        apply_risk_stratified_gatechecks([result, result], [gate], [], Settings())

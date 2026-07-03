@@ -103,6 +103,8 @@ class BacktestResult(BaseModel):
     rankic_tstat_nw: float = 0.0
     sharpe_ci_5_95: tuple[float, float] = (0.0, 0.0)
     probabilistic_sharpe: float = 0.0
+    # Expected-max haircut Sharpe (sqrt(2 ln N / n) penalty), not Bailey's
+    # PSR-based DSR — see stats.metrics.deflated_sharpe_ratio. G1 gates on > 0.
     deflated_sharpe: float = 0.0
     effective_trials_at_eval: int = 0
     global_trials_at_eval: int = 0
@@ -122,6 +124,11 @@ class BacktestResult(BaseModel):
     actual_cost_bps: float = 0.0
     prior_posterior_ic_ratio: float = 1.0
     window_stability: WindowStabilityDiagnostics | None = None
+    # Bounded (downsampled) final-OOS compound-equity path so the product can render
+    # a real chart for any result — including a reproduced run, which returns only
+    # this BacktestResult and no heavyweight detail payload. Empty by default for
+    # backward compatibility with archived results and the cross-repo consumer.
+    equity_curve: list[float] = Field(default_factory=list)
     trial_diagnostics: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 

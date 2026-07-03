@@ -48,7 +48,13 @@ def newey_west_tstat(values: Sequence[float], *, lag: int | None = None) -> floa
     n = arr.size
     if n < 3:
         return 0.0
-    lag = int(n ** (1 / 3)) if lag is None else lag
+    lag = int(n ** (1 / 3)) if lag is None else int(lag)
+    # An explicit overlap bandwidth (e.g. a rolling-IC window) can exceed the
+    # sample; Newey-West is only defined for lag < n, so cap it. When the whole
+    # sample fits inside one overlap window this collapses to the maximally
+    # conservative estimator (~one effective observation) — the honest result
+    # rather than a spuriously large t-stat.
+    lag = max(1, min(lag, n - 1))
     centered = arr - arr.mean()
     gamma0 = float(np.dot(centered, centered) / n)
     variance = gamma0
@@ -132,15 +138,22 @@ def probabilistic_sharpe_ratio(
 
 
 def deflated_sharpe_ratio(
-    returns: Sequence[float],
+    returns: Sequence[float] | None,
     *,
     observed_sr: float,
     trials_count: int,
     periods_per_year: int,
     benchmark_sr: float = 0.0,
+    observations: int | None = None,
 ) -> float:
-    """Deflated Sharpe haircut: ``observed_sr`` minus the expected maximum
+    """Expected-max haircut Sharpe: ``observed_sr`` minus the expected maximum
     Sharpe under the null over ``trials_count`` independent trials.
+
+    Despite the historical name this is NOT Bailey & Lopez de Prado's deflated
+    Sharpe ratio: there is no skewness/kurtosis correction and no variance of
+    the trial SR distribution — only the ``sqrt(2 ln N / n)`` expected-max
+    penalty. G1 gates on this value being positive; treat it as a
+    multiple-testing haircut, not a probability statement.
 
     ``observed_sr``/``benchmark_sr`` are *annualized* Sharpe ratios. The
     expected-maximum penalty ``sqrt(2 ln N / n)`` is a *per-period* Sharpe
@@ -148,9 +161,17 @@ def deflated_sharpe_ratio(
     subtracted. The prior code subtracted the per-period penalty straight from
     the annualized Sharpe, under-stating the haircut by ``sqrt(periods_per_year)``
     (≈ 324× on 5m bars) so almost every candidate cleared a positive DSR.
+
+    Only the *length* of ``returns`` enters the penalty; callers that know the
+    sample size but not the series (e.g. the merge-pool re-penalty) pass
+    ``observations`` and ``returns=None`` instead of fabricating an array.
     """
-    arr = np.asarray(returns, dtype=float)
-    n = max(len(arr), 1)
+    if observations is not None:
+        n = max(int(observations), 1)
+    else:
+        if returns is None:
+            raise ValueError("deflated_sharpe_ratio needs either returns or observations")
+        n = max(len(np.asarray(returns, dtype=float)), 1)
     per_period_penalty = math.sqrt(2.0 * math.log(max(trials_count, 1)) / n)
     annualized_penalty = per_period_penalty * math.sqrt(max(int(periods_per_year), 1))
     return float(observed_sr - benchmark_sr - annualized_penalty)

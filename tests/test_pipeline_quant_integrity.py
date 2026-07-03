@@ -2,6 +2,7 @@ import threading
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from factor_mining.config import BootstrapConfig, CPCVConfig, DataConfig, PermutationTestConfig, Settings
 from factor_mining.models import (
@@ -153,21 +154,44 @@ def test_run_pipeline_executes_symbol_rounds_in_parallel(monkeypatch) -> None:
             metrics_primary=MetricsBlock(sharpe=0.0),
             pbo=0.2,
         )
-        return {
-            "candidates": [candidate],
-            "backtests": [result],
-            "gatechecks": [],
-            "hardscores": [],
-            "factor_evidence": [],
-            "research_gates": [],
-            "near_misses": [],
-            "new_candidates": [],
-            "research_survivors": [],
-            "detail_artifact_ids": [],
-            "history_entry": {"symbol": candidate.symbol},
-        }
+        gate = GateCheckResult(
+            experiment_id=result.experiment_id,
+            candidate_id=candidate.candidate_id,
+            passed=True,
+            items=[],
+            risk_tier="full_pass",
+        )
+        return pipeline.RoundOutput(
+            candidates=[candidate],
+            backtests=[result],
+            gatechecks=[gate],
+            history_entry={"symbol": candidate.symbol},
+        )
 
     monkeypatch.setattr(pipeline, "_run_mining_round", fake_round)
+
+    def fake_terminal(*, candidates, gatechecks, **kwargs):
+        passed_ids = {gate.candidate_id for gate in gatechecks if gate.passed}
+        survivors = [candidate for candidate in candidates if candidate.candidate_id in passed_ids]
+        return pipeline.TerminalOutput(
+            candidates=survivors,
+            backtests=[
+                BacktestResult(
+                    experiment_id=f"terminal-{candidate.symbol}",
+                    candidate_id=candidate.candidate_id,
+                    hypothesis_family=candidate.hypothesis_family,
+                    method_id=candidate.method_id,
+                    symbol=candidate.symbol,
+                    market=candidate.market,
+                    interval=candidate.interval,
+                    metrics_primary=MetricsBlock(sharpe=0.0),
+                    pbo=0.2,
+                )
+                for candidate in survivors
+            ],
+        )
+
+    monkeypatch.setattr(pipeline, "_evaluate_final_holdout", fake_terminal)
 
     result = run_pipeline(
         Settings(data=DataConfig(symbols=["BTCUSDT", "ETHUSDT"])),
@@ -177,7 +201,10 @@ def test_run_pipeline_executes_symbol_rounds_in_parallel(monkeypatch) -> None:
         archive_top=0,
     )
 
+    # Both symbol groups' round-gate survivors reach the terminal holdout, and
+    # the run's headline backtests are the terminal outputs.
     assert {backtest.symbol for backtest in result.backtests} == {"BTCUSDT", "ETHUSDT"}
+    assert all(backtest.experiment_id.startswith("terminal-") for backtest in result.backtests)
     assert max_workers_seen == [1, 1]
 
 
@@ -228,19 +255,12 @@ def test_split_round_controls_disable_repairs_and_stop_on_optimizer_convergence(
             "smooth_span": 48,
             "signal_threshold": 0.25,
         })
-        return {
-            "candidates": [current],
-            "backtests": [result],
-            "gatechecks": [],
-            "hardscores": [],
-            "factor_evidence": [],
-            "research_gates": [],
-            "near_misses": [],
-            "new_candidates": [next_candidate],
-            "research_survivors": [],
-            "detail_artifact_ids": [],
-            "history_entry": {"phase": phase, "num_candidates": 1, "num_backtests": 1},
-        }
+        return pipeline.RoundOutput(
+            candidates=[current],
+            backtests=[result],
+            new_candidates=[next_candidate],
+            history_entry={"phase": phase, "num_candidates": 1, "num_backtests": 1},
+        )
 
     monkeypatch.setattr(pipeline, "_run_mining_round", fake_round)
 
@@ -262,7 +282,12 @@ def test_split_round_controls_disable_repairs_and_stop_on_optimizer_convergence(
     assert result.total_rounds == 3
 
 
-def test_mining_round_skips_discovery_pbo_and_uses_validation_pbo(monkeypatch) -> None:
+def test_mining_round_gates_on_validation_and_never_touches_holdout(monkeypatch) -> None:
+    """Q3 round semantics: the round's gate pool must be the repair-validation
+    evaluation of the merge pool, PBO comes from the validation slice, and no
+    backtest during the round may read the final-OOS window — the optimizer
+    is downstream of round results, so any holdout evaluation here leaks the
+    holdout into the search."""
     import factor_mining.hardscore as hardscore_module
     import factor_mining.optimizers.traditional_optimizer as optimizer_module
     import factor_mining.validation.gatecheck as gatecheck_module
@@ -270,6 +295,7 @@ def test_mining_round_skips_discovery_pbo_and_uses_validation_pbo(monkeypatch) -
     candidate = _candidate("c_btc", "BTCUSDT")
     frame = _frame(100)
     pbo_frame_lengths: list[int] = []
+    backtest_window_starts: list[int] = []
 
     def fake_build_tasks(candidates, frame_arg, *args, trial_counts_by_candidate=None, **kwargs):
         trial_counts_by_candidate = trial_counts_by_candidate or {}
@@ -285,12 +311,13 @@ def test_mining_round_skips_discovery_pbo_and_uses_validation_pbo(monkeypatch) -
         ]
 
     def fake_backtests(tasks, frame_arg, settings, max_workers, funding_df=None):
+        backtest_window_starts.append(int(frame_arg["open_time"].iloc[0]))
         results = []
         for _signal, candidate_dict, _idx, _trial_counts, _notes in tasks:
             item = CandidateStrategySpec.model_validate(candidate_dict)
             results.append(
                 BacktestResult(
-                    experiment_id=f"exp-{len(frame_arg)}-{item.candidate_id}",
+                    experiment_id=f"exp-{int(frame_arg['open_time'].iloc[0])}-{item.candidate_id}",
                     candidate_id=item.candidate_id,
                     hypothesis_family=item.hypothesis_family,
                     method_id=item.method_id,
@@ -408,7 +435,18 @@ def test_mining_round_skips_discovery_pbo_and_uses_validation_pbo(monkeypatch) -
     )
 
     assert pbo_frame_lengths == [20]
-    assert round_data["backtests"][0].pbo == 0.2
+    assert round_data.backtests[0].pbo == 0.2
+
+    # The round's gate pool is the validation evaluation (window starts at bar
+    # 60 of 100: discovery 60% / validation 20% / final 20%)...
+    base_time = int(frame["open_time"].iloc[0])
+    bar_ms = int(frame["open_time"].iloc[1]) - base_time
+    validation_start = base_time + 60 * bar_ms
+    final_start = base_time + 80 * bar_ms
+    assert round_data.backtests[0].experiment_id.startswith(f"exp-{validation_start}-")
+    # ...and the final-OOS window must never have been backtested in-round.
+    assert final_start not in backtest_window_starts
+    assert backtest_window_starts == [base_time, validation_start]
 
 
 def _signal_build_inputs() -> tuple[
@@ -1834,6 +1872,39 @@ def test_data_split_plan_final_oos_is_chronological_even_with_alien_regime_tail(
     assert final_regimes == {"high_vol"}
 
 
+def test_data_split_plan_inserts_purge_embargo_gap_between_splits() -> None:
+    """Q10: with a purge/embargo gap the discovery/validation/final splits are
+    separated by >= gap bars that belong to NO split, so the final holdout's first
+    feature window can't reach back into the validation/discovery bars the
+    optimizer tuned on. WHY it matters: contiguous splits leak adjacent-bar
+    information across the train/test boundary and inflate OOS performance."""
+    frame = _frame(2000)
+    gap = 100
+    plan = _build_data_split_plan(frame, purge_bars=gap, embargo_bars=0)
+    assert plan.gaps_honored
+    assert plan.purge_embargo_bars == gap
+    disc = [int(i) for i in plan.discovery_mask[plan.discovery_mask].index]
+    val = [int(i) for i in plan.repair_validation_mask[plan.repair_validation_mask].index]
+    fin = [int(i) for i in plan.final_oos_mask[plan.final_oos_mask].index]
+    assert not (set(disc) & set(val)) and not (set(val) & set(fin)) and not (set(disc) & set(fin))
+    assert min(val) - max(disc) - 1 >= gap   # purged between discovery and validation
+    assert min(fin) - max(val) - 1 >= gap    # purged between validation and final holdout
+
+
+def test_data_split_plan_skips_gap_when_frame_too_short_and_flags_it() -> None:
+    """A short frame can't spare the gap; rather than shred the splits into slivers,
+    the plan falls back to no purge and records gaps_honored=False — so the G11
+    leakage check can flag the un-purged split (Q9) instead of silently pretending
+    it was purged. All three splits stay non-empty and chronological."""
+    frame = _frame(120)
+    plan = _build_data_split_plan(frame, purge_bars=288, embargo_bars=288)
+    assert not plan.gaps_honored
+    assert plan.discovery_mask.sum() > 0
+    assert plan.repair_validation_mask.sum() > 0
+    assert plan.final_oos_mask.sum() > 0
+    assert not bool((plan.repair_mask & plan.final_oos_mask).any())
+
+
 def test_repair_merge_pool_prunes_high_pbo_and_redundant_repairs() -> None:
     parent = CandidateStrategySpec(
         candidate_id="c_parent",
@@ -2125,3 +2196,251 @@ def test_gatecheck_diagnostics_summarizes_failures_and_costs() -> None:
     assert top["search_variant"] == "low_turnover"
     assert top["cost_drag_sharpe"] == 1.5
     assert top["cost_margin_bps"] == -2.0
+
+
+def test_serial_backtest_path_ignores_worker_global_stomp(monkeypatch) -> None:
+    """Symbol groups run in a ThreadPoolExecutor and small batches take the
+    serial (n_workers==1) backtest path. That path must evaluate against the
+    frame it was handed — not the process-worker module globals — otherwise a
+    concurrent symbol group re-initializing the worker context makes this
+    group's candidates silently backtest on the *other symbol's* data."""
+    import factor_mining.backtest.engine as engine_module
+
+    frame_a = _frame(100)
+    frame_b = _frame(100)
+    frame_b["close"] = frame_b["close"] * 2.0
+    frames_seen: list[bool] = []
+
+    def fake_run_backtest(frame, signal, candidate, settings, **kwargs):
+        frames_seen.append(frame is frame_a)
+        # Simulate another symbol-group thread initializing the worker
+        # context with its own frame between this batch's tasks.
+        pipeline._init_worker(frame_b, settings, None)
+        return _result(f"exp-{candidate.candidate_id}", candidate.candidate_id, pbo=0.1, sharpe=1.0)
+
+    monkeypatch.setattr(engine_module, "run_backtest", fake_run_backtest)
+
+    candidates = [_candidate("c_serial_1", "BTCUSDT"), _candidate("c_serial_2", "BTCUSDT")]
+    tasks = [
+        (np.zeros(len(frame_a)), candidate.model_dump(mode="json"), idx, {"effective_trials_count": 1}, [])
+        for idx, candidate in enumerate(candidates)
+    ]
+
+    results = _run_backtests_parallel(tasks, frame_a, Settings(), max_workers=1)
+
+    assert len(results) == 2
+    assert frames_seen == [True, True], "serial path leaked to the stomped worker globals"
+
+
+def test_trial_counts_snapshot_serializes_with_writers() -> None:
+    """The merge-pool DSR penalty sums the cross-thread trial-count dict; that
+    read must serialize on the same lock _record_candidate_trials writers use,
+    or the penalty is computed from torn state mid-insert."""
+    lock = threading.Lock()
+    shared = {"momentum": 1}
+    assert lock.acquire()
+    out: list[dict[str, int]] = []
+    reader = threading.Thread(target=lambda: out.append(pipeline._trial_counts_snapshot(shared, lock)))
+    reader.start()
+    reader.join(timeout=0.2)
+    assert reader.is_alive(), "snapshot must block while a writer holds the lock"
+    shared["breakout"] = 5  # the writer finishes its insert before releasing
+    lock.release()
+    reader.join(timeout=2.0)
+    assert not reader.is_alive()
+    assert out[0] == {"momentum": 1, "breakout": 5}
+    assert out[0] is not shared, "snapshot must be a copy, not the live dict"
+    # Single-threaded path (no lock): the live dict is safe to use directly.
+    assert pipeline._trial_counts_snapshot(shared, None) is shared
+
+
+def test_terminal_holdout_evaluates_survivors_once_with_cumulative_fdr(monkeypatch) -> None:
+    """The terminal holdout must (a) evaluate only candidates whose *latest*
+    round gate passed, (b) backtest only the final-OOS window and only once,
+    (c) run FDR at cumulative cross-round family multiplicity (Q15), and
+    (d) raise the DSR penalty to the run-wide effective trial count. This is
+    the only path allowed to read the holdout."""
+    import factor_mining.hardscore as hardscore_module
+    import factor_mining.validation.gatecheck as gatecheck_module
+
+    winner = _candidate("c_pass", "BTCUSDT")
+    loser = _candidate("c_fail", "BTCUSDT")
+    context = _context_for(winner)
+    frame = context.frame
+
+    def _gate(candidate_id: str, passed: bool) -> GateCheckResult:
+        return GateCheckResult(
+            experiment_id=f"exp-{candidate_id}",
+            candidate_id=candidate_id,
+            passed=passed,
+            items=[],
+        )
+
+    # Latest gate wins: winner failed round 1 then passed round 2; loser passed
+    # round 1 then failed round 2.
+    gatechecks = [
+        _gate("c_pass", False),
+        _gate("c_fail", True),
+        _gate("c_pass", True),
+        _gate("c_fail", False),
+    ]
+
+    backtest_window_starts: list[int] = []
+
+    def fake_build_tasks(candidates, frame_arg, *args, trial_counts_by_candidate=None, **kwargs):
+        trial_counts_by_candidate = trial_counts_by_candidate or {}
+        return [
+            (
+                np.ones(len(frame_arg)),
+                item.model_dump(mode="json"),
+                idx,
+                trial_counts_by_candidate.get(item.candidate_id, {}),
+                [],
+            )
+            for idx, item in enumerate(candidates)
+        ]
+
+    def fake_backtests(tasks, frame_arg, settings_arg, max_workers, funding_df=None):
+        backtest_window_starts.append(int(frame_arg["open_time"].iloc[0]))
+        results = []
+        for _signal, candidate_dict, _idx, trial_counts, _notes in tasks:
+            item = CandidateStrategySpec.model_validate(candidate_dict)
+            results.append(
+                BacktestResult(
+                    experiment_id=f"exp-terminal-{item.candidate_id}",
+                    candidate_id=item.candidate_id,
+                    hypothesis_family=item.hypothesis_family,
+                    method_id=item.method_id,
+                    symbol=item.symbol,
+                    market=item.market,
+                    interval=item.interval,
+                    metrics_primary=MetricsBlock(sharpe=1.0, trade_count=50),
+                    ic_tstat_nw=4.0,
+                    rankic_tstat_nw=4.0,
+                    effective_trials_at_eval=int(trial_counts.get("effective_trials_count", 1)),
+                )
+            )
+        return results
+
+    monkeypatch.setattr(pipeline, "_build_tasks", fake_build_tasks)
+    monkeypatch.setattr(pipeline, "_run_backtests_parallel", fake_backtests)
+    monkeypatch.setattr(pipeline, "_apply_batch_pbo", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "build_factor_evidence_reports", lambda **kwargs: [])
+    monkeypatch.setattr(
+        hardscore_module,
+        "hardscore",
+        lambda result, gatecheck, **kwargs: HardScoreReport(
+            experiment_id=result.experiment_id,
+            score=1.0,
+            haircut_sharpe=0.5,
+            fdr_adjusted_pvalue=0.01,
+            prior_posterior_ic_ratio=1.0,
+            effective_trials_count=1,
+            global_cumulative_trials_count=1,
+        ),
+    )
+
+    captured: dict = {}
+    real_apply_fdr = gatecheck_module.apply_fdr
+
+    def spy_apply_fdr(results, settings_arg, **kwargs):
+        captured.update(kwargs)
+        return real_apply_fdr(results, settings_arg, **kwargs)
+
+    monkeypatch.setattr(gatecheck_module, "apply_fdr", spy_apply_fdr)
+
+    out = pipeline._evaluate_final_holdout(
+        candidates=[winner, loser],
+        gatechecks=gatechecks,
+        data_contexts={pipeline._data_key(winner): context},
+        settings=Settings(data=DataConfig(symbols=["BTCUSDT"])),
+        cumulative_trial_counts={"momentum": 37},
+        store=None,
+        max_workers=1,
+        survivor_candidate_ids=set(),
+        tested_candidates=5,
+    )
+
+    base_time = int(frame["open_time"].iloc[0])
+    bar_ms = int(frame["open_time"].iloc[1]) - base_time
+    final_start = base_time + 80 * bar_ms
+    assert backtest_window_starts == [final_start], "terminal must touch only the final window, once"
+    assert [result.candidate_id for result in out.backtests] == ["c_pass"]
+    assert captured.get("family_test_counts") == {"momentum": 37}
+    assert out.backtests[0].effective_trials_at_eval >= 37
+    assert len(out.gatechecks) == 1 and len(out.hardscores) == 1
+
+
+def test_batch_pbo_does_not_punish_never_selected_members(monkeypatch) -> None:
+    """PBO is a property of the selection process (Bailey CSCV): a candidate
+    that is never the in-sample winner must inherit the batch-level PBO, not
+    an automatic 1.0 — otherwise being batched with one dominant sibling
+    hard-fails G2 (blocking) regardless of the candidate's own merit."""
+    settings = Settings(cpcv=CPCVConfig(n_groups=8))
+    frame = _frame(400)
+
+    def _cand(cid: str) -> CandidateStrategySpec:
+        return _candidate(cid, "BTCUSDT")
+
+    def _res(cid: str) -> BacktestResult:
+        return BacktestResult(
+            experiment_id=f"exp-{cid}",
+            candidate_id=cid,
+            hypothesis_family="momentum",
+            method_id="factor_scoring",
+            symbol="BTCUSDT",
+            market="um_futures",
+            interval="5m",
+            metrics_primary=MetricsBlock(),
+            pbo=None,
+        )
+
+    rng = np.random.default_rng(3)
+    # Dominant sibling: strong steady returns wins every in-sample split.
+    strong = pd.Series(np.repeat(0.002, 400) + rng.normal(0.0, 0.0005, 400))
+    weak_a = pd.Series(rng.normal(0.0, 0.002, 400))
+    weak_b = pd.Series(rng.normal(0.0, 0.002, 400))
+    returns = {"c_strong": strong, "c_weak_a": weak_a, "c_weak_b": weak_b}
+
+    class _FakePath:
+        def __init__(self, series: pd.Series) -> None:
+            self.strategy_returns = series
+
+    monkeypatch.setattr(
+        pipeline,
+        "evaluate_strategy_path",
+        lambda frame_arg, signal, candidate, settings_arg, funding=None: _FakePath(returns[candidate.candidate_id]),
+    )
+
+    tasks = [
+        (np.ones(len(frame)), _cand(cid).model_dump(mode="json"), idx, {}, [])
+        for idx, cid in enumerate(returns)
+    ]
+    results = [_res(cid) for cid in returns]
+
+    _apply_batch_pbo(frame, tasks, results, settings, funding_df=None)
+
+    by_id = {result.candidate_id: result for result in results}
+    # The dominant sibling wins every split, so the weak members are never
+    # selected — they must carry the batch-level PBO, which for a genuinely
+    # strong winner is far below the old automatic 1.0.
+    assert by_id["c_weak_a"].pbo == by_id["c_weak_b"].pbo
+    assert by_id["c_weak_a"].pbo < 1.0
+    assert by_id["c_weak_a"].pbo == pytest.approx(by_id["c_strong"].pbo, abs=0.35)
+
+
+def test_cscv_split_subsample_is_not_lexicographically_biased() -> None:
+    """When the unique split pairs exceed the cap, the subset must be sampled,
+    not truncated: the first 128 lexicographic train sets all contain the
+    earliest groups, so PBO would only ever train on early data."""
+    settings = Settings(cpcv=CPCVConfig(n_groups=16))
+    splits = _cscv_splits(1600, settings)
+
+    assert len(splits) == 128
+    # Group 0 owns rows [0, 100). Under lexicographic truncation every train
+    # set contains group 0; a sampled subset must include splits that test on
+    # the earliest data instead.
+    assert any(not train_mask[0] for train_mask, _test_mask in splits)
+    # Complement-deduped and unique.
+    keys = {tuple(np.flatnonzero(train_mask[::100])) for train_mask, _ in splits}
+    assert len(keys) == 128

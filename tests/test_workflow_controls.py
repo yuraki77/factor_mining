@@ -1,10 +1,12 @@
+from datetime import datetime, timedelta
+
 import numpy as np
 import pandas as pd
 from typer.testing import CliRunner
 
 from factor_mining.cli import app
 from factor_mining.config import DataConfig, Settings
-from factor_mining.models import BacktestResult, CandidateStrategySpec, MetricsBlock, ResearchSurvivorRecord
+from factor_mining.models import UTC, BacktestResult, CandidateStrategySpec, MetricsBlock, ResearchSurvivorRecord
 from factor_mining.pipeline import MarketDataContext, PipelineResult, verify_research_survivors
 from factor_mining.storage import MetadataStore
 from factor_mining.ui import _run_args
@@ -74,6 +76,9 @@ def test_verify_research_survivors_promotes_without_recording_new_trials(tmp_pat
             experiment_id="exp-old",
             status="active",
             candidate_payload=candidate.model_dump(mode="json"),
+            # Aged past required_oos_days: promotion needs a matured
+            # paper-trade clock in addition to FDR + trade criteria (A4).
+            paper_trade_start_date=datetime.now(UTC) - timedelta(days=120),
         )
     ])
 
@@ -136,3 +141,99 @@ def test_verify_research_survivors_promotes_without_recording_new_trials(tmp_pat
     assert records[0].status == "promoted"
     assert records[0].status_reason in {"production_gate_passed", "promotion_criteria_met"}
     assert store.trial_counts(candidate.hypothesis_family) == (0, 0, 0)
+
+
+def test_verify_research_survivors_applies_cross_round_fdr_counts(tmp_path, monkeypatch) -> None:
+    """Q15 wiring: survivor rechecks must raise BH multiplicity to the family's
+    cumulative cross-round trial count from the ledger. Without it, a survivor
+    from a heavily searched family is re-tested at batch-size multiplicity and
+    its promotion FDR p-value understates the search that produced it."""
+    import factor_mining.validation.gatecheck as gatecheck_module
+    from factor_mining.models import TrialRecord
+
+    settings = Settings(data=DataConfig(sqlite_path=tmp_path / "meta.sqlite3"))
+    store = MetadataStore(settings.data.sqlite_path)
+    candidate = CandidateStrategySpec(
+        candidate_id="cand-survivor",
+        hypothesis_id="hyp-1",
+        method_id="factor_scoring",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+        market="um_futures",
+    )
+    store.upsert_research_survivors([
+        ResearchSurvivorRecord(
+            candidate_id=candidate.candidate_id,
+            experiment_id="exp-old",
+            status="active",
+            candidate_payload=candidate.model_dump(mode="json"),
+        )
+    ])
+    for idx in range(50):
+        store.record_trial(TrialRecord(
+            trial_id=f"trial-{idx}",
+            candidate_id=f"cand-{idx}",
+            hypothesis_family="momentum",
+            method_id="factor_scoring",
+        ))
+
+    frame = pd.DataFrame({
+        "open_time": [1_700_000_000_000 + idx * 300_000 for idx in range(60)],
+        "open": np.linspace(100.0, 110.0, 60),
+        "high": np.linspace(101.0, 111.0, 60),
+        "low": np.linspace(99.0, 109.0, 60),
+        "close": np.linspace(100.5, 110.5, 60),
+        "volume": [100.0] * 60,
+        "quote_volume": [1_000_000.0] * 60,
+    })
+    context = MarketDataContext(
+        symbol="BTCUSDT",
+        market="um_futures",
+        frame=frame,
+        features_df=pd.DataFrame(index=frame.index),
+        feature_meta={},
+        forward_regimes=pd.Series(["unknown"] * len(frame), index=frame.index),
+        funding_df=None,
+        funding_rate=pd.Series([0.0] * len(frame), index=frame.index),
+        data_quality_notes=[],
+    )
+
+    def fake_backtests(tasks, final_frame, settings_arg, max_workers, funding_df=None):
+        return [BacktestResult(
+            experiment_id="exp-new",
+            candidate_id=candidate.candidate_id,
+            hypothesis_family=candidate.hypothesis_family,
+            method_id=candidate.method_id,
+            symbol=candidate.symbol,
+            market=candidate.market,
+            interval=candidate.interval,
+            metrics_primary=MetricsBlock(sharpe=2.0, trade_count=120),
+            metrics_gross=MetricsBlock(sharpe=2.1),
+            ic_tstat_nw=4.0,
+            rankic_tstat_nw=4.0,
+            oos_trade_count=120,
+        )]
+
+    monkeypatch.setattr("factor_mining.pipeline._load_data_contexts", lambda *args, **kwargs: {("BTCUSDT", "um_futures"): context})
+    monkeypatch.setattr(
+        "factor_mining.pipeline._build_tasks",
+        lambda candidates, *args, **kwargs: [(np.ones(len(frame)), candidates[0].model_dump(mode="json"), 0, {}, [])],
+    )
+    monkeypatch.setattr("factor_mining.pipeline._run_backtests_parallel", fake_backtests)
+    monkeypatch.setattr("factor_mining.pipeline._apply_batch_pbo", lambda *args, **kwargs: None)
+    monkeypatch.setattr("factor_mining.pipeline.build_factor_evidence_reports", lambda *args, **kwargs: [])
+
+    captured: dict = {}
+    real_apply_fdr = gatecheck_module.apply_fdr
+
+    def spy_apply_fdr(results, settings_arg, **kwargs):
+        captured.update(kwargs)
+        return real_apply_fdr(results, settings_arg, **kwargs)
+
+    monkeypatch.setattr(gatecheck_module, "apply_fdr", spy_apply_fdr)
+
+    verify_research_survivors(settings, store=store, max_workers=1)
+
+    family_counts = captured.get("family_test_counts")
+    assert family_counts is not None, "survivor recheck ran FDR without cross-round counts"
+    assert family_counts.get("momentum", 0) >= 50

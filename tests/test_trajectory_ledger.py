@@ -654,3 +654,75 @@ def test_trajectory_json_serialization_is_deterministic() -> None:
     p1 = json.dumps(r1.model_dump(mode="json"), sort_keys=True, default=str)
     p2 = json.dumps(r2.model_dump(mode="json"), sort_keys=True, default=str)
     assert p1 == p2
+
+
+def test_success_contract_uplift_is_a_verifiable_ab_comparison() -> None:
+    """The operator report must be an explicit A/B contract: promoted-rate
+    uplift vs the named seed baseline with a bootstrap CI whose verdict is
+    checkable — not an arbitrary-weight composite score."""
+    store = _store()
+    for i in range(40):
+        store.save_trajectory(
+            TrajectoryRecord(
+                trajectory_id=f"base{i}",
+                candidate_id=f"cb{i}",
+                operator="SEED",
+                classification="research_survivor" if i < 4 else "rejected",
+                backtest_result={"metrics_primary": {"sharpe": 0.2}},
+            )
+        )
+    for i in range(40):
+        store.save_trajectory(
+            TrajectoryRecord(
+                trajectory_id=f"arm{i}",
+                candidate_id=f"ca{i}",
+                operator="MUTATION_AT_DSL",
+                classification="production_passed" if i < 24 else "rejected",
+                parent_ids=["cb0"],
+                backtest_result={"metrics_primary": {"sharpe": 1.0}},
+            )
+        )
+
+    report = build_success_contract_report(store=store, settings=_settings())
+
+    assert "operator_effectiveness" not in report
+    assert report["baseline_operators"] == ["SEED", "SEED_INFORMED"]
+    entry = report["operator_uplift"]["MUTATION_AT_DSL"]
+    assert entry["n"] == 40 and entry["baseline_n"] == 40
+    assert entry["promoted_rate"] == 0.6
+    assert entry["baseline_promoted_rate"] == 0.1
+    assert abs(entry["uplift"] - 0.5) < 1e-9
+    assert entry["ci_low"] > 0.0
+    assert entry["verdict"] == "positive"
+
+
+def test_success_contract_uplift_refuses_underpowered_comparisons() -> None:
+    """A handful of trajectories must yield 'insufficient_data', not a point
+    estimate — the contract's promise is that reported uplift is testable."""
+    store = _store()
+    for i in range(25):
+        store.save_trajectory(
+            TrajectoryRecord(
+                trajectory_id=f"base{i}",
+                candidate_id=f"cb{i}",
+                operator="SEED",
+                classification="rejected",
+                backtest_result={"metrics_primary": {"sharpe": 0.2}},
+            )
+        )
+    for i in range(3):
+        store.save_trajectory(
+            TrajectoryRecord(
+                trajectory_id=f"arm{i}",
+                candidate_id=f"ca{i}",
+                operator="CROSSOVER",
+                classification="production_passed",
+                backtest_result={"metrics_primary": {"sharpe": 2.0}},
+            )
+        )
+
+    report = build_success_contract_report(store=store, settings=_settings())
+
+    entry = report["operator_uplift"]["CROSSOVER"]
+    assert entry["verdict"] == "insufficient_data"
+    assert "ci_low" not in entry and "uplift" not in entry

@@ -1,8 +1,10 @@
-"""Success contract report — compare current optimizer performance against
-evolutionary wrapper baseline using existing trajectory artifacts.
+"""Success contract report — a verifiable A/B comparison of evolution
+operators against the seed baseline, from stored trajectory artifacts.
 
-This report is pure read-only aggregation.  It reads stored trajectories
-and summarises pipeline efficiency without changing any production behaviour.
+Read-only. Per-operator promotion-rate uplift is measured against the
+explicit baseline operator set (default: the seed operators) with a seeded
+bootstrap confidence interval; operators without enough samples report
+``insufficient_data`` instead of a point estimate.
 """
 
 from __future__ import annotations
@@ -10,8 +12,14 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
+import numpy as np
+
 from factor_mining.config import Settings
 from factor_mining.storage import MetadataStore
+
+BASELINE_OPERATORS = frozenset({"SEED", "SEED_INFORMED"})
+_UPLIFT_MIN_SAMPLES = 20
+_UPLIFT_RESAMPLES = 2000
 
 
 def build_success_contract_report(
@@ -19,8 +27,12 @@ def build_success_contract_report(
     store: MetadataStore,
     settings: Settings,
     experiment_ids: list[str] | None = None,
+    baseline_operators: frozenset[str] | set[str] | None = None,
+    min_samples: int = _UPLIFT_MIN_SAMPLES,
+    n_resamples: int = _UPLIFT_RESAMPLES,
+    seed: int = 42,
 ) -> dict[str, Any]:
-    """Aggregate trajectory statistics for the current pipeline run.
+    """Aggregate trajectory statistics plus the operator A/B contract.
 
     Returns a dictionary suitable for serialisation as a dashboard artifact
     or CLI report.  When *experiment_ids* is passed the report is scoped to
@@ -33,9 +45,14 @@ def build_success_contract_report(
     - ``mean_sharpe_by_operator``
     - ``gatecheck_pass_rate``
     - ``research_survivor_rate``
-    - ``operator_effectiveness`` — composite (2 * production_rate + survivor_rate) / 3
+    - ``baseline_operators`` / ``operator_uplift`` — the A/B contract: each
+      non-baseline operator's promoted-rate uplift vs the pooled baseline,
+      with a seeded bootstrap 95% CI and a verdict
+      (``positive``/``negative``/``inconclusive``/``insufficient_data``).
+      Records are resampled iid; round-level clustering is not modelled.
     - ``lineage_depth_stats`` — min / max / mean of parent chain depth
     """
+    baseline_ops = frozenset(baseline_operators) if baseline_operators is not None else BASELINE_OPERATORS
     records = store.list_trajectories(limit=2000)
 
     if experiment_ids is not None:
@@ -74,7 +91,6 @@ def build_success_contract_report(
     research_survivor_rate_by_operator: dict[str, float] = {}
     promoted_rate_by_operator: dict[str, float] = {}
     mean_sharpe_by_operator: dict[str, float | None] = {}
-    effectiveness_by_operator: dict[str, float] = {}
     for op in sorted(operator_counter):
         n = operator_counter[op]
         op_production_count = production_counter[op]
@@ -90,10 +106,6 @@ def build_success_contract_report(
         mean_sharpe_by_operator[op] = (
             sharpe_sums.get(op, 0.0) / sharpe_counts[op] if sharpe_counts.get(op, 0) > 0 else None
         )
-        # TODO: Replace this read-only aggregate with an explicit A/B success contract.
-        effectiveness_by_operator[op] = (
-            2.0 * production_rate_by_operator[op] + research_survivor_rate_by_operator[op]
-        ) / 3.0
 
     depth_sorted = sorted(depth_values)
     lineage_depth_stats: dict[str, float] = {
@@ -109,12 +121,76 @@ def build_success_contract_report(
         "research_survivor_rate_by_operator": research_survivor_rate_by_operator,
         "promoted_rate_by_operator": promoted_rate_by_operator,
         "mean_sharpe_by_operator": mean_sharpe_by_operator,
-        "operator_effectiveness": effectiveness_by_operator,
+        "baseline_operators": sorted(baseline_ops),
+        "operator_uplift": _operator_uplift(
+            records,
+            baseline_ops=baseline_ops,
+            min_samples=min_samples,
+            n_resamples=n_resamples,
+            seed=seed,
+        ),
         "gatecheck_pass_rate": production_count / total if total > 0 else 0.0,
         "research_survivor_rate": survivor_count / total if total > 0 else 0.0,
         "promoted_rate": promoted_count / total if total > 0 else 0.0,
         "lineage_depth_stats": lineage_depth_stats,
     }
+
+
+def _operator_uplift(
+    records: list[Any],
+    *,
+    baseline_ops: frozenset[str],
+    min_samples: int,
+    n_resamples: int,
+    seed: int,
+) -> dict[str, dict[str, Any]]:
+    """Promoted-rate uplift of each non-baseline operator vs the pooled baseline.
+
+    ``verdict`` is ``positive``/``negative`` when the bootstrap 95% CI of the
+    rate difference excludes zero, ``inconclusive`` when it straddles zero,
+    and ``insufficient_data`` (no CI) when either arm has fewer than
+    ``min_samples`` records — a point estimate on a handful of trajectories
+    is noise dressed as a comparison."""
+    promoted_flags: dict[str, list[int]] = {}
+    for record in records:
+        flag = 1 if (_is_production_passed(record) or _is_research_survivor(record)) else 0
+        promoted_flags.setdefault(record.operator, []).append(flag)
+
+    baseline = np.array(
+        [flag for op in sorted(baseline_ops) for flag in promoted_flags.get(op, [])],
+        dtype=float,
+    )
+    uplift: dict[str, dict[str, Any]] = {}
+    rng = np.random.default_rng(seed)
+    for op in sorted(promoted_flags):
+        if op in baseline_ops:
+            continue
+        arm = np.array(promoted_flags[op], dtype=float)
+        entry: dict[str, Any] = {
+            "n": int(arm.size),
+            "baseline_n": int(baseline.size),
+            "promoted_rate": float(arm.mean()) if arm.size else 0.0,
+            "baseline_promoted_rate": float(baseline.mean()) if baseline.size else 0.0,
+        }
+        if arm.size < min_samples or baseline.size < min_samples:
+            entry["verdict"] = "insufficient_data"
+            uplift[op] = entry
+            continue
+        entry["uplift"] = entry["promoted_rate"] - entry["baseline_promoted_rate"]
+        arm_idx = rng.integers(0, arm.size, size=(n_resamples, arm.size))
+        base_idx = rng.integers(0, baseline.size, size=(n_resamples, baseline.size))
+        diffs = arm[arm_idx].mean(axis=1) - baseline[base_idx].mean(axis=1)
+        ci_low, ci_high = np.percentile(diffs, [2.5, 97.5])
+        entry["ci_low"] = float(ci_low)
+        entry["ci_high"] = float(ci_high)
+        if ci_low > 0.0:
+            entry["verdict"] = "positive"
+        elif ci_high < 0.0:
+            entry["verdict"] = "negative"
+        else:
+            entry["verdict"] = "inconclusive"
+        uplift[op] = entry
+    return uplift
 
 
 def _scoped(record: Any, experiment_ids: set[str]) -> bool:
@@ -164,7 +240,8 @@ def _empty_report() -> dict[str, Any]:
         "research_survivor_rate_by_operator": {},
         "promoted_rate_by_operator": {},
         "mean_sharpe_by_operator": {},
-        "operator_effectiveness": {},
+        "baseline_operators": sorted(BASELINE_OPERATORS),
+        "operator_uplift": {},
         "gatecheck_pass_rate": 0.0,
         "research_survivor_rate": 0.0,
         "promoted_rate": 0.0,
