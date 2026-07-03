@@ -299,3 +299,57 @@ def test_supplemental_features_include_spot_perp_basis_from_existing_klines(tmp_
     assert "spot_perp_basis_chg_12" in supplemental
     assert meta["spot_perp_basis"]["family"] == "funding_basis"
     assert meta["spot_perp_basis"]["direction"] == "negative_when_high"
+
+
+def test_data_extent_content_hash_detects_resynced_warehouse(tmp_path) -> None:
+    """WHY (I3): archives pinned reproduction to row count + open_time extent
+    only, so a silently re-synced parquet with identical shape but different
+    prices passed the manifest. The content hash must change when bytes
+    change even though rows and extent are identical."""
+    import pandas as pd
+
+    from factor_mining.config import Settings
+    from factor_mining.data.loader import data_extent
+
+    settings = Settings()
+    settings.data.parquet_dir = tmp_path
+    settings.data.symbols = ["TESTUSDT"]
+    path = tmp_path / f"TESTUSDT_{settings.data.default_interval}.parquet"
+
+    frame = pd.DataFrame({"open_time": [0, 300, 600], "close": [1.0, 2.0, 3.0]})
+    frame.to_parquet(path)
+    first = data_extent(settings, symbol="TESTUSDT", market="um_futures")
+
+    frame_resynced = frame.assign(close=[1.0, 2.5, 3.0])
+    frame_resynced.to_parquet(path)
+    second = data_extent(settings, symbol="TESTUSDT", market="um_futures")
+
+    assert first["rows"] == second["rows"]
+    assert first["data_start_ms"] == second["data_start_ms"]
+    assert first["data_end_ms"] == second["data_end_ms"]
+    assert first["content_sha256"] != second["content_sha256"]
+
+
+def test_checkpoint_fingerprint_detects_content_change_with_identical_shape() -> None:
+    """WHY (I3): resuming a run against a re-synced warehouse with the same
+    row count and extent must invalidate stage checkpoints (fail-loud on
+    resume) rather than silently mixing datasets."""
+    import pandas as pd
+
+    from factor_mining.config import Settings
+    from factor_mining.pipeline import _checkpoint_fingerprint
+
+    frame = pd.DataFrame({
+        "open_time": [0, 300, 600],
+        "open": [1.0, 2.0, 3.0],
+        "close": [1.0, 2.0, 3.0],
+    })
+    resynced = frame.assign(close=[1.0, 2.1, 3.0])
+    kwargs = {"run_args": {}, "symbol": "BTCUSDT", "market": "um_futures"}
+    original = _checkpoint_fingerprint(Settings(), frame=frame, **kwargs)
+    changed = _checkpoint_fingerprint(Settings(), frame=resynced, **kwargs)
+
+    assert original["row_count"] == changed["row_count"]
+    assert original["open_time_min"] == changed["open_time_min"]
+    assert original["open_time_max"] == changed["open_time_max"]
+    assert original != changed

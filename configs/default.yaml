@@ -48,7 +48,6 @@ permutation_test:
   n_permutations: 100
   permute_target: "factor_values"
   test_statistic: "mean_ic"
-  rejection_threshold: 0.05
 
 position_sizing:
   primary: "vol_target"

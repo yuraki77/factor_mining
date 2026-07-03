@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -306,13 +307,34 @@ def load_supplemental_features(
     return pd.DataFrame(features, index=frame.index), meta
 
 
-def data_extent(settings: Settings, *, symbol: str, market: str | None = None) -> dict[str, Any]:
-    """Data manifest for an archive bundle: the bar extent of *symbol*'s parquet at
-    archive time, so a later reproduce can pin to the data that was available.
+_CONTENT_HASH_MEMO: dict[tuple[str, int, int], str] = {}
 
-    Reads only the ``open_time`` column. Returns ``{}`` (never raises) when no data
-    is found, so a missing/corrupt parquet degrades the manifest without aborting
-    the archive write.
+
+def file_content_sha256(path: Path) -> str:
+    """Streamed sha256 of a data file, memoized on (path, size, mtime_ns) so
+    repeated manifest/archive calls do not re-read unchanged parquet."""
+    stat = path.stat()
+    key = (str(path), stat.st_size, stat.st_mtime_ns)
+    cached = _CONTENT_HASH_MEMO.get(key)
+    if cached is not None:
+        return cached
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    value = digest.hexdigest()
+    _CONTENT_HASH_MEMO[key] = value
+    return value
+
+
+def data_extent(settings: Settings, *, symbol: str, market: str | None = None) -> dict[str, Any]:
+    """Data manifest for an archive bundle: the bar extent and content hash of
+    *symbol*'s parquet at archive time, so a later reproduce can pin to the data
+    that was available and detect a silently re-synced warehouse (I3) — row
+    counts and extent alone cannot tell rewritten history apart.
+
+    Returns ``{}`` (never raises) when no data is found, so a missing/corrupt
+    parquet degrades the manifest without aborting the archive write.
     """
     try:
         paths = resolve_frame_paths(settings, symbol=symbol, market=market or None)
@@ -329,6 +351,7 @@ def data_extent(settings: Settings, *, symbol: str, market: str | None = None) -
                 start_ms = low if start_ms is None else min(start_ms, low)
         if not rows:
             return {}
+        file_hashes = [file_content_sha256(path) for path in paths]
         return {
             "symbol": symbol,
             "market": market or "",
@@ -336,6 +359,8 @@ def data_extent(settings: Settings, *, symbol: str, market: str | None = None) -
             "data_start_ms": start_ms or 0,
             "data_end_ms": end_ms,
             "rows": rows,
+            "content_sha256": hashlib.sha256("".join(file_hashes).encode()).hexdigest(),
+            "file_sha256": file_hashes,
         }
     except Exception:  # noqa: BLE001 - a missing/corrupt parquet must not abort archiving
         return {}

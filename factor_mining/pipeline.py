@@ -58,7 +58,13 @@ from factor_mining.models import (
     TrialRecord,
 )
 from factor_mining.registry import METHOD_REGISTRY
-from factor_mining.stats.metrics import annualization_factor, combined_ic_tstat_pvalue, deflated_sharpe_ratio, sharpe_ratio
+from factor_mining.stats.metrics import (
+    annualization_factor,
+    combined_ic_tstat_pvalue,
+    deflated_sharpe_probability,
+    deflated_sharpe_ratio,
+    sharpe_ratio,
+)
 from factor_mining.storage import MetadataStore
 from factor_mining.trial_ledger import TrialLedger
 
@@ -466,7 +472,22 @@ def _checkpoint_fingerprint(
         "row_count": int(len(frame)),
         "open_time_min": None if frame.empty else int(frame["open_time"].min()),
         "open_time_max": None if frame.empty else int(frame["open_time"].max()),
+        "content_sha256": None if frame.empty else _frame_content_sha256(frame),
     }
+
+
+def _frame_content_sha256(frame: pd.DataFrame) -> str:
+    """Digest of the data a resumed stage would actually consume (I3).
+
+    Row count and open_time extent alone let a silently re-synced warehouse
+    with identical shape resume stale checkpoints; a mismatch now fails the
+    resume loudly (see _load_stage_checkpoint) instead of mixing datasets."""
+    digest = hashlib.sha256()
+    for column in ("open_time", "open", "high", "low", "close", "volume"):
+        if column in frame.columns:
+            digest.update(column.encode())
+            digest.update(np.ascontiguousarray(frame[column].to_numpy(dtype=float)).tobytes())
+    return digest.hexdigest()
 
 
 def _save_run_checkpoint_payload(
@@ -865,9 +886,11 @@ def _run_pipeline_impl(
         result.hypotheses = list(seed_hypotheses)
         _log(f"Using {len(result.hypotheses)} seeded hypotheses")
     elif use_llm:
+        llm_capture: dict[str, Any] = {}
         try:
             result.hypotheses = generate_hypotheses_with_deepseek(
                 settings, count=hypothesis_count, research_brief=research_brief,
+                capture=llm_capture,
             )
             _log(f"DeepSeek generated {len(result.hypotheses)} hypotheses in {time.perf_counter() - t0:.0f}s")
         except Exception as exc:
@@ -875,6 +898,16 @@ def _run_pipeline_impl(
             _log("Falling back to default + discovered hypotheses")
             result.hypotheses = default_hypotheses()
             result.errors.append(f"step1_deepseek: {exc}")
+        finally:
+            # I6: persist the raw exchange whenever the API answered — most
+            # valuable exactly when parsing failed after a successful call.
+            # Checkpoints are prunable; this is the durable audit record.
+            if store and llm_capture:
+                store.save_artifact(
+                    f"llm_hypotheses_raw_{run_id}" if run_id else "llm_hypotheses_raw_latest",
+                    "llm_raw",
+                    {**llm_capture, "requested_count": hypothesis_count},
+                )
     else:
         result.hypotheses = default_hypotheses()
 
@@ -3637,11 +3670,22 @@ def _apply_merge_pool_trial_penalty(
             periods_per_year=annualization_factor(result.interval),
             observations=observations,
         )
+        # The Bailey DSR is re-derivable from the moments the engine stored on
+        # the result, so the raised trial count propagates to it as well.
+        result.deflated_sharpe_prob = deflated_sharpe_probability(
+            observed_sr=result.metrics_primary.sharpe,
+            trials_count=result.effective_trials_at_eval,
+            periods_per_year=annualization_factor(result.interval),
+            observations=max(2, int(observations)),
+            skew=result.return_skew,
+            kurtosis=result.return_kurtosis,
+        )
         # Write merge-pool trial count back to trial_diagnostics for artifact transparency.
         result.trial_diagnostics["merge_pool_effective_trials"] = effective_trials_count
         result.trial_diagnostics["effective_trials_at_eval"] = result.effective_trials_at_eval
         result.trial_diagnostics["global_trials_at_eval"] = result.global_trials_at_eval
         result.trial_diagnostics["dsr"] = float(result.deflated_sharpe)
+        result.trial_diagnostics["dsr_prob"] = float(result.deflated_sharpe_prob)
 
 
 def _json_dumps_sorted(payload: Any) -> str:

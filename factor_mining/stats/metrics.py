@@ -137,6 +137,92 @@ def probabilistic_sharpe_ratio(
     return normal_cdf(z_score)
 
 
+_EULER_GAMMA = 0.5772156649015329
+
+
+def inverse_normal_cdf(p: float) -> float:
+    """Φ⁻¹ by bisection on the existing ``normal_cdf`` — no scipy dependency
+    (scipy is only transitively present via hmmlearn). Callers use moderate
+    quantiles like ``1 - 1/N``; 90 bisection steps give ~1e-13 accuracy."""
+    if not 0.0 < p < 1.0:
+        raise ValueError(f"p must be in (0, 1), got {p}")
+    lo, hi = -13.0, 13.0
+    for _ in range(90):
+        mid = (lo + hi) / 2.0
+        if normal_cdf(mid) < p:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
+def expected_max_sharpe(trials_count: int, *, sr_std: float) -> float:
+    """E[max SR] across ``trials_count`` independent null trials whose SR
+    estimator has standard deviation ``sr_std`` (per-period units) — the
+    extreme-value approximation from Bailey & López de Prado (2014).
+    Zero for a single trial: nothing was selected from."""
+    n = max(int(trials_count), 1)
+    if n <= 1 or sr_std <= 0.0:
+        return 0.0
+    z1 = inverse_normal_cdf(1.0 - 1.0 / n)
+    z2 = inverse_normal_cdf(1.0 - 1.0 / (n * math.e))
+    return sr_std * ((1.0 - _EULER_GAMMA) * z1 + _EULER_GAMMA * z2)
+
+
+def return_moments(returns: Sequence[float]) -> tuple[int, float, float]:
+    """(n, skewness, raw kurtosis) of a return series, matching the moment
+    definitions inside :func:`probabilistic_sharpe_ratio`. Degenerate series
+    report normal moments (0 skew, kurtosis 3) so downstream adjustments
+    become no-ops instead of garbage."""
+    arr = np.asarray(returns, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    n = int(arr.size)
+    if n < 3:
+        return n, 0.0, 3.0
+    std = arr.std(ddof=1)
+    if std == 0:
+        return n, 0.0, 3.0
+    centered = arr - arr.mean()
+    skew = float(np.mean((centered / std) ** 3))
+    kurtosis = float(np.mean((centered / std) ** 4))
+    return n, skew, kurtosis
+
+
+def deflated_sharpe_probability(
+    *,
+    observed_sr: float,
+    trials_count: int,
+    periods_per_year: int,
+    observations: int,
+    skew: float,
+    kurtosis: float,
+    sr_variance: float | None = None,
+) -> float:
+    """True deflated Sharpe ratio (Bailey & López de Prado, 2014): the
+    probability that the observed SR exceeds the expected maximum SR of
+    ``trials_count`` null trials, adjusted for return skewness/kurtosis.
+
+    This is the PSR evaluated at the ``expected_max_sharpe`` threshold. It
+    complements — and is deliberately separate from — the haircut-style
+    :func:`deflated_sharpe_ratio` that G1 gates on: this returns a
+    probability in [0, 1], not an SR difference.
+
+    ``observed_sr`` is annualized (system convention) and converted to
+    per-period units here. ``sr_variance`` is the across-trials variance of
+    the SR estimates (per-period²); when ``None`` it defaults to the null
+    sampling variance ``1/(n-1)`` — the honest stand-in absent a recorded
+    population of trial SRs.
+    """
+    n = max(int(observations), 2)
+    scale = math.sqrt(max(int(periods_per_year), 1))
+    sr = observed_sr / scale
+    variance = (1.0 / (n - 1)) if sr_variance is None else max(float(sr_variance), 0.0)
+    sr_star = expected_max_sharpe(trials_count, sr_std=math.sqrt(variance))
+    denominator = math.sqrt(max(1e-12, 1 - skew * sr + ((kurtosis - 1) / 4) * sr**2))
+    z_score = (sr - sr_star) * math.sqrt(n - 1) / denominator
+    return normal_cdf(z_score)
+
+
 def deflated_sharpe_ratio(
     returns: Sequence[float] | None,
     *,
@@ -229,6 +315,16 @@ def permutation_test_mean_ic(
     n_permutations: int,
     seed: int = 42,
 ) -> float:
+    """Empirical p-value for ``|corr(factor, returns)|`` under a circular-shift null.
+
+    The null rotates the factor by a random offset (Q8): unlike an i.i.d.
+    shuffle it preserves the factor's autocorrelation while breaking its
+    alignment with returns, so persistent signals tested against
+    autocorrelated returns are not anti-conservatively rejected. The return
+    value is always the finite-sample ``(k+1)/(n+1)`` estimator — the previous
+    normal approximation of the null had thin tails exactly where small
+    p-values were being claimed.
+    """
     factor = np.asarray(factor_values, dtype=float)
     returns = np.asarray(forward_returns, dtype=float)
     mask = np.isfinite(factor) & np.isfinite(returns)
@@ -238,20 +334,13 @@ def permutation_test_mean_ic(
         return 1.0
     observed = abs(float(np.corrcoef(factor, returns)[0, 1]))
     rng = np.random.default_rng(seed)
+    shifts = rng.integers(1, factor.size, size=max(0, int(n_permutations)))
     exceed = 0
-    null_stats = np.empty(max(0, int(n_permutations)), dtype=float)
-    for _ in range(n_permutations):
-        permuted = rng.permutation(factor)
-        stat = abs(float(np.corrcoef(permuted, returns)[0, 1]))
-        null_stats[_] = stat
+    for shift in shifts:
+        stat = abs(float(np.corrcoef(np.roll(factor, int(shift)), returns)[0, 1]))
         if stat >= observed:
             exceed += 1
-    empirical_p = float((exceed + 1) / (n_permutations + 1))
-    null_std = float(null_stats.std(ddof=1)) if null_stats.size > 1 else 0.0
-    if null_std <= 0.0:
-        return empirical_p
-    z_score = (observed - float(null_stats.mean())) / null_std
-    return float(max(0.0, min(1.0, 1.0 - normal_cdf(z_score))))
+    return float((exceed + 1) / (len(shifts) + 1))
 
 
 def rank_ic(factor_values: Sequence[float], forward_returns: Sequence[float]) -> float:

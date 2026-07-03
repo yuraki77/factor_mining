@@ -239,6 +239,7 @@ def _evidence_flags(
         "gross_sharpe": gross_sharpe,
         "net_sharpe": result.metrics_primary.sharpe,
         "deflated_sharpe": result.deflated_sharpe,
+        "deflated_sharpe_prob": result.deflated_sharpe_prob,
         "probabilistic_sharpe": result.probabilistic_sharpe,
         "permutation_pvalue": result.permutation_test_pvalue,
         "pbo": result.pbo,
