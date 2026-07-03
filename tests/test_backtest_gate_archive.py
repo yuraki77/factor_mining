@@ -723,3 +723,80 @@ def test_reopen_bar_blocks_new_entries_but_allows_exits(tmp_path) -> None:
     exit_path = evaluate_strategy_path(frame, exit_signal, candidate, settings)
     assert abs(exit_path.position.iloc[59]) > 1e-12
     assert abs(exit_path.position.iloc[60]) < 1e-12
+
+
+def test_rerun_verify_stores_verdict_and_detects_metric_drift(tmp_path, monkeypatch) -> None:
+    """H1 (P1-8): 'verified' must mean the archived claim was actually
+    re-produced, not merely that the JSON bytes were un-corrupted. The rerun
+    must use the archived data pin and trial counts, compare the
+    reproducible metrics within tolerance, and leave a durable verdict in
+    the archive dir — mismatches included, honestly."""
+    import json
+
+    from factor_mining.archive import rerun_verify_archive
+    from factor_mining.models import CandidateStrategySpec
+
+    result = BacktestResult(
+        experiment_id="exp-rerun",
+        candidate_id="c1",
+        hypothesis_family="momentum",
+        method_id="rule_mining",
+        symbol="BTCUSDT",
+        market="um_futures",
+        interval="5m",
+        metrics_primary=MetricsBlock(sharpe=2.0, total_return=0.5, max_drawdown=-0.1, trade_count=200),
+        effective_trials_at_eval=64,
+        global_trials_at_eval=128,
+    )
+    gate = GateCheckResult(experiment_id=result.experiment_id, passed=True, items=[], allocation_multiplier=1.0)
+    score = hardscore(result, gate, fdr_adjusted_pvalue=0.01, settings=Settings())
+    candidate = CandidateStrategySpec(
+        candidate_id="c1",
+        hypothesis_id="h1",
+        method_id="rule_mining",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+        market="um_futures",
+        interval="5m",
+    )
+    root = tmp_path / "archives"
+    archive_experiment(
+        result=result, gatecheck=gate, hardscore=score, settings=Settings(),
+        candidate=candidate, data_manifest={"data_end_ms": 1_777_593_300_000}, root=root,
+    )
+
+    captured = {}
+
+    def fake_reproduce(spec, settings, *, data_end_ms=None, trial_counts=None):
+        captured["data_end_ms"] = data_end_ms
+        captured["trial_counts"] = trial_counts
+        return result.model_copy(deep=True)
+
+    monkeypatch.setattr("factor_mining.pipeline.reproduce_candidate", fake_reproduce)
+
+    verdict = rerun_verify_archive("exp-rerun", Settings(), root=root)
+
+    assert verdict["status"] == "verified"
+    assert captured["data_end_ms"] == 1_777_593_300_000  # archived pin honored
+    assert captured["trial_counts"] == {
+        "effective_trials_count": 64,
+        "global_cumulative_trials_count": 128,
+    }
+    stored = json.loads((root / "exp-rerun" / "verify_verdict.json").read_text(encoding="utf-8"))
+    assert stored["status"] == "verified"
+    assert stored["fields"]["sharpe"]["within_tolerance"]
+
+    drifted = result.model_copy(deep=True)
+    drifted.metrics_primary.sharpe = 1.5
+    monkeypatch.setattr(
+        "factor_mining.pipeline.reproduce_candidate",
+        lambda spec, settings, *, data_end_ms=None, trial_counts=None: drifted,
+    )
+
+    verdict = rerun_verify_archive("exp-rerun", Settings(), root=root)
+
+    assert verdict["status"] == "mismatch"
+    assert not verdict["fields"]["sharpe"]["within_tolerance"]
+    assert verdict["fields"]["total_return"]["within_tolerance"]
+    stored = json.loads((root / "exp-rerun" / "verify_verdict.json").read_text(encoding="utf-8"))
+    assert stored["status"] == "mismatch"  # the durable verdict reflects drift honestly
