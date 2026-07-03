@@ -466,7 +466,22 @@ def _checkpoint_fingerprint(
         "row_count": int(len(frame)),
         "open_time_min": None if frame.empty else int(frame["open_time"].min()),
         "open_time_max": None if frame.empty else int(frame["open_time"].max()),
+        "content_sha256": None if frame.empty else _frame_content_sha256(frame),
     }
+
+
+def _frame_content_sha256(frame: pd.DataFrame) -> str:
+    """Digest of the data a resumed stage would actually consume (I3).
+
+    Row count and open_time extent alone let a silently re-synced warehouse
+    with identical shape resume stale checkpoints; a mismatch now fails the
+    resume loudly (see _load_stage_checkpoint) instead of mixing datasets."""
+    digest = hashlib.sha256()
+    for column in ("open_time", "open", "high", "low", "close", "volume"):
+        if column in frame.columns:
+            digest.update(column.encode())
+            digest.update(np.ascontiguousarray(frame[column].to_numpy(dtype=float)).tobytes())
+    return digest.hexdigest()
 
 
 def _save_run_checkpoint_payload(
