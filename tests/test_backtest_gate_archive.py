@@ -588,3 +588,66 @@ def test_g3_fdr_failure_warns_but_does_not_block_by_decision() -> None:
     g3 = next(item for item in gate.items if item.rule_id == "G3")
     assert g3.status == "warn"
     assert gate.raw_passed
+
+
+def test_sliced_full_frame_vol_state_removes_per_slice_warmup(tmp_path) -> None:
+    """F3 (P1-5): every evaluation slice used to re-warm its vol estimate from
+    nothing, zeroing leverage over the slice's warm-up bars even though the
+    trailing history existed on the full frame. With the full-frame state
+    sliced alongside the signal, the position must be active from the first
+    executable bar of the slice."""
+    from factor_mining.backtest.engine import realized_vol_series
+
+    settings = small_settings(tmp_path)
+    rng_prices = [100.0]
+    for idx in range(599):
+        rng_prices.append(rng_prices[-1] * (1.0 + (0.002 if idx % 3 else -0.001)))
+    full = make_frame(600)
+    full["open"] = rng_prices
+    full["close"] = [p * 1.0005 for p in rng_prices]
+
+    signals_full = pd.Series([1.0] * 600)
+    start = 400
+    sliced_frame = full.iloc[start:].reset_index(drop=True)
+    sliced_signal = signals_full.iloc[start:].reset_index(drop=True)
+    candidate = CandidateStrategySpec(
+        candidate_id="c-f3",
+        hypothesis_id="h1",
+        method_id="rule_mining",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+    )
+
+    rewarmed = evaluate_strategy_path(sliced_frame, sliced_signal, candidate, settings)
+    sliced_vol = realized_vol_series(full, settings, "5m").iloc[start:].reset_index(drop=True)
+    carried = evaluate_strategy_path(
+        sliced_frame, sliced_signal, candidate, settings, realized_vol=sliced_vol
+    )
+
+    first_active_rewarmed = int((rewarmed.position.abs() > 1e-12).idxmax())
+    first_active_carried = int((carried.position.abs() > 1e-12).idxmax())
+    assert first_active_rewarmed >= 10  # in-slice warm-up (min_periods)
+    assert first_active_carried <= 2  # trailing state carried into the slice
+
+
+def test_regime_labels_flow_from_caller_into_regime_metrics(tmp_path) -> None:
+    """F3 (P1-5): regime-conditional metrics must use labels computed on the
+    full frame and sliced by the caller — the in-slice labeler needs a 60-day
+    warm-up and quietly pushed every early bar into 'sideways'."""
+    settings = small_settings(tmp_path)
+    frame = make_frame(120)
+    signals = pd.Series([1.0] * 120)
+    candidate = CandidateStrategySpec(
+        candidate_id="c-f3r",
+        hypothesis_id="h1",
+        method_id="rule_mining",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+    )
+    labels = pd.Series(["bull" if i < 60 else "bear" for i in range(120)])
+
+    with_labels = run_backtest(frame, signals, candidate, settings, regime_labels=labels)
+    without_labels = run_backtest(frame, signals, candidate, settings)
+
+    assert set(with_labels.regime_conditional_metrics) == {"bull", "bear"}
+    assert set(without_labels.regime_conditional_metrics) == {"sideways"}

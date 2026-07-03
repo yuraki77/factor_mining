@@ -310,7 +310,7 @@ def test_mining_round_gates_on_validation_and_never_touches_holdout(monkeypatch)
             for idx, item in enumerate(candidates)
         ]
 
-    def fake_backtests(tasks, frame_arg, settings, max_workers, funding_df=None):
+    def fake_backtests(tasks, frame_arg, settings, max_workers, funding_df=None, **state):
         backtest_window_starts.append(int(frame_arg["open_time"].iloc[0]))
         results = []
         for _signal, candidate_dict, _idx, _trial_counts, _notes in tasks:
@@ -331,7 +331,7 @@ def test_mining_round_gates_on_validation_and_never_touches_holdout(monkeypatch)
             )
         return results
 
-    def fake_apply_batch_pbo(frame_arg, tasks, results, settings, funding_df):
+    def fake_apply_batch_pbo(frame_arg, tasks, results, settings, funding_df, **state):
         pbo_frame_lengths.append(len(frame_arg))
         for result in results:
             result.pbo = 0.2
@@ -2300,7 +2300,7 @@ def test_terminal_holdout_evaluates_survivors_once_with_cumulative_fdr(monkeypat
             for idx, item in enumerate(candidates)
         ]
 
-    def fake_backtests(tasks, frame_arg, settings_arg, max_workers, funding_df=None):
+    def fake_backtests(tasks, frame_arg, settings_arg, max_workers, funding_df=None, **state):
         backtest_window_starts.append(int(frame_arg["open_time"].iloc[0]))
         results = []
         for _signal, candidate_dict, _idx, trial_counts, _notes in tasks:
@@ -2409,7 +2409,7 @@ def test_batch_pbo_does_not_punish_never_selected_members(monkeypatch) -> None:
     monkeypatch.setattr(
         pipeline,
         "evaluate_strategy_path",
-        lambda frame_arg, signal, candidate, settings_arg, funding=None: _FakePath(returns[candidate.candidate_id]),
+        lambda frame_arg, signal, candidate, settings_arg, funding=None, realized_vol=None: _FakePath(returns[candidate.candidate_id]),
     )
 
     tasks = [

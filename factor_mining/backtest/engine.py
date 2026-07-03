@@ -379,6 +379,20 @@ def _resolve_exit_params(
     return sl, mh, tiers, tr, ta
 
 
+def realized_vol_series(frame: pd.DataFrame, settings: Settings, interval: str) -> pd.Series:
+    """Trailing annualized realized vol used for vol targeting.
+
+    Exposed so the pipeline can compute it once on the full frame and slice
+    the *state* along with the signal (F3/P1-5): re-warming inside every
+    evaluation slice zeroed leverage over each slice's warm-up bars even
+    though the trailing history existed on the full frame."""
+    periods = annualization_factor(interval)
+    bars_per_day = max(1.0, periods / 365.0)
+    vol_window = max(2, int(settings.position_sizing.vol_window_days * bars_per_day))
+    known_open_returns = frame["open"].pct_change().shift(1)
+    return known_open_returns.rolling(vol_window, min_periods=10).std() * np.sqrt(periods)
+
+
 def evaluate_strategy_path(
     frame: pd.DataFrame,
     signals: pd.Series,
@@ -386,6 +400,7 @@ def evaluate_strategy_path(
     settings: Settings,
     *,
     funding: pd.DataFrame | None = None,
+    realized_vol: pd.Series | None = None,
 ) -> StrategyPath:
     frame = frame.sort_values("open_time").reset_index(drop=True).copy()
     signals = pd.Series(signals.to_numpy(dtype=float), index=frame.index).clip(-1, 1).fillna(0.0)
@@ -395,11 +410,11 @@ def evaluate_strategy_path(
 
     open_returns = frame["open"].shift(-1) / frame["open"] - 1.0
     executable_signal = signals.shift(1).fillna(0.0)
-    periods = annualization_factor(candidate.interval)
-    bars_per_day = max(1.0, periods / 365.0)
-    vol_window = max(2, int(settings.position_sizing.vol_window_days * bars_per_day))
-    known_open_returns = frame["open"].pct_change().shift(1)
-    realized_vol = known_open_returns.rolling(vol_window, min_periods=10).std() * np.sqrt(periods)
+    if realized_vol is None:
+        realized_vol = realized_vol_series(frame, settings, candidate.interval)
+    else:
+        # Precomputed full-frame state sliced by the caller; align positionally.
+        realized_vol = pd.Series(np.asarray(realized_vol, dtype=float), index=frame.index)
     leverage = (settings.position_sizing.target_annual_vol / realized_vol.replace(0, np.nan)).clip(
         upper=settings.position_sizing.max_leverage_for(candidate.symbol)
     ).fillna(0.0)
@@ -478,8 +493,10 @@ def run_backtest(
     funding: pd.DataFrame | None = None,
     data_quality_notes: list[DataQualityNote] | None = None,
     btc_regime_frame: pd.DataFrame | None = None,
+    realized_vol: pd.Series | None = None,
+    regime_labels: pd.Series | None = None,
 ) -> BacktestResult:
-    path = evaluate_strategy_path(frame, signals, candidate, settings, funding=funding)
+    path = evaluate_strategy_path(frame, signals, candidate, settings, funding=funding, realized_vol=realized_vol)
     frame = path.frame
     signals = path.signals
     open_returns = path.open_returns
@@ -564,11 +581,17 @@ def run_backtest(
         skew=ret_skew,
         kurtosis=ret_kurt,
     )
-    regimes = label_btc_regime(btc_regime_frame if btc_regime_frame is not None else frame, settings.regime)
-    if len(regimes) == len(frame):
-        regimes = pd.Series(regimes.to_numpy(), index=frame.index).astype(str)
+    if regime_labels is not None:
+        # F3 (P1-5): labels computed on the full frame and sliced by the
+        # caller, so the slice's early bars carry real trailing regimes
+        # instead of the labeler's in-slice warm-up default.
+        regimes = pd.Series(np.asarray(regime_labels, dtype=object), index=frame.index).astype(str)
     else:
-        regimes = regimes.reindex(frame.index).fillna("sideways").astype(str)
+        regimes = label_btc_regime(btc_regime_frame if btc_regime_frame is not None else frame, settings.regime)
+        if len(regimes) == len(frame):
+            regimes = pd.Series(regimes.to_numpy(), index=frame.index).astype(str)
+        else:
+            regimes = regimes.reindex(frame.index).fillna("sideways").astype(str)
     trade_mask = vol_target_position.diff().abs().fillna(vol_target_position.abs()) > 1e-12
     regime_metrics = {}
     for regime in sorted(set(regimes)):
