@@ -800,3 +800,45 @@ def test_rerun_verify_stores_verdict_and_detects_metric_drift(tmp_path, monkeypa
     assert verdict["fields"]["total_return"]["within_tolerance"]
     stored = json.loads((root / "exp-rerun" / "verify_verdict.json").read_text(encoding="utf-8"))
     assert stored["status"] == "mismatch"  # the durable verdict reflects drift honestly
+
+
+def test_calmar_distinguishes_zero_drawdown_gains_from_no_edge() -> None:
+    """I5 (P2-6): calmar=0 at zero drawdown hid infinite-Calmar cases —
+    a monotonically profitable series must not report the same Calmar as a
+    flat one. Capped (not infinite) so the field stays serializable."""
+    from factor_mining.backtest.engine import _CALMAR_CAP, _metrics_from_returns
+
+    gains = _metrics_from_returns(pd.Series([0.001] * 50), interval="5m", trade_count=1, pnl=1.0)
+    flat = _metrics_from_returns(pd.Series([0.0] * 50), interval="5m", trade_count=0, pnl=0.0)
+
+    assert gains.max_drawdown == 0.0
+    assert gains.calmar == _CALMAR_CAP
+    assert flat.calmar == 0.0
+
+
+def test_tanh_zscore_smoothing_is_solely_smooth_span() -> None:
+    """I3 (P2-6): tanh_zscore hardcoded a 12-bar EWM, so 'smoothing off'
+    (smooth_span=1) never was, and smooth_span=12 silently double-smoothed.
+    The candidate's smooth_span must be the only smoothing knob."""
+    import numpy as np
+
+    from factor_mining.pipeline import _apply_transform
+
+    rng = np.random.default_rng(11)
+    raw = pd.Series(rng.normal(size=400))
+
+    unsmoothed = _apply_transform(raw, 1, "tanh_zscore", {"smooth_span": 1})
+    smoothed = _apply_transform(raw, 1, "tanh_zscore", {"smooth_span": 12})
+
+    # With smoothing off the signal must be strictly noisier than smoothed.
+    unsmoothed_flips = int((np.sign(unsmoothed).diff().abs() > 0).sum())
+    smoothed_flips = int((np.sign(smoothed).diff().abs() > 0).sum())
+    assert unsmoothed_flips > smoothed_flips
+    # And it must equal the raw tanh(z) with no EWM applied anywhere: applying
+    # any hidden smoothing would break this equality.
+    window, scale = 288, 2.0
+    mu = raw.rolling(window, min_periods=20).mean()
+    sigma = raw.rolling(window, min_periods=20).std().replace(0, np.nan)
+    z = ((raw - mu) / sigma).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    expected = np.tanh(z / scale)
+    assert np.allclose(unsmoothed.to_numpy(), expected.to_numpy())

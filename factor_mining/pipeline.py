@@ -3908,7 +3908,7 @@ def _apply_batch_pbo(
 
 
 def _cscv_splits(n_rows: int, settings: Settings) -> list[tuple[np.ndarray, np.ndarray]]:
-    n_groups = min(settings.cpcv.n_groups, n_rows)
+    n_groups = min(settings.cscv.n_groups, n_rows)
     if n_groups % 2 == 1:
         n_groups -= 1
     if n_groups < 4:
@@ -4684,9 +4684,11 @@ def _apply_transform(
         mu = raw.rolling(window, min_periods=20).mean()
         sigma = raw.rolling(window, min_periods=20).std().replace(0, np.nan)
         z = ((raw - mu) / sigma).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        # Apply smoothing (e.g. 1 hour = 12 bars) to prevent rapid flipping
-        smooth_z = z.ewm(span=12, min_periods=1).mean()
-        sig = direction * np.tanh(smooth_z / scale)
+        # I3 (P2-6): smoothing is solely the candidate's smooth_span, applied in
+        # _apply_signal_controls like every other transform. The old hardcoded
+        # 12-bar EWM here meant "smoothing off" (smooth_span=1) never was, and
+        # smooth_span=12 silently double-smoothed.
+        sig = direction * np.tanh(z / scale)
         return _apply_signal_controls(sig.fillna(0.0), params)
     elif transform == "rank":
         window = params.get("zscore_window", 288)

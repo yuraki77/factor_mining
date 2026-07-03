@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 
 class DataConfig(BaseModel):
@@ -38,11 +38,19 @@ class WalkForwardConfig(BaseModel):
     embargo_bars: int = 288
 
 
-class CPCVConfig(BaseModel):
+class CSCVConfig(BaseModel):
+    """Combinatorially symmetric CV (CSCV) for PBO — plain contiguous groups,
+    not the purged CPCV the old section name claimed (I2/P2-6)."""
+
     n_groups: int = 8
     test_groups: int = 2
     pbo_threshold: float = 0.40
     ml_pbo_threshold: float = 0.30
+
+
+# Backward-compat alias for external constructors; the yaml alias lives on the
+# Settings field.
+CPCVConfig = CSCVConfig
 
 
 class RegimeConfig(BaseModel):
@@ -70,8 +78,6 @@ class NeweyWestConfig(BaseModel):
 
 class PermutationTestConfig(BaseModel):
     n_permutations: int = 100
-    permute_target: Literal["factor_values"] = "factor_values"
-    test_statistic: Literal["mean_ic"] = "mean_ic"
 
 
 class PositionSizingConfig(BaseModel):
@@ -183,7 +189,10 @@ class Settings(BaseModel):
     data: DataConfig = Field(default_factory=DataConfig)
     trial_ledger: TrialLedgerConfig = Field(default_factory=TrialLedgerConfig)
     walk_forward: WalkForwardConfig = Field(default_factory=WalkForwardConfig)
-    cpcv: CPCVConfig = Field(default_factory=CPCVConfig)
+    cscv: CSCVConfig = Field(
+        default_factory=CSCVConfig,
+        validation_alias=AliasChoices("cscv", "cpcv"),
+    )
     regime: RegimeConfig = Field(default_factory=RegimeConfig)
     bootstrap: BootstrapConfig = Field(default_factory=BootstrapConfig)
     newey_west: NeweyWestConfig = Field(default_factory=NeweyWestConfig)

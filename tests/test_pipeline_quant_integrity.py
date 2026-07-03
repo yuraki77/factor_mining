@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from factor_mining.config import BootstrapConfig, CPCVConfig, DataConfig, PermutationTestConfig, Settings
+from factor_mining.config import BootstrapConfig, CSCVConfig, DataConfig, PermutationTestConfig, Settings
 from factor_mining.models import (
     BacktestResult,
     CandidateStrategySpec,
@@ -2068,7 +2068,7 @@ def test_unfunded_filter_skips_only_funding_factor_signal_candidates() -> None:
 def test_batch_pbo_is_computed_from_candidate_returns(tmp_path) -> None:
     settings = Settings(
         data=DataConfig(sqlite_path=tmp_path / "meta.sqlite3"),
-        cpcv=CPCVConfig(n_groups=4, test_groups=1),
+        cscv=CSCVConfig(n_groups=4, test_groups=1),
     )
     frame = _frame(220)
     candidate_a = CandidateStrategySpec(
@@ -2376,7 +2376,7 @@ def test_batch_pbo_does_not_punish_never_selected_members(monkeypatch) -> None:
     that is never the in-sample winner must inherit the batch-level PBO, not
     an automatic 1.0 — otherwise being batched with one dominant sibling
     hard-fails G2 (blocking) regardless of the candidate's own merit."""
-    settings = Settings(cpcv=CPCVConfig(n_groups=8))
+    settings = Settings(cscv=CSCVConfig(n_groups=8))
     frame = _frame(400)
 
     def _cand(cid: str) -> CandidateStrategySpec:
@@ -2433,7 +2433,7 @@ def test_cscv_split_subsample_is_not_lexicographically_biased() -> None:
     """When the unique split pairs exceed the cap, the subset must be sampled,
     not truncated: the first 128 lexicographic train sets all contain the
     earliest groups, so PBO would only ever train on early data."""
-    settings = Settings(cpcv=CPCVConfig(n_groups=16))
+    settings = Settings(cscv=CSCVConfig(n_groups=16))
     splits = _cscv_splits(1600, settings)
 
     assert len(splits) == 128

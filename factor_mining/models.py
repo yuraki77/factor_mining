@@ -51,7 +51,13 @@ class MetricsBlock(BaseModel):
     annualized_vol: float = 0.0
     sharpe: float = 0.0
     max_drawdown: float = 0.0
+    # Capped at 1000.0 when max_drawdown is zero with positive returns; 0.0
+    # when returns are non-positive (I5/P2-6 — 0 used to hide the distinction).
     calmar: float = 0.0
+    # Position-delta count: every rebalance above the 1e-12 threshold,
+    # INCLUDING vol-target resizing of an unchanged view (I4/P2-6). Higher
+    # than an entry/exit count; BacktestResult.oos_trade_count uses the same
+    # convention, so G7 and cost-per-trade diagnostics are comparable.
     trade_count: int = 0
     pnl: float = 0.0
 

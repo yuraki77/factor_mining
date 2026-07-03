@@ -64,6 +64,9 @@ class StrategyPath:
     avg_participation: float
 
 
+_CALMAR_CAP = 1000.0
+
+
 def _metrics_from_returns(returns: pd.Series, *, interval: str, trade_count: int, pnl: float) -> MetricsBlock:
     returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
     periods = annualization_factor(interval)
@@ -83,7 +86,13 @@ def _metrics_from_returns(returns: pd.Series, *, interval: str, trade_count: int
     ann_vol = float(returns.std(ddof=1) * np.sqrt(periods)) if len(returns) > 1 else 0.0
     sharpe = sharpe_ratio(returns, periods_per_year=periods)
     mdd = max_drawdown(equity)
-    calmar = ann_return / abs(mdd) if mdd < 0 else 0.0
+    # I5 (P2-6): zero drawdown with positive returns used to report calmar=0,
+    # indistinguishable from "no edge". Cap instead of infinity so the field
+    # stays JSON-serializable and sortable.
+    if mdd < 0:
+        calmar = min(ann_return / abs(mdd), _CALMAR_CAP)
+    else:
+        calmar = _CALMAR_CAP if ann_return > 0 else 0.0
     return MetricsBlock(
         total_return=total_return,
         annualized_return=ann_return,
