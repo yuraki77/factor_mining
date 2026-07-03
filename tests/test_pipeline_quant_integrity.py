@@ -2472,3 +2472,27 @@ def test_merge_pool_penalty_propagates_raised_trials_to_bailey_dsr() -> None:
         kurtosis=result.return_kurtosis,
     )
     assert result.deflated_sharpe_prob < single_trial_equiv
+
+
+def test_g1_shadow_calibration_classifies_divergence_without_gating() -> None:
+    """E2/DP-B: the haircut-vs-Bailey-DSR comparison must be recorded per
+    terminal result so the G1 re-pointing decision is made on accumulated
+    evidence — and it must remain observational (no gate reads it)."""
+    both = _result("e1", "c_both", pbo=0.2, sharpe=2.0)
+    both.deflated_sharpe, both.deflated_sharpe_prob = 0.5, 0.99
+    haircut_only = _result("e2", "c_haircut", pbo=0.2, sharpe=1.5)
+    haircut_only.deflated_sharpe, haircut_only.deflated_sharpe_prob = 0.3, 0.60
+    prob_only = _result("e3", "c_prob", pbo=0.2, sharpe=1.2)
+    prob_only.deflated_sharpe, prob_only.deflated_sharpe_prob = -0.1, 0.97
+    neither = _result("e4", "c_neither", pbo=0.2, sharpe=0.2)
+    neither.deflated_sharpe, neither.deflated_sharpe_prob = -0.4, 0.10
+    legacy = _result("e5", "c_legacy", pbo=0.2, sharpe=0.5)
+    legacy.deflated_sharpe, legacy.deflated_sharpe_prob = 0.2, None  # pre-upgrade artifact
+
+    summary = pipeline._g1_calibration_summary([both, haircut_only, prob_only, neither, legacy])
+
+    assert summary["counts"] == {"both_pass": 1, "haircut_only": 2, "prob_only": 1, "neither": 1}
+    assert summary["n_divergent"] == 3
+    assert summary["n_results"] == 5
+    legacy_row = next(row for row in summary["rows"] if row["candidate_id"] == "c_legacy")
+    assert legacy_row["prob_pass"] is False  # missing prob never silently passes

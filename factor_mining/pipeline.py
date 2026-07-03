@@ -1691,7 +1691,53 @@ def _evaluate_final_holdout(
             "research_gate": [g.model_dump(mode="json") for g in output.research_gates],
             "research_survivors": output.research_survivors,
         })
+        # E2: shadow-compare the current G1 metric (haircut > 0) against the
+        # Bailey DSR candidate criterion without changing any gate. The
+        # accumulated artifacts are the evidence base for the deliberate
+        # re-pointing decision (DP-B).
+        store.save_artifact(
+            f"g1_calibration_{run_id or uuid.uuid4().hex[:12]}",
+            "g1_calibration_shadow",
+            _g1_calibration_summary(output.backtests),
+        )
     return output
+
+
+_G1_SHADOW_PROB_THRESHOLD = 0.95
+
+
+def _g1_calibration_summary(results: list[BacktestResult]) -> dict[str, Any]:
+    """Shadow comparison of G1's haircut criterion vs the Bailey DSR
+    probability (E2/DP-B). Purely observational: G1 still gates on the
+    haircut; this records where the two verdicts diverge so the re-pointing
+    decision can be made on accumulated run data instead of a guess."""
+    rows = []
+    counts = {"both_pass": 0, "haircut_only": 0, "prob_only": 0, "neither": 0}
+    for result in results:
+        haircut_pass = result.deflated_sharpe > 0.0
+        prob_pass = (result.deflated_sharpe_prob or 0.0) >= _G1_SHADOW_PROB_THRESHOLD
+        key = (
+            "both_pass" if haircut_pass and prob_pass
+            else "haircut_only" if haircut_pass
+            else "prob_only" if prob_pass
+            else "neither"
+        )
+        counts[key] += 1
+        rows.append({
+            "candidate_id": result.candidate_id,
+            "deflated_sharpe": float(result.deflated_sharpe),
+            "deflated_sharpe_prob": result.deflated_sharpe_prob,
+            "effective_trials_at_eval": int(result.effective_trials_at_eval),
+            "haircut_pass": haircut_pass,
+            "prob_pass": prob_pass,
+        })
+    return {
+        "prob_threshold": _G1_SHADOW_PROB_THRESHOLD,
+        "counts": counts,
+        "n_results": len(rows),
+        "n_divergent": counts["haircut_only"] + counts["prob_only"],
+        "rows": rows,
+    }
 
 
 def _run_mining_round(
