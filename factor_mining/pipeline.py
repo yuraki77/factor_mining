@@ -7,6 +7,7 @@ and stop early on convergence.
 
 from __future__ import annotations
 
+import math
 import os
 import hashlib
 import json
@@ -3651,6 +3652,9 @@ def _is_int_like(value: Any) -> bool:
         return False
 
 
+_PBO_MIN_SELECTIONS_FOR_OWN_RATE = 3
+
+
 def _apply_batch_pbo(
     frame: pd.DataFrame,
     tasks: list[tuple],
@@ -3658,9 +3662,19 @@ def _apply_batch_pbo(
     settings: Settings,
     funding_df: pd.DataFrame | None,
 ) -> None:
+    """CSCV probability of backtest overfitting for a batch of candidates.
+
+    PBO is a property of the *selection process* (Bailey et al.): the fraction
+    of splits where the in-sample winner lands in the poor OOS half. Every
+    batch member that produced a return series receives that batch-level
+    number — being batched with a dominant sibling is not per-candidate
+    evidence of overfitting. A candidate selected in at least
+    ``_PBO_MIN_SELECTIONS_FOR_OWN_RATE`` splits carries its own
+    poor/selected rate instead (a real per-candidate estimate). Members with
+    no return series keep the conservative 1.0."""
     result_by_candidate = {result.candidate_id: result for result in results}
     returns_by_candidate: dict[str, pd.Series] = {}
-    periods = annualization_factor(settings.data.default_interval)
+    periods_by_candidate: dict[str, int] = {}
 
     for signal_arr, cdict, *_ in tasks:
         candidate_id = cdict["candidate_id"]
@@ -3675,7 +3689,7 @@ def _apply_batch_pbo(
             funding=funding_df,
         )
         returns_by_candidate[candidate_id] = path.strategy_returns.reset_index(drop=True)
-        periods = annualization_factor(candidate.interval)
+        periods_by_candidate[candidate_id] = annualization_factor(candidate.interval)
 
     if len(returns_by_candidate) < 2:
         for result in results:
@@ -3691,14 +3705,15 @@ def _apply_batch_pbo(
 
     selected_count = {candidate_id: 0 for candidate_id in returns_by_candidate}
     poor_oos_count = {candidate_id: 0 for candidate_id in returns_by_candidate}
+    poor_splits = 0
     for train_mask, test_mask in split_defs:
         train_scores = {
-            candidate_id: sharpe_ratio(series.iloc[:n_rows].iloc[train_mask], periods_per_year=periods)
+            candidate_id: sharpe_ratio(series.iloc[:n_rows].iloc[train_mask], periods_per_year=periods_by_candidate[candidate_id])
             for candidate_id, series in returns_by_candidate.items()
         }
         selected_id = max(train_scores, key=train_scores.get)
         test_scores = {
-            candidate_id: sharpe_ratio(series.iloc[:n_rows].iloc[test_mask], periods_per_year=periods)
+            candidate_id: sharpe_ratio(series.iloc[:n_rows].iloc[test_mask], periods_per_year=periods_by_candidate[candidate_id])
             for candidate_id, series in returns_by_candidate.items()
         }
         selected_test_score = test_scores[selected_id]
@@ -3708,10 +3723,18 @@ def _apply_batch_pbo(
         selected_count[selected_id] += 1
         if logit < 0.0:
             poor_oos_count[selected_id] += 1
+            poor_splits += 1
 
+    batch_pbo = poor_splits / len(split_defs)
     for result in results:
-        count = selected_count.get(result.candidate_id, 0)
-        result.pbo = float(poor_oos_count.get(result.candidate_id, 0) / count) if count else 1.0
+        if result.candidate_id not in returns_by_candidate:
+            result.pbo = 1.0
+            continue
+        count = selected_count[result.candidate_id]
+        if count >= _PBO_MIN_SELECTIONS_FOR_OWN_RATE:
+            result.pbo = float(poor_oos_count[result.candidate_id] / count)
+        else:
+            result.pbo = float(batch_pbo)
 
 
 def _cscv_splits(n_rows: int, settings: Settings) -> list[tuple[np.ndarray, np.ndarray]]:
@@ -3729,19 +3752,33 @@ def _cscv_splits(n_rows: int, settings: Settings) -> list[tuple[np.ndarray, np.n
     seen: set[tuple[int, ...]] = set()
     train_group_count = n_groups // 2
     all_groups = set(range(n_groups))
-    for train_group_ids in combinations(range(n_groups), train_group_count):
-        train_tuple = tuple(train_group_ids)
+    max_splits = 128
+    total_pairs = math.comb(n_groups, train_group_count) // 2
+
+    def _add_split(train_tuple: tuple[int, ...]) -> None:
         test_tuple = tuple(sorted(all_groups.difference(train_tuple)))
         pair_key = min(train_tuple, test_tuple)
         if pair_key in seen:
-            continue
+            return
         seen.add(pair_key)
         train_mask = np.isin(group_ids, train_tuple)
         test_mask = np.isin(group_ids, test_tuple)
         if bool(train_mask.any()) and bool(test_mask.any()):
             split_defs.append((train_mask, test_mask))
-        if len(split_defs) >= 128:
-            break
+
+    if total_pairs <= max_splits:
+        for train_group_ids in combinations(range(n_groups), train_group_count):
+            _add_split(tuple(train_group_ids))
+    else:
+        # Sample the split subset uniformly (seeded): truncating the
+        # lexicographic enumeration keeps only train sets built from the
+        # earliest groups, biasing PBO toward early-data training windows.
+        rng = np.random.default_rng(42)
+        attempts = 0
+        while len(split_defs) < max_splits and attempts < max_splits * 50:
+            attempts += 1
+            train_tuple = tuple(sorted(rng.choice(n_groups, size=train_group_count, replace=False).tolist()))
+            _add_split(train_tuple)
     return split_defs
 
 

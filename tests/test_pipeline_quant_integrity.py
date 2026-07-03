@@ -2,6 +2,7 @@ import threading
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from factor_mining.config import BootstrapConfig, CPCVConfig, DataConfig, PermutationTestConfig, Settings
 from factor_mining.models import (
@@ -2368,3 +2369,78 @@ def test_terminal_holdout_evaluates_survivors_once_with_cumulative_fdr(monkeypat
     assert captured.get("family_test_counts") == {"momentum": 37}
     assert out.backtests[0].effective_trials_at_eval >= 37
     assert len(out.gatechecks) == 1 and len(out.hardscores) == 1
+
+
+def test_batch_pbo_does_not_punish_never_selected_members(monkeypatch) -> None:
+    """PBO is a property of the selection process (Bailey CSCV): a candidate
+    that is never the in-sample winner must inherit the batch-level PBO, not
+    an automatic 1.0 — otherwise being batched with one dominant sibling
+    hard-fails G2 (blocking) regardless of the candidate's own merit."""
+    settings = Settings(cpcv=CPCVConfig(n_groups=8))
+    frame = _frame(400)
+
+    def _cand(cid: str) -> CandidateStrategySpec:
+        return _candidate(cid, "BTCUSDT")
+
+    def _res(cid: str) -> BacktestResult:
+        return BacktestResult(
+            experiment_id=f"exp-{cid}",
+            candidate_id=cid,
+            hypothesis_family="momentum",
+            method_id="factor_scoring",
+            symbol="BTCUSDT",
+            market="um_futures",
+            interval="5m",
+            metrics_primary=MetricsBlock(),
+            pbo=None,
+        )
+
+    rng = np.random.default_rng(3)
+    # Dominant sibling: strong steady returns wins every in-sample split.
+    strong = pd.Series(np.repeat(0.002, 400) + rng.normal(0.0, 0.0005, 400))
+    weak_a = pd.Series(rng.normal(0.0, 0.002, 400))
+    weak_b = pd.Series(rng.normal(0.0, 0.002, 400))
+    returns = {"c_strong": strong, "c_weak_a": weak_a, "c_weak_b": weak_b}
+
+    class _FakePath:
+        def __init__(self, series: pd.Series) -> None:
+            self.strategy_returns = series
+
+    monkeypatch.setattr(
+        pipeline,
+        "evaluate_strategy_path",
+        lambda frame_arg, signal, candidate, settings_arg, funding=None: _FakePath(returns[candidate.candidate_id]),
+    )
+
+    tasks = [
+        (np.ones(len(frame)), _cand(cid).model_dump(mode="json"), idx, {}, [])
+        for idx, cid in enumerate(returns)
+    ]
+    results = [_res(cid) for cid in returns]
+
+    _apply_batch_pbo(frame, tasks, results, settings, funding_df=None)
+
+    by_id = {result.candidate_id: result for result in results}
+    # The dominant sibling wins every split, so the weak members are never
+    # selected — they must carry the batch-level PBO, which for a genuinely
+    # strong winner is far below the old automatic 1.0.
+    assert by_id["c_weak_a"].pbo == by_id["c_weak_b"].pbo
+    assert by_id["c_weak_a"].pbo < 1.0
+    assert by_id["c_weak_a"].pbo == pytest.approx(by_id["c_strong"].pbo, abs=0.35)
+
+
+def test_cscv_split_subsample_is_not_lexicographically_biased() -> None:
+    """When the unique split pairs exceed the cap, the subset must be sampled,
+    not truncated: the first 128 lexicographic train sets all contain the
+    earliest groups, so PBO would only ever train on early data."""
+    settings = Settings(cpcv=CPCVConfig(n_groups=16))
+    splits = _cscv_splits(1600, settings)
+
+    assert len(splits) == 128
+    # Group 0 owns rows [0, 100). Under lexicographic truncation every train
+    # set contains group 0; a sampled subset must include splits that test on
+    # the earliest data instead.
+    assert any(not train_mask[0] for train_mask, _test_mask in splits)
+    # Complement-deduped and unique.
+    keys = {tuple(np.flatnonzero(train_mask[::100])) for train_mask, _ in splits}
+    assert len(keys) == 128
