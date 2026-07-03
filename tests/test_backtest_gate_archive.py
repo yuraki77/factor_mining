@@ -651,3 +651,75 @@ def test_regime_labels_flow_from_caller_into_regime_metrics(tmp_path) -> None:
 
     assert set(with_labels.regime_conditional_metrics) == {"bull", "bear"}
     assert set(without_labels.regime_conditional_metrics) == {"sideways"}
+
+
+def _gap_frame(n: int = 120, gap_after: int = 59, gap_bars: int = 72) -> pd.DataFrame:
+    """5m frame with a data outage: bar ``gap_after``'s next bar is ``gap_bars``
+    intervals later (a 6h outage for the defaults)."""
+    frame = make_frame(n)
+    open_times = frame["open_time"].to_numpy().copy()
+    open_times[gap_after + 1:] += gap_bars * 300_000
+    frame["open_time"] = open_times
+    return frame
+
+
+def test_cross_gap_returns_are_excluded_from_ic_inputs(tmp_path, monkeypatch) -> None:
+    """G1 (P2-2): the 1-bar 'return' spanning a 6-hour outage is not a
+    5-minute quantity; feeding it to IC/permutation inputs lets one outage
+    print dominate the correlation. The pre-gap bar must be dropped from the
+    compacted IC inputs."""
+    captured = {}
+
+    def fake_rolling_ic(signals, forward_returns, window=288, min_periods=10):
+        captured["fwd"] = list(forward_returns)
+        return pd.Series(forward_returns).fillna(0.0).to_numpy() * 0.0
+
+    monkeypatch.setattr("factor_mining.backtest.engine.rolling_pearson_ic", fake_rolling_ic)
+    settings = small_settings(tmp_path)
+    frame = _gap_frame(120, gap_after=59)
+    # Make the cross-gap print huge so its exclusion is unambiguous.
+    frame.loc[60:, "open"] = frame.loc[60:, "open"] * 2.0
+    signals = pd.Series([float(idx % 5) for idx in range(120)])
+    candidate = CandidateStrategySpec(
+        candidate_id="c-gap-ic",
+        hypothesis_id="h1",
+        method_id="rule_mining",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+    )
+
+    run_backtest(frame, signals, candidate, settings)
+
+    cross_gap_return = frame.loc[60, "open"] / frame.loc[59, "open"] - 1.0
+    assert len(captured["fwd"]) == 119  # pre-gap bar dropped
+    assert not any(abs(v - cross_gap_return) < 1e-12 for v in captured["fwd"])
+
+
+def test_reopen_bar_blocks_new_entries_but_allows_exits(tmp_path) -> None:
+    """G1 (P2-2): a fill on the first print after an outage, from a signal
+    built on pre-gap information, is fantasy — new risk must wait one bar.
+    Exits stay allowed: holding losers because the market was down is worse
+    than the fantasy fill."""
+    settings = small_settings(tmp_path)
+    candidate = CandidateStrategySpec(
+        candidate_id="c-gap-entry",
+        hypothesis_id="h1",
+        method_id="rule_mining",
+        hypothesis_family="momentum",
+        symbol="BTCUSDT",
+    )
+    frame = _gap_frame(120, gap_after=59)
+
+    # Entry case: flat before the gap, signal turns on at the pre-gap bar →
+    # the executable entry lands exactly on the reopen bar (60).
+    entry_signal = pd.Series([0.0] * 59 + [1.0] * 61)
+    entry_path = evaluate_strategy_path(frame, entry_signal, candidate, settings)
+    assert abs(entry_path.position.iloc[60]) < 1e-12  # no fill into the reopen print
+    assert abs(entry_path.position.iloc[61]) > 1e-12  # entry executes one bar later
+
+    # Exit case: long before the gap, signal turns off at the pre-gap bar →
+    # the exit on the reopen bar must still execute.
+    exit_signal = pd.Series([1.0] * 59 + [0.0] * 61)
+    exit_path = evaluate_strategy_path(frame, exit_signal, candidate, settings)
+    assert abs(exit_path.position.iloc[59]) > 1e-12
+    assert abs(exit_path.position.iloc[60]) < 1e-12

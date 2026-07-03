@@ -379,6 +379,36 @@ def _resolve_exit_params(
     return sl, mh, tiers, tr, ta
 
 
+def _pre_gap_flags(frame: pd.DataFrame, interval: str) -> np.ndarray:
+    """True at bars whose NEXT bar is non-contiguous (G1/P2-2): any 1-bar
+    forward quantity computed at such a bar spans a data outage and is not a
+    per-interval return."""
+    open_times = frame["open_time"].to_numpy(dtype=np.int64)
+    flags = np.zeros(open_times.size, dtype=bool)
+    if open_times.size < 2:
+        return flags
+    interval_ms = round(365 * 86_400_000 / annualization_factor(interval))
+    flags[:-1] = np.diff(open_times) > 1.5 * interval_ms
+    return flags
+
+
+def _freeze_reopen_entries(position: pd.Series, reopen_indices: np.ndarray) -> pd.Series:
+    """Block NEW risk on the first bar after a data gap (G1/P2-2): the signal
+    there was built on pre-gap information and a fill at the reopen print is
+    fantasy. Exits and reductions stay allowed — the position is clamped to
+    the interval between zero and the previous bar's position."""
+    if reopen_indices.size == 0:
+        return position
+    pos = position.copy()
+    for idx in reopen_indices:
+        if idx <= 0 or idx >= len(pos):
+            continue
+        prev = float(pos.iloc[idx - 1])
+        lo, hi = min(0.0, prev), max(0.0, prev)
+        pos.iloc[idx] = float(np.clip(pos.iloc[idx], lo, hi))
+    return pos
+
+
 def realized_vol_series(frame: pd.DataFrame, settings: Settings, interval: str) -> pd.Series:
     """Trailing annualized realized vol used for vol targeting.
 
@@ -437,6 +467,11 @@ def evaluate_strategy_path(
             stop_loss_pct=sl_pct, max_hold_bars=max_hold,
             tp_tiers=tiers, trailing_stop_pct=tr_pct, trailing_after_first_tp=tr_after_tp,
         )
+
+    reopen_indices = np.where(_pre_gap_flags(frame, candidate.interval))[0] + 1
+    if reopen_indices.size:
+        vol_target_position = _freeze_reopen_entries(vol_target_position, reopen_indices)
+        fixed_position = _freeze_reopen_entries(fixed_position, reopen_indices)
 
     primary_returns, primary_cost_bps, avg_participation = _strategy_returns(
         frame,
@@ -532,8 +567,16 @@ def run_backtest(
     executable_sig = signals.shift(1).fillna(0.0)
     sig_arr = executable_sig.to_numpy(dtype=float)
     fwd_arr = forward_returns.to_numpy(dtype=float)
-    ic_series = pd.Series(rolling_pearson_ic(sig_arr, fwd_arr, window=_IC_WINDOW_BARS, min_periods=10), index=signals.index)
-    rankic_series = pd.Series(rolling_rank_ic(sig_arr, fwd_arr, window=_IC_WINDOW_BARS, min_periods=10), index=signals.index)
+    # G1 (P2-2): a bar whose next bar sits across a data outage has no 5-minute
+    # forward return — drop those bars from the IC inputs (compacted, then
+    # re-aligned with NaN so downstream .dropna() consumers stay positional).
+    ic_keep = ~_pre_gap_flags(frame, candidate.interval)
+    ic_vals = np.full(sig_arr.size, np.nan)
+    rankic_vals = np.full(sig_arr.size, np.nan)
+    ic_vals[ic_keep] = rolling_pearson_ic(sig_arr[ic_keep], fwd_arr[ic_keep], window=_IC_WINDOW_BARS, min_periods=10)
+    rankic_vals[ic_keep] = rolling_rank_ic(sig_arr[ic_keep], fwd_arr[ic_keep], window=_IC_WINDOW_BARS, min_periods=10)
+    ic_series = pd.Series(ic_vals, index=signals.index)
+    rankic_series = pd.Series(rankic_vals, index=signals.index)
     avg_hold = _avg_holding_period(vol_target_position)
     block_len = settings.bootstrap.block_length_bars(avg_hold)
     ret_arr = primary_returns.to_numpy(dtype=float)
@@ -547,8 +590,8 @@ def run_backtest(
     else:
         ci = (0.0, 0.0)
     permutation_p = permutation_test_mean_ic(
-        executable_sig,
-        forward_returns,
+        sig_arr[ic_keep],
+        fwd_arr[ic_keep],
         n_permutations=settings.permutation_test.n_permutations,
     )
     if trial_ledger is not None:
