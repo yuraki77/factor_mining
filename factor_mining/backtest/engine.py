@@ -193,14 +193,29 @@ def compute_oos_window_diagnostics(
 
 
 def _apply_funding(position: pd.Series, frame: pd.DataFrame, funding: pd.DataFrame | None) -> pd.Series:
+    """Funding cash flows mapped to the first bar at-or-after each settlement.
+
+    Vectorized via searchsorted on ``open_time`` (A6/A8). The previous
+    exact-match dict lookup silently dropped any funding event whose
+    settlement time fell inside a data gap or off the bar grid — the cash
+    flow simply vanished from the backtest. Events now settle on the next
+    available bar (several events inside one gap accumulate there); events
+    before the window's first bar or after its last bar are outside the
+    evaluation and are dropped.
+    """
     impact = pd.Series(0.0, index=frame.index)
     if funding is None or funding.empty:
         return impact
-    rate_by_time = dict(zip(funding["calc_time"], funding["last_funding_rate"], strict=False))
-    for idx, open_time in frame["open_time"].items():
-        rate = rate_by_time.get(int(open_time))
-        if rate is not None:
-            impact.loc[idx] = -float(position.loc[idx]) * float(rate)
+    open_times = frame["open_time"].to_numpy(dtype=np.int64)
+    calc_times = funding["calc_time"].to_numpy(dtype=np.int64)
+    rates = funding["last_funding_rate"].to_numpy(dtype=float)
+    bar_idx = np.searchsorted(open_times, calc_times, side="left")
+    valid = (calc_times >= open_times[0]) & (bar_idx < len(open_times))
+    if not valid.any():
+        return impact
+    flows = np.zeros(len(open_times), dtype=float)
+    np.add.at(flows, bar_idx[valid], rates[valid])
+    impact.iloc[:] = -position.to_numpy(dtype=float) * flows
     return impact
 
 
