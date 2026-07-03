@@ -422,6 +422,24 @@ def _aligned_dataset_series(
     time_col: str,
     value_col: str,
 ) -> pd.Series | None:
+    """Align a supplemental dataset onto the frame's bar grid by forward-fill.
+
+    Timestamp semantics audit (G2/P2-5) — the bar at ``open_time == T``
+    receives the last record stamped ``<= T``, never a future-stamped one.
+    What a record's stamp *means* differs by dataset shape:
+
+    - Kline-shaped datasets (spot/mark/index/premium klines, ``time_col=
+      "open_time"``) are stamped at window OPEN and synced at the frame's own
+      interval, so the ``close`` aligned at bar T is realized at T+interval —
+      exactly the next bar's open. This matches the frame's own close columns
+      and is only executable because the engine lags every signal one bar
+      (``signals.shift(1)``); any consumer bypassing that lag would look
+      ahead by one interval.
+    - Snapshot-shaped datasets (openInterestHist, long/short ratios, taker
+      volume, basis; ``time_col="timestamp"``) are point-in-time records
+      knowable at their stamp; alignment at bar T assumes zero publication
+      latency at the boundary.
+    """
     if dataset is None or dataset.empty or time_col not in dataset.columns or value_col not in dataset.columns:
         return None
     series = pd.Series(
