@@ -229,6 +229,16 @@ def permutation_test_mean_ic(
     n_permutations: int,
     seed: int = 42,
 ) -> float:
+    """Empirical p-value for ``|corr(factor, returns)|`` under a circular-shift null.
+
+    The null rotates the factor by a random offset (Q8): unlike an i.i.d.
+    shuffle it preserves the factor's autocorrelation while breaking its
+    alignment with returns, so persistent signals tested against
+    autocorrelated returns are not anti-conservatively rejected. The return
+    value is always the finite-sample ``(k+1)/(n+1)`` estimator — the previous
+    normal approximation of the null had thin tails exactly where small
+    p-values were being claimed.
+    """
     factor = np.asarray(factor_values, dtype=float)
     returns = np.asarray(forward_returns, dtype=float)
     mask = np.isfinite(factor) & np.isfinite(returns)
@@ -238,20 +248,13 @@ def permutation_test_mean_ic(
         return 1.0
     observed = abs(float(np.corrcoef(factor, returns)[0, 1]))
     rng = np.random.default_rng(seed)
+    shifts = rng.integers(1, factor.size, size=max(0, int(n_permutations)))
     exceed = 0
-    null_stats = np.empty(max(0, int(n_permutations)), dtype=float)
-    for _ in range(n_permutations):
-        permuted = rng.permutation(factor)
-        stat = abs(float(np.corrcoef(permuted, returns)[0, 1]))
-        null_stats[_] = stat
+    for shift in shifts:
+        stat = abs(float(np.corrcoef(np.roll(factor, int(shift)), returns)[0, 1]))
         if stat >= observed:
             exceed += 1
-    empirical_p = float((exceed + 1) / (n_permutations + 1))
-    null_std = float(null_stats.std(ddof=1)) if null_stats.size > 1 else 0.0
-    if null_std <= 0.0:
-        return empirical_p
-    z_score = (observed - float(null_stats.mean())) / null_std
-    return float(max(0.0, min(1.0, 1.0 - normal_cdf(z_score))))
+    return float((exceed + 1) / (len(shifts) + 1))
 
 
 def rank_ic(factor_values: Sequence[float], forward_returns: Sequence[float]) -> float:

@@ -71,7 +71,6 @@ class PermutationTestConfig(BaseModel):
     n_permutations: int = 100
     permute_target: Literal["factor_values"] = "factor_values"
     test_statistic: Literal["mean_ic"] = "mean_ic"
-    rejection_threshold: float = 0.05
 
 
 class PositionSizingConfig(BaseModel):

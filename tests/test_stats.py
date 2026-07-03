@@ -179,3 +179,35 @@ def test_deflated_sharpe_observations_matches_series_length() -> None:
 
     with pytest.raises(ValueError):
         deflated_sharpe_ratio(None, observed_sr=1.5, trials_count=64, periods_per_year=365)
+
+
+def test_permutation_null_is_calibrated_for_autocorrelated_series() -> None:
+    """WHY: an i.i.d. shuffle destroys the factor's autocorrelation, so a
+    persistent (AR) signal tested against autocorrelated returns was rejected
+    at a multiple of the nominal rate — the advertised robustness check was
+    anti-conservative exactly for the signals this system mines. The
+    circular-shift null must keep false rejections near nominal, and the
+    returned value must be the finite-sample (k+1)/(n+1) estimator, not a
+    thin-tailed normal approximation of the null."""
+    rng = np.random.default_rng(123)
+    n, reps, n_perm = 400, 120, 99
+    rejections = 0
+    for rep in range(reps):
+        eps = rng.normal(size=n)
+        factor = np.empty(n)
+        factor[0] = eps[0]
+        for t in range(1, n):
+            factor[t] = 0.9 * factor[t - 1] + eps[t]
+        shocks = rng.normal(size=n)
+        vol = 0.5 + 0.5 * np.abs(np.sin(np.arange(n) / 25.0))
+        ret = np.empty(n)
+        ret[0] = shocks[0] * vol[0]
+        for t in range(1, n):
+            ret[t] = 0.35 * ret[t - 1] + shocks[t] * vol[t]
+
+        p = permutation_test_mean_ic(factor, ret, n_permutations=n_perm, seed=rep)
+        grid = p * (n_perm + 1)
+        assert abs(grid - round(grid)) < 1e-9, "p must be the empirical (k+1)/(n+1) estimator"
+        if p <= 0.05:
+            rejections += 1
+    assert rejections / reps <= 0.125, f"null rejection rate {rejections / reps:.3f} is anti-conservative"
