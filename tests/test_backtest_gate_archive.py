@@ -576,3 +576,20 @@ def test_risk_stratification_rejects_mispaired_batches() -> None:
     gate = run_gatecheck(result, Settings(), method=get_method("factor_scoring"))
     with pytest.raises(ValueError):
         apply_risk_stratified_gatechecks([result, result], [gate], [], Settings())
+
+
+def test_g3_fdr_failure_warns_but_does_not_block_by_decision() -> None:
+    """P1-1 decision (2026-07): G3 is intentionally non-blocking. FDR
+    multiplicity already binds at the terminal holdout (cumulative n_tests)
+    and at survivor promotion (fdr_pvalue < promotion_fdr); blocking the gate
+    on G3 too would double-penalize underpowered-but-real signals the
+    survivor path exists to accumulate evidence for. If G3 is ever added to
+    _BLOCKING_RULES this test must be revisited alongside that rationale."""
+    from factor_mining.validation.gatecheck import _BLOCKING_RULES
+
+    assert "G3" not in _BLOCKING_RULES
+    result = _gate_ready_result(pbo=0.2)
+    gate = run_gatecheck(result, Settings(), method=get_method("rule_mining"), fdr_adjusted_pvalue=0.9)
+    g3 = next(item for item in gate.items if item.rule_id == "G3")
+    assert g3.status == "warn"
+    assert gate.raw_passed

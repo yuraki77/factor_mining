@@ -15,6 +15,14 @@ if TYPE_CHECKING:
 _FULL_ALLOCATION = 1.0
 _CONDITIONAL_ALLOCATION = 0.25
 _CONDITIONAL_REVIEW_DAYS = 60
+# G3 (family-FDR p-value) is deliberately NOT blocking (P1-1 decision, 2026-07):
+# FDR multiplicity already binds where selection happens — the terminal holdout
+# runs BH with n_tests raised to cumulative cross-round family trial counts,
+# and survivor promotion requires fdr_pvalue < promotion_fdr. Making G3 also
+# block the round/terminal gate would double-penalize discovery: candidates
+# with real but underpowered signals could never accumulate the OOS evidence
+# the survivor path exists to collect. G3 stays a warn item feeding the
+# research-gate evidence flags.
 _BLOCKING_RULES = {"G1", "G2", "G5", "G8", "G10", "G11", "G14", "G15"}
 _FDR_EFFECTIVE_FAMILY_MIN = 10
 
