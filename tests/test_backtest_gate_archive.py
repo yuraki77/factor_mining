@@ -3,7 +3,7 @@ import pytest
 
 from factor_mining.archive import archive_experiment, verify_archive
 from factor_mining.backtest.engine import _EQUITY_CURVE_MAX_POINTS, _apply_exit_rules, _bounded_equity_curve, evaluate_strategy_path, run_backtest
-from factor_mining.config import BootstrapConfig, DataConfig, GateCheckConfig, PermutationTestConfig, PositionSizingConfig, Settings, WalkForwardConfig
+from factor_mining.config import BootstrapConfig, DataConfig, GateCheckConfig, PermutationTestConfig, PositionSizingConfig, Settings
 from factor_mining.models import BacktestResult, CandidateStrategySpec, DataQualityNote, FactorEvidenceReport, GateCheckResult, MetricsBlock
 from factor_mining.registry import get_method
 from factor_mining.storage import MetadataStore

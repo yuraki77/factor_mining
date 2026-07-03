@@ -25,16 +25,17 @@ class TrialLedgerConfig(BaseModel):
 
 
 class WalkForwardConfig(BaseModel):
-    mode: Literal["rolling"] = "rolling"
-    train_months: int = 12
-    validation_months: int = 3
-    test_months: int = 3
+    """Split-boundary hygiene for the discovery/validation/holdout cut (Q10).
+
+    F2 (P1-3): the rolling walk-forward keys this section used to carry
+    (mode/train/validation/test months, min_folds) described an evaluation
+    that never existed and are gone; the real split is the purged 60/20/20
+    plan in pipeline._build_data_split_plan. If rolling walk-forward is ever
+    implemented, its config belongs to that feature, not here.
+    """
+
     purge_bars_floor: int = 288
     embargo_bars: int = 288
-    min_folds: int = 4
-
-    def purge_bars(self, max_feature_lookback_bars: int) -> int:
-        return max(self.purge_bars_floor, 2 * max_feature_lookback_bars)
 
 
 class CPCVConfig(BaseModel):

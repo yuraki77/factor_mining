@@ -13,13 +13,8 @@ trial_ledger:
   window_days: 90
 
 walk_forward:
-  mode: "rolling"
-  train_months: 12
-  validation_months: 3
-  test_months: 3
   purge_bars_floor: 288
   embargo_bars: 288
-  min_folds: 4
 
 cpcv:
   n_groups: 8
