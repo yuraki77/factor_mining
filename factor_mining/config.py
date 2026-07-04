@@ -131,6 +131,9 @@ class LLMConfig(BaseModel):
 
 class GateCheckConfig(BaseModel):
     fdr_q: float = 0.05
+    # G1: minimum Bailey-LdP deflated-Sharpe probability (PSR at the
+    # expected-max-SR threshold). 0.95 is the B&LdP confidence convention.
+    dsr_prob_min: float = 0.95
     ic_tstat_nw_min: float = 2.0
     rankic_tstat_nw_min: float = 2.0
     sharpe_ci_5_min: float = 0.0

@@ -199,6 +199,7 @@ def test_near_miss_marks_statistically_underpowered_survivor() -> None:
         metrics_primary=MetricsBlock(sharpe=3.93, trade_count=40),
         metrics_gross=MetricsBlock(sharpe=4.58),
         deflated_sharpe=3.897,
+        deflated_sharpe_prob=0.62,
         oos_trade_count=40,
         break_even_cost_bps=35.77,
         actual_cost_bps=5.0,

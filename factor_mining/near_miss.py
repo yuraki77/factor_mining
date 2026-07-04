@@ -220,6 +220,7 @@ def _diagnostics(
         "gross_sharpe": gross_sharpe,
         "net_sharpe": result.metrics_primary.sharpe,
         "deflated_sharpe": result.deflated_sharpe,
+        "deflated_sharpe_prob": result.deflated_sharpe_prob,
         "probabilistic_sharpe": result.probabilistic_sharpe,
         "permutation_pvalue": result.permutation_test_pvalue,
         "fdr_adjusted_pvalue": _gate_item_value(gatecheck, "G3"),
@@ -267,10 +268,12 @@ def _cost_destroyed_edge(diagnostics: dict) -> bool:
 
 
 def _statistically_underpowered_survivor(diagnostics: dict) -> bool:
+    # Mirrors research_gate._statistically_underpowered: DSR prob >= 0.5 is
+    # "promising but short of the G1 bar"; the haircut DSR cannot serve here.
     return (
         bool(diagnostics.get("g3_fdr_not_passed"))
         and bool(diagnostics.get("g7_trades_not_passed"))
-        and float(diagnostics.get("deflated_sharpe") or 0.0) > 0.0
+        and float(diagnostics.get("deflated_sharpe_prob") or 0.0) >= 0.5
         and float(diagnostics.get("net_sharpe") or 0.0) > 0.0
         and float(diagnostics.get("cost_margin_bps") or 0.0) > 0.0
     )

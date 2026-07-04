@@ -293,7 +293,7 @@ def gate_run() -> None:
         else:
             fail_ids = [item.rule_id for item in gc.failures]
             typer.echo(f"  FAIL {r.candidate_id[:16]}... {fail_ids} "
-                       f"SR={r.metrics_primary.sharpe:+.2f} DSR={r.deflated_sharpe:+.3f}")
+                       f"SR={r.metrics_primary.sharpe:+.2f} DSRp={(r.deflated_sharpe_prob or 0.0):.3f}")
 
     typer.echo(f"GateCheck: {passed}/{len(results)} passed")
 

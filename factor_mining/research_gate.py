@@ -267,10 +267,14 @@ def _evidence_flags(
 
 
 def _statistically_underpowered(flags: dict[str, float | int | str | bool | None]) -> bool:
+    # "Promising but underpowered": more likely than not to beat the expected
+    # max of the search (DSR prob >= 0.5), short of the G1 bar. The haircut
+    # DSR is unusable here — annualized on intraday bars it is negative for
+    # every honest candidate.
     return (
         bool(flags.get("failed_g3_fdr"))
         and bool(flags.get("failed_g7_trades"))
-        and float(flags.get("deflated_sharpe") or 0.0) > 0.0
+        and float(flags.get("deflated_sharpe_prob") or 0.0) >= 0.5
         and float(flags.get("net_sharpe") or 0.0) > 0.0
         and float(flags.get("cost_margin_bps") or 0.0) > 0.0
     )

@@ -37,6 +37,10 @@ class CandidateStrategySpec(BaseModel):
     is_ml: bool = False
     candidate_type: Literal["original", "repair", "grid_tuning", "composite", "optimizer"] = "original"
     parent_candidate_id: str | None = None
+    # Root candidate id of the search lineage. Derived candidates (repairs,
+    # grid tuning) inherit their root's id so the trial ledger can count
+    # independent search paths instead of raw evaluations.
+    lineage_id: str | None = None
     # ── DSL fields (optional, None for non-DSL candidates) ──────────
     dsl_expression: str | None = None
     dsl_canonical_expression: str | None = None
@@ -104,11 +108,12 @@ class BacktestResult(BaseModel):
     sharpe_ci_5_95: tuple[float, float] = (0.0, 0.0)
     probabilistic_sharpe: float = 0.0
     # Expected-max haircut Sharpe (sqrt(2 ln N / n) penalty), not Bailey's
-    # PSR-based DSR — see stats.metrics.deflated_sharpe_ratio. G1 gates on > 0.
+    # PSR-based DSR — see stats.metrics.deflated_sharpe_ratio. Diagnostic:
+    # annualized on intraday bars it dwarfs any honest SR, so it must not gate.
     deflated_sharpe: float = 0.0
     # True Bailey & López de Prado DSR: P(observed SR beats the expected max
     # of effective_trials_at_eval null trials), skew/kurtosis-adjusted.
-    # Diagnostic — G1 still gates on the haircut above.
+    # G1 gates on this clearing settings.gatecheck.dsr_prob_min.
     deflated_sharpe_prob: float | None = None
     return_skew: float = 0.0
     return_kurtosis: float = 3.0
@@ -303,6 +308,9 @@ class TrialRecord(BaseModel):
     experiment_id: str | None = None
     hypothesis_family: str
     method_id: str
+    # Root of the search lineage this evaluation belongs to; defaults to the
+    # candidate's own id at storage time when unset.
+    lineage_id: str | None = None
     evaluated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 

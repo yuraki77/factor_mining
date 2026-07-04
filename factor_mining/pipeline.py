@@ -1982,7 +1982,7 @@ def _run_mining_round(
     merge_pool_trials = _merge_pool_effective_trials(
         merge_plan.validation_results,
         _trial_counts_snapshot(cumulative_trial_counts, trial_counts_lock),
-        tested_candidates=len(validation_candidates),
+        tested_candidates=len({_lineage_root_id(c) for c in validation_candidates}),
     )
     _apply_merge_pool_trial_penalty(
         round_backtests,
@@ -2059,7 +2059,7 @@ def _run_mining_round(
             allocation = g.allocation_multiplier if g.allocation_multiplier is not None else 0.0
             _log(
                 f"    {label} {r.candidate_id[:16]}... "
-                f"SR={r.metrics_primary.sharpe:+.2f} DSR={r.deflated_sharpe:+.3f} "
+                f"SR={r.metrics_primary.sharpe:+.2f} DSRp={(r.deflated_sharpe_prob or 0.0):.3f} "
                 f"alloc={allocation:.2f} evidence={g.factor_evidence_level}"
             )
 
@@ -2519,6 +2519,13 @@ def _symbol_round_parallelism(group_count: int, max_workers: int | None) -> tupl
     return symbol_workers, backtest_workers_per_group
 
 
+def _lineage_root_id(candidate: CandidateStrategySpec) -> str:
+    """Root of the candidate's search lineage. The parent fallback covers
+    derived candidates created before lineage tracking (LLM mutations,
+    optimizer variants) at one level of depth."""
+    return candidate.lineage_id or candidate.parent_candidate_id or candidate.candidate_id
+
+
 def _record_candidate_trials(
     candidates: list[CandidateStrategySpec],
     store: MetadataStore | None,
@@ -2543,7 +2550,13 @@ def _record_candidate_trials(
         family = candidate.hypothesis_family
         complexity_score = _candidate_complexity_score(candidate)
         candidate.params["complexity_score"] = complexity_score
-        cumulative_trial_counts[family] = cumulative_trial_counts.get(family, 0) + 1
+        lineage_id = _lineage_root_id(candidate)
+        # Derived candidates (repairs/grid variants) share their root's lineage
+        # and must not inflate the independent-trial count.
+        if lineage_id == candidate.candidate_id:
+            cumulative_trial_counts[family] = cumulative_trial_counts.get(family, 0) + 1
+        else:
+            cumulative_trial_counts.setdefault(family, 0)
         if ledger is not None:
             ledger.record(
                 TrialRecord(
@@ -2552,6 +2565,7 @@ def _record_candidate_trials(
                     experiment_id=None,
                     hypothesis_family=family,
                     method_id=candidate.method_id,
+                    lineage_id=lineage_id,
                 )
             )
             counts = ledger.counts_for(family)
@@ -2942,6 +2956,7 @@ def _spawn_local_grid_tuning_candidate(
     candidate.candidate_id = f"c_grid_{uuid.uuid4().hex[:12]}"
     candidate.candidate_type = "grid_tuning"
     candidate.parent_candidate_id = parent.candidate_id
+    candidate.lineage_id = _lineage_root_id(parent)
     candidate.params.update(params)
     candidate.params["parent_id"] = parent.candidate_id
     candidate.params["generated_by"] = "local_grid_tuning"
@@ -3163,6 +3178,7 @@ def _spawn_pre_gate_repair(
     repair.candidate_id = f"c_pre_{uuid.uuid4().hex[:12]}"
     repair.candidate_type = "repair"
     repair.parent_candidate_id = parent.candidate_id
+    repair.lineage_id = _lineage_root_id(parent)
     repair.params.update(params)
     repair.params["parent_id"] = parent.candidate_id
     repair.params["generated_by"] = "pre_gate_repair"
@@ -3642,7 +3658,7 @@ def _merge_pool_effective_trials(
     """Compute the effective trial count for the final merge-pool DSR penalty.
 
     Policy (explicit):
-    - `tested_candidates`  = actual distinct candidates that competed in the merge pool;
+    - `tested_candidates`  = distinct search lineages that competed in the merge pool;
       this is the primary measure of independent search paths.
     - `sum(cumulative_trial_counts)` = conservative family-based floor; only used if it
       exceeds `tested_candidates` (rare, happens when many families compete).

@@ -79,7 +79,9 @@ def run_gatecheck(
     """
     items: list[GateCheckItem] = []
     fdr_adjusted_pvalue = combined_ic_tstat_pvalue(result.ic_tstat_nw, result.rankic_tstat_nw) if fdr_adjusted_pvalue is None else fdr_adjusted_pvalue
-    _item(items, "G1", result.deflated_sharpe > 0.0, "Deflated Sharpe is positive after trial adjustment", result.deflated_sharpe, 0.0)
+    # Fail closed when the probability was never computed (legacy results).
+    dsr_prob = result.deflated_sharpe_prob if result.deflated_sharpe_prob is not None else 0.0
+    _item(items, "G1", dsr_prob >= settings.gatecheck.dsr_prob_min, "Bailey-LdP deflated Sharpe probability clears the confidence threshold", dsr_prob, settings.gatecheck.dsr_prob_min)
     _warn_item(items, "G3", fdr_adjusted_pvalue <= settings.gatecheck.fdr_q, f"Family FDR-adjusted NW IC p-value <= {settings.gatecheck.fdr_q}", fdr_adjusted_pvalue, settings.gatecheck.fdr_q)
     _warn_item(items, "G4", result.ic_tstat_nw > settings.gatecheck.ic_tstat_nw_min, "Newey-West IC t-stat contributes strength", result.ic_tstat_nw, settings.gatecheck.ic_tstat_nw_min)
     _warn_item(items, "G4R", result.rankic_tstat_nw > settings.gatecheck.rankic_tstat_nw_min, "Newey-West RankIC t-stat contributes strength", result.rankic_tstat_nw, settings.gatecheck.rankic_tstat_nw_min)

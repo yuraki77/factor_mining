@@ -92,6 +92,7 @@ llm:
 
 gatecheck:
   fdr_q: 0.05
+  dsr_prob_min: 0.95
   ic_tstat_nw_min: 2.0
   rankic_tstat_nw_min: 2.0
   sharpe_ci_5_min: 0.0

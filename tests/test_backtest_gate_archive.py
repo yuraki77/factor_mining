@@ -76,6 +76,7 @@ def test_gatecheck_result_carries_candidate_id() -> None:
         metrics_primary=MetricsBlock(sharpe=1.0, trade_count=100),
         metrics_gross=MetricsBlock(sharpe=1.2),
         deflated_sharpe=1.0,
+        deflated_sharpe_prob=0.99,
         pbo=0.1,
         oos_trade_count=100,
         estimated_capacity_usd=1_000_000.0,
@@ -253,6 +254,7 @@ def test_gatecheck_warns_autocorr_and_data_quality_without_hard_fail() -> None:
         sharpe_ci_5_95=(0.2, 2.5),
         probabilistic_sharpe=0.99,
         deflated_sharpe=0.95,
+        deflated_sharpe_prob=0.99,
         pbo=0.2,
         permutation_test_pvalue=0.01,
         regime_conditional_metrics={"bull": MetricsBlock(pnl=50), "bear": MetricsBlock(pnl=50)},
@@ -286,6 +288,7 @@ def _gate_ready_result(*, experiment_id: str = "exp-tier", pbo: float = 0.5) -> 
         sharpe_ci_5_95=(0.2, 2.5),
         probabilistic_sharpe=0.95,
         deflated_sharpe=0.7,
+        deflated_sharpe_prob=0.98,
         pbo=pbo,
         permutation_test_pvalue=0.01,
         regime_conditional_metrics={"bull": MetricsBlock(pnl=50), "bear": MetricsBlock(pnl=50)},
@@ -433,6 +436,34 @@ def test_conditional_pass_hardscore_is_scaled_by_allocation() -> None:
 
     assert score.score > 0.0
     assert score.allocation_multiplier == 0.25
+
+
+def test_g1_gates_on_bailey_probability_not_the_haircut() -> None:
+    # WHY: annualized on intraday bars, the expected-max haircut exceeds any
+    # honest Sharpe (sqrt(2 ln N / n) * sqrt(periods_per_year) is tens of SR
+    # units), so a deeply negative haircut must not block a candidate whose
+    # Bailey-LdP probability clears the confidence bar — and a merely
+    # "positive haircut" must not substitute for that probability.
+    confident = _gate_ready_result().model_copy(
+        update={"deflated_sharpe": -25.0, "deflated_sharpe_prob": 0.97}
+    )
+    gate = run_gatecheck(confident, Settings(), method=get_method("rule_mining"), fdr_adjusted_pvalue=0.01)
+    assert "G1" not in {item.rule_id for item in gate.failures}
+
+    unproven = _gate_ready_result().model_copy(
+        update={"deflated_sharpe": 1.0, "deflated_sharpe_prob": 0.80}
+    )
+    gate = run_gatecheck(unproven, Settings(), method=get_method("rule_mining"), fdr_adjusted_pvalue=0.01)
+    assert "G1" in {item.rule_id for item in gate.failures}
+
+
+def test_g1_fails_closed_when_probability_is_missing() -> None:
+    # WHY: legacy results predate deflated_sharpe_prob; treating "unknown"
+    # as a pass would wave through exactly the unvetted candidates the
+    # multiple-testing gate exists to stop.
+    legacy = _gate_ready_result().model_copy(update={"deflated_sharpe_prob": None})
+    gate = run_gatecheck(legacy, Settings(), method=get_method("rule_mining"), fdr_adjusted_pvalue=0.01)
+    assert "G1" in {item.rule_id for item in gate.failures}
 
 
 def test_hardscore_distinguishes_strong_dsr_without_hard_saturation() -> None:

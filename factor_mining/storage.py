@@ -57,7 +57,8 @@ class MetadataStore:
                         experiment_id text,
                         hypothesis_family text not null,
                         method_id text not null,
-                        evaluated_at text not null
+                        evaluated_at text not null,
+                        lineage_id text
                     );
     
                     create index if not exists idx_trials_family_time
@@ -126,6 +127,34 @@ class MetadataStore:
                         on trajectories(operator);
                     """
                 )
+                self._migrate_trial_lineage(conn)
+
+    @staticmethod
+    def _migrate_trial_lineage(conn: sqlite3.Connection) -> None:
+        """Backfill ``trials.lineage_id`` so trial counts measure independent
+        search paths rather than raw evaluations.
+
+        Legacy rows predate lineage tracking. Parameter-local variants
+        (grid tuning, pre-gate repairs, optimizer adjust/repair) cannot be
+        re-linked to their parents, so they collapse into one per-family
+        bucket — their parents carry the lineage count through their own
+        rows. Everything else keeps its candidate_id as its own lineage.
+        GLOB keeps '_' literal (LIKE would treat it as a wildcard)."""
+        columns = {row[1] for row in conn.execute("pragma table_info(trials)")}
+        if "lineage_id" not in columns:
+            conn.execute("alter table trials add column lineage_id text")
+        conn.execute(
+            """
+            update trials set lineage_id = 'legacy_derived:' || hypothesis_family
+            where lineage_id is null
+              and (candidate_id glob 'c_grid_*' or candidate_id glob 'c_pre_*'
+                   or candidate_id glob 'c_adj_*' or candidate_id glob 'c_rep_*')
+            """
+        )
+        conn.execute("update trials set lineage_id = candidate_id where lineage_id is null")
+        conn.execute(
+            "create index if not exists idx_trials_family_lineage on trials(hypothesis_family, lineage_id)"
+        )
 
     def record_trial(self, record: TrialRecord) -> None:
         with closing(self.connect()) as conn:
@@ -133,8 +162,8 @@ class MetadataStore:
                 conn.execute(
                     """
                     insert or ignore into trials
-                        (trial_id, candidate_id, experiment_id, hypothesis_family, method_id, evaluated_at)
-                    values (?, ?, ?, ?, ?, ?)
+                        (trial_id, candidate_id, experiment_id, hypothesis_family, method_id, evaluated_at, lineage_id)
+                    values (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record.trial_id,
@@ -143,22 +172,27 @@ class MetadataStore:
                         _canonical_family(record.hypothesis_family),
                         record.method_id,
                         record.evaluated_at.astimezone(UTC).isoformat(),
+                        record.lineage_id or record.candidate_id,
                     ),
                 )
 
     def trial_counts(self, hypothesis_family: str, now: datetime | None = None, window_days: int = 90) -> tuple[int, int, int]:
+        """Distinct-lineage trial counts: N for the E[max SR] deflation is the
+        number of independent search paths, so grid/repair variants and
+        re-evaluations of the same candidate must not compound it.
+        ``lineage_id`` is non-null by migration + record_trial invariant."""
         now = (now or datetime.now(UTC)).astimezone(UTC)
         cutoff = now - timedelta(days=window_days)
         with closing(self.connect()) as conn:
             family_count = conn.execute(
-                "select count(*) from trials where hypothesis_family = ?",
+                "select count(distinct lineage_id) from trials where hypothesis_family = ?",
                 (_canonical_family(hypothesis_family),),
             ).fetchone()[0]
             rolling_count = conn.execute(
-                "select count(*) from trials where evaluated_at >= ?",
+                "select count(distinct lineage_id) from trials where evaluated_at >= ?",
                 (cutoff.isoformat(),),
             ).fetchone()[0]
-            global_count = conn.execute("select count(*) from trials").fetchone()[0]
+            global_count = conn.execute("select count(distinct lineage_id) from trials").fetchone()[0]
         return int(family_count), int(rolling_count), int(global_count)
 
     def save_artifact(self, artifact_id: str, kind: str, payload: dict) -> None:

@@ -286,7 +286,10 @@ def _classify_outcome(
         if merged == "merged":
             return "research_survivor"
         return "pre_gate_skipped"
-    if backtest is not None and backtest.deflated_sharpe <= 0.0:
+    # Coarse fallback label when no research-gate result exists; keyed on the
+    # same quantity G1 gates on (0.5 = worse than a coin flip vs the expected
+    # max of the search), not the haircut DSR which is negative for everything.
+    if backtest is not None and (backtest.deflated_sharpe_prob or 0.0) < 0.5:
         return "gatecheck_failed"
     return "rejected"
 
@@ -310,6 +313,7 @@ def _build_diagnosis(
     if backtest is not None:
         parts.append(f"sr={backtest.metrics_primary.sharpe:+.2f}")
         parts.append(f"dsr={backtest.deflated_sharpe:+.3f}")
+        parts.append(f"dsr_p={(backtest.deflated_sharpe_prob or 0.0):.3f}")
         parts.append(f"turnover={backtest.factor_turnover:.3f}")
         parts.append(f"cost_bps={backtest.actual_cost_bps:.1f}")
     if near_miss is not None and near_miss.primary_reason != "production_passed":
