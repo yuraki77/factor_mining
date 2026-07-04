@@ -118,6 +118,24 @@ def test_failed_discovery_is_queued_for_resume_and_success_records_extents(tmp_p
     assert state["last_discovery_extent_ms"] == {"BTCUSDT/spot": 200 * day_ms}
 
 
+def test_discovery_child_mines_llm_hypotheses_unless_disabled(tmp_path, monkeypatch) -> None:
+    """Production discovery uses LLM-generated hypotheses; the knob exists so
+    an environment without DEEPSEEK_API_KEY can fall back to deterministic
+    defaults instead of failing every round."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(worker, "_run_supervised_child", lambda args, s, st: calls.append(args) or (0, "r"))
+    monkeypatch.setattr(factory, "current_extents_ms", lambda _s: {})
+
+    settings = _settings(tmp_path)  # use_llm defaults True
+    worker.run_discovery(settings, _store(settings))
+    assert "--llm" in calls[0]
+
+    calls.clear()
+    settings = _settings(tmp_path, use_llm=False)
+    worker.run_discovery(settings, _store(settings))
+    assert "--llm" not in calls[0]
+
+
 def test_abandon_after_sync_prunes_only_that_runs_checkpoints(tmp_path) -> None:
     """Post-sync the I3 fingerprint can never match again — the marker and
     checkpoints must go. Underscores in run ids are LIKE wildcards; a sloppy

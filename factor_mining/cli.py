@@ -27,6 +27,7 @@ exp_app = typer.Typer(help="Experiment archive commands")
 worker_app = typer.Typer(help="Worker commands")
 llm_app = typer.Typer(help="LLM provider commands")
 factory_app = typer.Typer(help="Continuous discovery factory commands")
+ledger_app = typer.Typer(help="Trial ledger commands")
 
 app.add_typer(data_app, name="data")
 app.add_typer(mine_app, name="mine")
@@ -36,6 +37,7 @@ app.add_typer(exp_app, name="exp")
 app.add_typer(worker_app, name="worker")
 app.add_typer(llm_app, name="llm")
 app.add_typer(factory_app, name="factory")
+app.add_typer(ledger_app, name="ledger")
 
 
 @app.callback()
@@ -483,10 +485,52 @@ def factory_status() -> None:
     for record in rejected[:10]:
         typer.echo(f"  {record.candidate_id[:22]:24s} {record.status_reason or ''}")
 
-    typer.echo(f"\n{len(validated)} validated of {global_lineages} independent lineages searched")
+    denominator = f"\n{len(validated)} validated of {global_lineages} independent lineages searched"
+    archived_lineages = store.archived_trial_lineage_count()
+    if archived_lineages:
+        denominator += f" ({archived_lineages} dev lineages archived out of the count)"
+    typer.echo(denominator)
     state = load_factory_state(store)
     typer.echo(f"last discovery: {state.get('last_discovery_at') or 'never'} (run {state.get('last_discovery_run_id') or '-'})")
     typer.echo(f"last recheck:   {state.get('last_recheck_at') or 'never'} (run {state.get('last_recheck_run_id') or '-'})")
+
+
+@ledger_app.command("archive")
+def ledger_archive(
+    before: str = typer.Option(..., "--before", help="Cutoff date YYYY-MM-DD (UTC): trials evaluated before this date move to trials_archive."),
+    yes: bool = typer.Option(False, "--yes", help="Required. This removes the moved lineages from live G1/FDR trial counts by design."),
+) -> None:
+    """Statistical reset (WS6b): move pre-cutoff trials out of the live ledger.
+
+    Archived lineages stop counting toward the deflated-Sharpe N and family
+    FDR multiplicity — deliberate amnesty for dev-phase trials that were spent
+    debugging the machine, not searching for alpha. Rows are preserved in
+    trials_archive, never deleted.
+    """
+    from factor_mining.models import UTC as _UTC
+
+    settings = load_settings()
+    store = MetadataStore(settings.data.sqlite_path)
+    try:
+        cutoff = datetime.strptime(before, "%Y-%m-%d").replace(tzinfo=_UTC)
+    except ValueError as exc:
+        raise typer.BadParameter("--before must be YYYY-MM-DD") from exc
+
+    hot_rows, hot_lineages, move_rows, move_lineages = store.trial_archive_preview(cutoff)
+    typer.echo(f"live ledger: {hot_rows} rows / {hot_lineages} independent lineages")
+    typer.echo(f"would move:  {move_rows} rows / {move_lineages} lineages (evaluated before {before})")
+    if move_rows == 0:
+        typer.echo("nothing to archive")
+        return
+    if not yes:
+        typer.echo("refusing without --yes: this lowers the G1/FDR multiplicity bar by design")
+        raise typer.Exit(code=1)
+    moved = store.archive_trials(cutoff)
+    _, _, global_lineages = store.trial_counts("momentum")
+    typer.echo(
+        f"archived {moved} rows; live ledger now {hot_rows - moved} rows / "
+        f"{global_lineages} lineages ({store.archived_trial_lineage_count()} lineages in trials_archive)"
+    )
 
 
 def _poll_pipeline_stop(

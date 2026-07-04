@@ -122,11 +122,10 @@ def run_discovery(settings: Settings, store: MetadataStore) -> int:
     # Snapshot extents BEFORE the child runs: bars arriving mid-run belong to
     # the next round's arrival check, not this one's baseline.
     extents = factory.current_extents_ms(settings)
-    code, run_id = _run_supervised_child(
-        ["mine", "run", "--trial-budget", str(settings.factory.trial_budget_per_round)],
-        settings,
-        store,
-    )
+    args = ["mine", "run", "--trial-budget", str(settings.factory.trial_budget_per_round)]
+    if settings.factory.use_llm:
+        args.append("--llm")
+    code, run_id = _run_supervised_child(args, settings, store)
     if code == 0:
         factory.record_discovery_completed(store, run_id=run_id or "unknown", extents_ms=extents)
     elif run_id:

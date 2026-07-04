@@ -63,6 +63,19 @@ class MetadataStore:
     
                     create index if not exists idx_trials_family_time
                         on trials(hypothesis_family, evaluated_at);
+
+                    -- WS6(b): dev-phase trials moved out of the live ledger.
+                    -- Archived lineages deliberately stop counting toward the
+                    -- DSR N / family FDR multiplicity (statistical reset).
+                    create table if not exists trials_archive (
+                        trial_id text primary key,
+                        candidate_id text not null,
+                        experiment_id text,
+                        hypothesis_family text not null,
+                        method_id text not null,
+                        evaluated_at text not null,
+                        lineage_id text
+                    );
     
                     create table if not exists artifacts (
                         artifact_id text primary key,
@@ -208,6 +221,39 @@ class MetadataStore:
             ).fetchone()[0]
             global_count = conn.execute("select count(distinct lineage_id) from trials").fetchone()[0]
         return int(family_count), int(rolling_count), int(global_count)
+
+    def trial_archive_preview(self, cutoff: datetime) -> tuple[int, int, int, int]:
+        """(live rows, live lineages, rows that would move, lineages that would move)."""
+        iso = cutoff.astimezone(UTC).isoformat()
+        with closing(self.connect()) as conn:
+            hot_rows = conn.execute("select count(*) from trials").fetchone()[0]
+            hot_lineages = conn.execute("select count(distinct lineage_id) from trials").fetchone()[0]
+            move_rows = conn.execute("select count(*) from trials where evaluated_at < ?", (iso,)).fetchone()[0]
+            move_lineages = conn.execute(
+                "select count(distinct lineage_id) from trials where evaluated_at < ?", (iso,)
+            ).fetchone()[0]
+        return int(hot_rows), int(hot_lineages), int(move_rows), int(move_lineages)
+
+    def archive_trials(self, cutoff: datetime) -> int:
+        """WS6(b) statistical reset: move pre-cutoff trials to trials_archive.
+
+        Archived lineages stop counting toward the DSR N, family FDR
+        multiplicity and the global denominator — deliberate amnesty for
+        dev-phase trials that were spent debugging the machine, not searching
+        for alpha. One transaction: every row moves or none do; rows are
+        preserved in trials_archive, never deleted."""
+        iso = cutoff.astimezone(UTC).isoformat()
+        with closing(self.connect()) as conn:
+            with conn:
+                before = conn.total_changes
+                conn.execute("insert into trials_archive select * from trials where evaluated_at < ?", (iso,))
+                inserted = conn.total_changes - before
+                conn.execute("delete from trials where evaluated_at < ?", (iso,))
+        return inserted
+
+    def archived_trial_lineage_count(self) -> int:
+        with closing(self.connect()) as conn:
+            return int(conn.execute("select count(distinct lineage_id) from trials_archive").fetchone()[0])
 
     def save_artifact(self, artifact_id: str, kind: str, payload: dict) -> None:
         with closing(self.connect()) as conn:

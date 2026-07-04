@@ -189,6 +189,7 @@ class FactoryConfig(BaseModel):
     """
 
     enabled: bool = False
+    use_llm: bool = True
     min_new_days: float = 1.0
     trial_budget_per_round: int = 400
     family_budget_floor: int = 20
