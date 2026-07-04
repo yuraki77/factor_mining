@@ -87,6 +87,7 @@ def mine_run(
     iterations: int = typer.Option(1, "--iterations", help="Legacy total rounds: 1 discovery + N-1 optimization rounds when split controls are omitted."),
     discovery_rounds: int | None = typer.Option(None, "--discovery-rounds", help="Discovery rounds that may generate broad candidates and pre-gate repairs."),
     optimization_rounds: int | None = typer.Option(None, "--optimization-rounds", help="Optimization rounds that tune survivors and stop early on convergence."),
+    trial_budget: int | None = typer.Option(None, "--trial-budget", help="Cap on NEW search lineages per discovery round (factory mode); derived candidates and survivor rechecks are exempt."),
     btc_leverage: float | None = typer.Option(None, "--btc-leverage", help="Run-scoped BTCUSDT max leverage override."),
     eth_leverage: float | None = typer.Option(None, "--eth-leverage", help="Run-scoped ETHUSDT max leverage override."),
     taker_bps: float | None = typer.Option(None, "--taker-bps", help="Run-scoped taker fee assumption, in bps."),
@@ -125,6 +126,7 @@ def mine_run(
         "iterations": iterations,
         "discovery_rounds": discovery_rounds,
         "optimization_rounds": optimization_rounds,
+        "trial_budget": trial_budget,
         "btc_leverage": btc_leverage,
         "eth_leverage": eth_leverage,
         "taker_bps": taker_bps,
@@ -145,7 +147,7 @@ def mine_run(
             for key in (
                 "use_llm", "hypothesis_count", "research_brief", "symbols", "max_workers",
                 "tail", "sample_bars", "sample_mode", "seed", "archive_top", "iterations",
-                "discovery_rounds", "optimization_rounds",
+                "discovery_rounds", "optimization_rounds", "trial_budget",
                 "btc_leverage", "eth_leverage", "taker_bps",
                 "slippage_base_bps", "slippage_k", "slippage_gamma",
             )
@@ -176,6 +178,7 @@ def mine_run(
             iterations=int(run_args["iterations"]),
             discovery_rounds=run_args.get("discovery_rounds"),
             optimization_rounds=run_args.get("optimization_rounds"),
+            trial_budget=run_args.get("trial_budget"),
             store=store,
             event_sink=sink,
             run_id=run_id,
