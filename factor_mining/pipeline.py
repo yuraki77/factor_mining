@@ -2180,6 +2180,9 @@ def _run_mining_round(
         store.save_artifact(f"near_misses_{artifact_scope}", "near_misses", {
             "items": [item.model_dump(mode="json") for item in round_near_misses],
         })
+        # Durable Watch stratum: the artifact above is overwritten per scope
+        # on the next run; the table accumulates across runs.
+        store.save_near_misses(round_near_misses, run_id=run_id)
 
     # ── HardScore ───────────────────────────────────────────────────
     t0 = time.perf_counter()
@@ -4208,12 +4211,34 @@ def _update_research_survivor_store(
             if stored is not None
             else 0
         )
+        max_failures = int(settings.factory.demotion_max_consecutive_failures)
+        prior_failures = int(stored.consecutive_recheck_failures) if stored is not None else 0
         if allow_promotion and gate.status == "production_passed":
             store.update_research_survivor_status(candidate_id, "promoted", "production_gate_passed")
         elif allow_promotion and fdr_pvalue < promotion_fdr and current_trades >= min_trades and elapsed_days >= required_days:
             store.update_research_survivor_status(candidate_id, "promoted", "promotion_criteria_met")
         elif gate.status == "rejected" and current_trades >= min_trades:
             store.update_research_survivor_status(candidate_id, "retired", "rejected_after_min_trades")
+        elif allow_promotion and gate.status == "rejected":
+            # Decay demotion: a survivor repeatedly failing holdout-grade
+            # rechecks ages out instead of shelf-squatting as a zombie. Only
+            # allow_promotion evaluations count — a 5-round run's per-round
+            # maintenance must not book 5 "consecutive" failures in one day.
+            failures = prior_failures + 1
+            if 0 < max_failures <= failures:
+                store.update_research_survivor_status(
+                    candidate_id, "retired", f"demoted_{failures}_consecutive_recheck_failures"
+                )
+            else:
+                store.update_research_survivor_fields(
+                    candidate_id, consecutive_recheck_failures=failures, last_recheck_at=now
+                )
+        elif allow_promotion:
+            # Any holdout-grade evaluation that didn't reject resets the streak.
+            reset_fields: dict[str, Any] = {"last_recheck_at": now}
+            if prior_failures:
+                reset_fields["consecutive_recheck_failures"] = 0
+            store.update_research_survivor_fields(candidate_id, **reset_fields)
 
 
 def _sum_research_gate_counts(child_history: list[dict[str, Any]]) -> dict[str, int]:

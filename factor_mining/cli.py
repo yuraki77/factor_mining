@@ -24,6 +24,7 @@ hardscore_app = typer.Typer(help="HardScore commands")
 exp_app = typer.Typer(help="Experiment archive commands")
 worker_app = typer.Typer(help="Worker commands")
 llm_app = typer.Typer(help="LLM provider commands")
+factory_app = typer.Typer(help="Continuous discovery factory commands")
 
 app.add_typer(data_app, name="data")
 app.add_typer(mine_app, name="mine")
@@ -32,6 +33,7 @@ app.add_typer(hardscore_app, name="hardscore")
 app.add_typer(exp_app, name="exp")
 app.add_typer(worker_app, name="worker")
 app.add_typer(llm_app, name="llm")
+app.add_typer(factory_app, name="factory")
 
 
 @app.callback()
@@ -395,6 +397,63 @@ def _resolve_cli_symbols(symbols: str | None, universe: str | None) -> list[str]
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from exc
     return None
+
+
+@factory_app.command("status")
+def factory_status() -> None:
+    """Promotion-ladder view: Validated / Provisional / Watch / Rejected.
+
+    Confidence here is calendar time survived, not re-analysis: Provisional
+    rows show days of fresh OOS data still required before promotion.
+    """
+    from factor_mining.factory import load_factory_state
+    from factor_mining.models import UTC as _UTC
+
+    settings = load_settings()
+    store = MetadataStore(settings.data.sqlite_path)
+    now = datetime.now(_UTC)
+
+    validated = store.list_research_survivors(status="promoted")
+    provisional = store.list_research_survivors(status="active")
+    rejected = store.list_research_survivors(status="retired")
+    watch: list = []
+    seen_watch: set[str] = set()
+    for item in store.list_near_misses(since_days=settings.factory.watch_window_days, actionable_only=True):
+        if item.candidate_id in seen_watch or item.primary_reason == "production_passed":
+            continue
+        seen_watch.add(item.candidate_id)
+        watch.append(item)
+    # family argument is irrelevant for the third (global) element
+    _, _, global_lineages = store.trial_counts("momentum")
+
+    typer.echo(f"Validated ({len(validated)}) — production tier")
+    for record in validated[:20]:
+        typer.echo(
+            f"  {record.candidate_id[:22]:24s} sharpe={record.sharpe:+.2f} "
+            f"reason={record.status_reason or 'production_gate_passed'}"
+        )
+    typer.echo(f"Provisional ({len(provisional)}) — accruing OOS days on the paper clock")
+    for record in provisional[:20]:
+        elapsed = (now - record.paper_trade_start_date.astimezone(_UTC)).days
+        days_left = max(0, int(record.required_oos_days) - elapsed)
+        trades_needed = record.current_trades + record.required_additional_trades
+        typer.echo(
+            f"  {record.candidate_id[:22]:24s} days_left={days_left:3d} "
+            f"trades={record.current_trades}/{trades_needed} "
+            f"failstreak={record.consecutive_recheck_failures}"
+        )
+    typer.echo(f"Watch ({len(watch)}) — actionable near-misses, last {settings.factory.watch_window_days}d")
+    for item in watch[:20]:
+        repairs = len(item.repair_actions) + len(item.suggested_param_variants)
+        typer.echo(f"  {item.candidate_id[:22]:24s} {item.primary_reason} repair_paths={repairs}")
+    typer.echo(f"Rejected ({len(rejected)})")
+    for record in rejected[:10]:
+        typer.echo(f"  {record.candidate_id[:22]:24s} {record.status_reason or ''}")
+
+    typer.echo(f"\n{len(validated)} validated of {global_lineages} independent lineages searched")
+    state = load_factory_state(store)
+    typer.echo(f"last discovery: {state.get('last_discovery_at') or 'never'} (run {state.get('last_discovery_run_id') or '-'})")
+    typer.echo(f"last recheck:   {state.get('last_recheck_at') or 'never'} (run {state.get('last_recheck_run_id') or '-'})")
 
 
 def _parse_csv(value: str | None) -> list[str] | None:
