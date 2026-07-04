@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from datetime import date, datetime
 from pathlib import Path
 import uuid
@@ -165,6 +167,12 @@ def mine_run(
     def sink(phase: str, level: str, message: str, payload: dict | None = None) -> None:
         store.append_pipeline_event(run_id, phase=phase, level=level, message=message, payload=payload)
 
+    # Supervisor watchdog contract: flipping this run to 'stopping' in the
+    # store asks the pipeline to halt at the next stage boundary.
+    stop_event = threading.Event()
+    threading.Thread(
+        target=_poll_pipeline_stop, args=(store, run_id, stop_event), daemon=True
+    ).start()
     try:
         result = run_pipeline(
             settings,
@@ -185,11 +193,14 @@ def mine_run(
             event_sink=sink,
             run_id=run_id,
             resume_run_id=resume_run_id,
+            stop_event=stop_event,
         )
     except Exception as exc:
         store.append_pipeline_event(run_id, phase="cli", level="error", message=str(exc))
         store.update_pipeline_run(run_id, "failed", error=str(exc))
         raise
+    finally:
+        stop_event.set()
 
     if result.errors:
         store.update_pipeline_run(run_id, "failed", error=f"{len(result.errors)} pipeline error(s)")
@@ -352,6 +363,28 @@ def worker_run() -> None:
     run_worker()
 
 
+@worker_app.command("run-once")
+def worker_run_once(
+    mode: str = typer.Option("decide", "--mode", help="decide | discovery | recheck | tick"),
+) -> None:
+    """Exercise one factory decision/action without the scheduler."""
+    from factor_mining import worker as worker_module
+
+    settings = load_settings()
+    store = MetadataStore(settings.data.sqlite_path)
+    if mode == "decide":
+        typer.echo(worker_module.decide_action(store, settings))
+    elif mode == "discovery":
+        raise typer.Exit(code=worker_module.run_discovery(settings, store))
+    elif mode == "recheck":
+        raise typer.Exit(code=worker_module.run_recheck(settings, store))
+    elif mode == "tick":
+        client = BinanceArchiveClient(settings, store)
+        worker_module.factory_tick(settings, store, client)
+    else:
+        raise typer.BadParameter("mode must be decide, discovery, recheck, or tick")
+
+
 @llm_app.command("check")
 def llm_check() -> None:
     settings = load_settings()
@@ -454,6 +487,21 @@ def factory_status() -> None:
     state = load_factory_state(store)
     typer.echo(f"last discovery: {state.get('last_discovery_at') or 'never'} (run {state.get('last_discovery_run_id') or '-'})")
     typer.echo(f"last recheck:   {state.get('last_recheck_at') or 'never'} (run {state.get('last_recheck_run_id') or '-'})")
+
+
+def _poll_pipeline_stop(
+    store: MetadataStore, run_id: str, stop_event: threading.Event, interval_s: float = 5.0
+) -> None:
+    """Set stop_event when the run's status flips to 'stopping'. A transient
+    sqlite error must not kill the graceful-stop path — retry next tick."""
+    while not stop_event.is_set():
+        try:
+            if store.pipeline_run_status(run_id) == "stopping":
+                stop_event.set()
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(interval_s)
 
 
 def _parse_csv(value: str | None) -> list[str] | None:

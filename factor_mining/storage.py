@@ -230,6 +230,17 @@ class MetadataStore:
             return None
         return json.loads(row["payload_json"])
 
+    def delete_artifacts_with_prefix(self, prefix: str) -> int:
+        """Remove artifacts by id prefix (an abandoned run's checkpoints).
+        ``_`` and ``%`` are escaped — run ids contain underscores, which are
+        LIKE wildcards and would otherwise over-match."""
+        like = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        with closing(self.connect()) as conn:
+            with conn:
+                before = conn.total_changes
+                conn.execute("delete from artifacts where artifact_id like ? escape '\\'", (like,))
+                return conn.total_changes - before
+
     def delete_artifacts(self, artifact_ids: set[str]) -> int:
         if not artifact_ids:
             return 0
