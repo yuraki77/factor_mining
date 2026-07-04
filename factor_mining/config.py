@@ -181,6 +181,26 @@ class EvolutionaryConfig(BaseModel):
     output_correlation_warn_threshold: float = 0.6
 
 
+class FactoryConfig(BaseModel):
+    """Controls for the continuous discovery factory (supervisor worker).
+
+    All factory behaviour is gated behind ``enabled`` — when False (default)
+    no scheduling happens and pipeline behaviour is unchanged.
+    """
+
+    enabled: bool = False
+    min_new_days: float = 1.0
+    trial_budget_per_round: int = 400
+    family_budget_floor: int = 20
+    demotion_max_consecutive_failures: int = 3
+    watch_window_days: int = 30
+    sync_hour_utc: int = 3
+    sync_minute_utc: int = 15
+    recheck_interval_days: int = 1
+    max_run_hours: float = 12.0
+    max_rss_gb: float | None = None
+
+
 class Settings(BaseModel):
     data: DataConfig = Field(default_factory=DataConfig)
     trial_ledger: TrialLedgerConfig = Field(default_factory=TrialLedgerConfig)
@@ -199,6 +219,7 @@ class Settings(BaseModel):
     gatecheck: GateCheckConfig = Field(default_factory=GateCheckConfig)
     exit_bounds: ExitBoundsConfig = Field(default_factory=ExitBoundsConfig)
     evolutionary: EvolutionaryConfig = Field(default_factory=EvolutionaryConfig)
+    factory: FactoryConfig = Field(default_factory=FactoryConfig)
 
 
 def apply_trade_overrides(

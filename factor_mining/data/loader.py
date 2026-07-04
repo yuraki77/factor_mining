@@ -366,6 +366,23 @@ def data_extent(settings: Settings, *, symbol: str, market: str | None = None) -
         return {}
 
 
+def data_end_ms(settings: Settings, *, symbol: str, market: str | None = None) -> int:
+    """Latest bar ``open_time`` (epoch ms) across *symbol*'s parquet, 0 when no
+    data is found. Unlike :func:`data_extent` this skips content hashing, so it
+    is cheap enough for the factory worker's nightly arrival poll."""
+    try:
+        paths = resolve_frame_paths(settings, symbol=symbol, market=market or None)
+        end_ms = 0
+        for path in paths:
+            column = pd.read_parquet(path, columns=["open_time"])["open_time"]
+            numeric = pd.to_numeric(column, errors="coerce").dropna()
+            if len(numeric):
+                end_ms = max(end_ms, int(numeric.max()))
+        return end_ms
+    except Exception:  # noqa: BLE001 - missing/corrupt parquet reads as "no data yet"
+        return 0
+
+
 def merge_funding_to_frame(frame: pd.DataFrame, funding: pd.DataFrame | None) -> pd.Series:
     """Merge 8h funding rate into 5m frame via forward fill.
 

@@ -122,3 +122,16 @@ exit_bounds:
 evolutionary:
   enabled: true
   llm_mutations: true
+
+factory:
+  enabled: false
+  min_new_days: 1.0
+  trial_budget_per_round: 400
+  family_budget_floor: 20
+  demotion_max_consecutive_failures: 3
+  watch_window_days: 30
+  sync_hour_utc: 3
+  sync_minute_utc: 15
+  recheck_interval_days: 1
+  max_run_hours: 12.0
+  max_rss_gb: null
