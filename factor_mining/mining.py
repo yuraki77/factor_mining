@@ -564,11 +564,14 @@ def factor_signal(
         return -np.tanh(z / 2.0)
     if family == "volatility":
         vol = close.pct_change().rolling(lookback).std()
-        vol_median = vol.rolling(lookback * 4, min_periods=lookback).median()
-        vol_iqr = vol.rolling(lookback * 4, min_periods=lookback).apply(
-            lambda x: x.quantile(0.75) - x.quantile(0.25) if len(x) > 1 else 1.0,
-            raw=False,
-        ).replace(0, np.nan)
+        window = vol.rolling(lookback * 4, min_periods=lookback)
+        vol_median = window.median()
+        # Cython rolling quantiles, NOT .apply(lambda: x.quantile(...)): the
+        # per-window Python callback took ~238x longer (minutes per candidate
+        # on a 666k-bar frame, GIL-bound across symbol threads) and stalled a
+        # full run for ~50 minutes in signal building. Same interpolation,
+        # bit-identical output.
+        vol_iqr = (window.quantile(0.75) - window.quantile(0.25)).replace(0, np.nan)
         z = ((vol - vol_median) / vol_iqr).replace([np.inf, -np.inf], np.nan).fillna(0.0)
         return np.tanh(z / 2.0)
     if family == "funding_basis":
