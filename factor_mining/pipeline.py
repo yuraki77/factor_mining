@@ -57,6 +57,7 @@ from factor_mining.models import (
     ResearchSurvivorRecord,
     TrialRecord,
 )
+from factor_mining.factory import RoundBudget
 from factor_mining.registry import METHOD_REGISTRY
 from factor_mining.stats.metrics import (
     annualization_factor,
@@ -643,6 +644,7 @@ def run_pipeline(
     resume_run_id: str | None = None,
     seed_hypotheses: list[HypothesisSpec] | None = None,
     direction_scope: dict[str, Any] | None = None,
+    trial_budget: int | None = None,
     stop_event: threading.Event | None = None,
 ) -> PipelineResult:
     """Execute the full factor mining workflow with optional iterative optimization.
@@ -657,6 +659,10 @@ def run_pipeline(
             this runs one discovery round plus iterations - 1 optimization rounds.
         discovery_rounds: Rounds that can generate broad candidates and repairs.
         optimization_rounds: Rounds that tune survivor candidates and stop on convergence.
+        trial_budget: Cap on NEW search lineages admitted per discovery round
+            (None = unlimited, today's behavior). Derived candidates and
+            survivor rechecks are exempt — they do not raise the
+            independent-trial count.
     """
     if tail is not None and sample_bars is not None:
         raise ValueError("--tail and --sample-bars are mutually exclusive")
@@ -700,6 +706,7 @@ def run_pipeline(
             resume_run_id=resume_run_id,
             seed_hypotheses=seed_hypotheses,
             direction_scope=normalized_scope,
+            trial_budget=trial_budget,
             stop_event=stop_event,
         )
     finally:
@@ -826,6 +833,7 @@ def _run_pipeline_impl(
     resume_run_id: str | None,
     seed_hypotheses: list[HypothesisSpec] | None,
     direction_scope: dict[str, Any] | None,
+    trial_budget: int | None = None,
     stop_event: threading.Event | None = None,
 ) -> PipelineResult:
     run_args = _run_checkpoint_args(
@@ -842,6 +850,7 @@ def _run_pipeline_impl(
         discovery_rounds=discovery_rounds,
         optimization_rounds=optimization_rounds,
         direction_scope=direction_scope,
+        trial_budget=trial_budget,
     )
     checkpoint_source_run_id = resume_run_id or run_id
     active_survivor_records = store.list_research_survivors(status="active") if store else []
@@ -1045,11 +1054,22 @@ def _run_pipeline_impl(
     cumulative_trial_counts: dict[str, int] = {}
     round_num = 0
     previous_optimization_signature: str | None = None
+    round_budget: RoundBudget | None = None
 
     for round_num in range(1, iterations + 1):
         phase = "discovery" if round_num <= discovery_rounds else "optimization"
         phase_round = round_num if phase == "discovery" else round_num - discovery_rounds
         phase_total = discovery_rounds if phase == "discovery" else optimization_rounds
+        if trial_budget is not None and phase == "discovery":
+            # Fresh budget per discovery round. Optimization rounds keep the
+            # last discovery round's (possibly exhausted) budget, so late fresh
+            # lineages — e.g. next-hypothesis candidates minted at the end of a
+            # discovery round — cannot bypass the cap by landing one round later.
+            round_budget = RoundBudget(
+                trial_budget,
+                (candidate.hypothesis_family for candidate in current_candidates),
+                family_floor=settings.factory.family_budget_floor,
+            )
         _step_header(
             2 + round_num,
             f"{phase.title()} round {phase_round}/{phase_total} — {len(current_candidates)} candidates",
@@ -1108,6 +1128,7 @@ def _run_pipeline_impl(
                 run_args=run_args,
                 stop_event=stop_event,
                 trial_counts_lock=trial_counts_lock,
+                round_budget=round_budget,
             )
 
         round_data_by_key: dict[tuple[str, str], RoundOutput] = {}
@@ -1722,6 +1743,7 @@ def _run_mining_round(
     run_args: dict[str, Any] | None = None,
     stop_event: threading.Event | None = None,
     trial_counts_lock: Any | None = None,
+    round_budget: RoundBudget | None = None,
 ) -> RoundOutput:
     """Execute one complete mining round: backtest → gatecheck → hardscore → optimize."""
     artifact_scope = artifact_scope or f"round{round_num}"
@@ -1770,6 +1792,21 @@ def _run_mining_round(
             f"  Funding factor_signal candidates skipped: {skipped_funding}; "
             "supplemental funding features still allowed"
         )
+
+    # Budget must bind before _record_candidate_trials: a dropped candidate
+    # never enters the ledger, so the independent-trial count N stays honest.
+    budget_dropped_by_family: dict[str, int] = {}
+    if round_budget is not None:
+        current_candidates, budget_dropped_by_family = round_budget.admit(
+            current_candidates,
+            lineage_root=_lineage_root_id,
+            survivor_candidate_ids=survivor_candidate_ids,
+        )
+        if budget_dropped_by_family:
+            _log(
+                f"  Budget: dropped {sum(budget_dropped_by_family.values())} fresh-lineage candidates "
+                f"{dict(sorted(budget_dropped_by_family.items()))}"
+            )
 
     trial_counts_by_candidate = _record_candidate_trials(
         current_candidates,
@@ -1879,6 +1916,16 @@ def _run_mining_round(
 
     if pre_gate_candidates:
         t_repair = time.perf_counter()
+        if round_budget is not None:
+            # Defense-in-depth: pre-gate output inherits lineage by
+            # construction, so this normally admits everything for free.
+            pre_gate_candidates, pre_gate_dropped = round_budget.admit(
+                pre_gate_candidates,
+                lineage_root=_lineage_root_id,
+                survivor_candidate_ids=survivor_candidate_ids,
+            )
+            for family, count in pre_gate_dropped.items():
+                budget_dropped_by_family[family] = budget_dropped_by_family.get(family, 0) + count
         repair_counts = _record_candidate_trials(
             pre_gate_candidates,
             store,
@@ -2133,6 +2180,9 @@ def _run_mining_round(
         store.save_artifact(f"near_misses_{artifact_scope}", "near_misses", {
             "items": [item.model_dump(mode="json") for item in round_near_misses],
         })
+        # Durable Watch stratum: the artifact above is overwritten per scope
+        # on the next run; the table accumulates across runs.
+        store.save_near_misses(round_near_misses, run_id=run_id)
 
     # ── HardScore ───────────────────────────────────────────────────
     t0 = time.perf_counter()
@@ -2362,6 +2412,7 @@ def _run_mining_round(
         "num_pre_gate_repairs_merged": pre_gate_merged,
         "num_pre_gate_repairs_rejected": pre_gate_rejected,
         "repair_merge_diagnostics": repair_merge_diagnostics,
+        "budget_dropped_by_family": dict(sorted(budget_dropped_by_family.items())),
         "split": {
             "discovery_bars": len(discovery_frame),
             "repair_validation_bars": len(repair_validation_frame),
@@ -4160,12 +4211,34 @@ def _update_research_survivor_store(
             if stored is not None
             else 0
         )
+        max_failures = int(settings.factory.demotion_max_consecutive_failures)
+        prior_failures = int(stored.consecutive_recheck_failures) if stored is not None else 0
         if allow_promotion and gate.status == "production_passed":
             store.update_research_survivor_status(candidate_id, "promoted", "production_gate_passed")
         elif allow_promotion and fdr_pvalue < promotion_fdr and current_trades >= min_trades and elapsed_days >= required_days:
             store.update_research_survivor_status(candidate_id, "promoted", "promotion_criteria_met")
         elif gate.status == "rejected" and current_trades >= min_trades:
             store.update_research_survivor_status(candidate_id, "retired", "rejected_after_min_trades")
+        elif allow_promotion and gate.status == "rejected":
+            # Decay demotion: a survivor repeatedly failing holdout-grade
+            # rechecks ages out instead of shelf-squatting as a zombie. Only
+            # allow_promotion evaluations count — a 5-round run's per-round
+            # maintenance must not book 5 "consecutive" failures in one day.
+            failures = prior_failures + 1
+            if 0 < max_failures <= failures:
+                store.update_research_survivor_status(
+                    candidate_id, "retired", f"demoted_{failures}_consecutive_recheck_failures"
+                )
+            else:
+                store.update_research_survivor_fields(
+                    candidate_id, consecutive_recheck_failures=failures, last_recheck_at=now
+                )
+        elif allow_promotion:
+            # Any holdout-grade evaluation that didn't reject resets the streak.
+            reset_fields: dict[str, Any] = {"last_recheck_at": now}
+            if prior_failures:
+                reset_fields["consecutive_recheck_failures"] = 0
+            store.update_research_survivor_fields(candidate_id, **reset_fields)
 
 
 def _sum_research_gate_counts(child_history: list[dict[str, Any]]) -> dict[str, int]:

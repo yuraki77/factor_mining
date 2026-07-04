@@ -215,6 +215,10 @@ class ResearchSurvivorRecord(BaseModel):
     production_gate_failures: list[str] = Field(default_factory=list)
     evidence_flags: dict[str, float | int | str | bool | None] = Field(default_factory=dict)
     status_reason: str | None = None
+    # Recheck bookkeeping (defaults so pre-factory payload_json rows parse):
+    # holdout-grade rejections in a row; K of them demotes to retired.
+    consecutive_recheck_failures: int = 0
+    last_recheck_at: datetime | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 

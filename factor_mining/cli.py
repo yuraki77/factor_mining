@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from datetime import date, datetime
 from pathlib import Path
 import uuid
@@ -24,6 +26,8 @@ hardscore_app = typer.Typer(help="HardScore commands")
 exp_app = typer.Typer(help="Experiment archive commands")
 worker_app = typer.Typer(help="Worker commands")
 llm_app = typer.Typer(help="LLM provider commands")
+factory_app = typer.Typer(help="Continuous discovery factory commands")
+ledger_app = typer.Typer(help="Trial ledger commands")
 
 app.add_typer(data_app, name="data")
 app.add_typer(mine_app, name="mine")
@@ -32,6 +36,8 @@ app.add_typer(hardscore_app, name="hardscore")
 app.add_typer(exp_app, name="exp")
 app.add_typer(worker_app, name="worker")
 app.add_typer(llm_app, name="llm")
+app.add_typer(factory_app, name="factory")
+app.add_typer(ledger_app, name="ledger")
 
 
 @app.callback()
@@ -87,6 +93,7 @@ def mine_run(
     iterations: int = typer.Option(1, "--iterations", help="Legacy total rounds: 1 discovery + N-1 optimization rounds when split controls are omitted."),
     discovery_rounds: int | None = typer.Option(None, "--discovery-rounds", help="Discovery rounds that may generate broad candidates and pre-gate repairs."),
     optimization_rounds: int | None = typer.Option(None, "--optimization-rounds", help="Optimization rounds that tune survivors and stop early on convergence."),
+    trial_budget: int | None = typer.Option(None, "--trial-budget", help="Cap on NEW search lineages per discovery round (factory mode); derived candidates and survivor rechecks are exempt."),
     btc_leverage: float | None = typer.Option(None, "--btc-leverage", help="Run-scoped BTCUSDT max leverage override."),
     eth_leverage: float | None = typer.Option(None, "--eth-leverage", help="Run-scoped ETHUSDT max leverage override."),
     taker_bps: float | None = typer.Option(None, "--taker-bps", help="Run-scoped taker fee assumption, in bps."),
@@ -125,6 +132,7 @@ def mine_run(
         "iterations": iterations,
         "discovery_rounds": discovery_rounds,
         "optimization_rounds": optimization_rounds,
+        "trial_budget": trial_budget,
         "btc_leverage": btc_leverage,
         "eth_leverage": eth_leverage,
         "taker_bps": taker_bps,
@@ -145,7 +153,7 @@ def mine_run(
             for key in (
                 "use_llm", "hypothesis_count", "research_brief", "symbols", "max_workers",
                 "tail", "sample_bars", "sample_mode", "seed", "archive_top", "iterations",
-                "discovery_rounds", "optimization_rounds",
+                "discovery_rounds", "optimization_rounds", "trial_budget",
                 "btc_leverage", "eth_leverage", "taker_bps",
                 "slippage_base_bps", "slippage_k", "slippage_gamma",
             )
@@ -161,6 +169,12 @@ def mine_run(
     def sink(phase: str, level: str, message: str, payload: dict | None = None) -> None:
         store.append_pipeline_event(run_id, phase=phase, level=level, message=message, payload=payload)
 
+    # Supervisor watchdog contract: flipping this run to 'stopping' in the
+    # store asks the pipeline to halt at the next stage boundary.
+    stop_event = threading.Event()
+    threading.Thread(
+        target=_poll_pipeline_stop, args=(store, run_id, stop_event), daemon=True
+    ).start()
     try:
         result = run_pipeline(
             settings,
@@ -176,15 +190,19 @@ def mine_run(
             iterations=int(run_args["iterations"]),
             discovery_rounds=run_args.get("discovery_rounds"),
             optimization_rounds=run_args.get("optimization_rounds"),
+            trial_budget=run_args.get("trial_budget"),
             store=store,
             event_sink=sink,
             run_id=run_id,
             resume_run_id=resume_run_id,
+            stop_event=stop_event,
         )
     except Exception as exc:
         store.append_pipeline_event(run_id, phase="cli", level="error", message=str(exc))
         store.update_pipeline_run(run_id, "failed", error=str(exc))
         raise
+    finally:
+        stop_event.set()
 
     if result.errors:
         store.update_pipeline_run(run_id, "failed", error=f"{len(result.errors)} pipeline error(s)")
@@ -347,6 +365,28 @@ def worker_run() -> None:
     run_worker()
 
 
+@worker_app.command("run-once")
+def worker_run_once(
+    mode: str = typer.Option("decide", "--mode", help="decide | discovery | recheck | tick"),
+) -> None:
+    """Exercise one factory decision/action without the scheduler."""
+    from factor_mining import worker as worker_module
+
+    settings = load_settings()
+    store = MetadataStore(settings.data.sqlite_path)
+    if mode == "decide":
+        typer.echo(worker_module.decide_action(store, settings))
+    elif mode == "discovery":
+        raise typer.Exit(code=worker_module.run_discovery(settings, store))
+    elif mode == "recheck":
+        raise typer.Exit(code=worker_module.run_recheck(settings, store))
+    elif mode == "tick":
+        client = BinanceArchiveClient(settings, store)
+        worker_module.factory_tick(settings, store, client)
+    else:
+        raise typer.BadParameter("mode must be decide, discovery, recheck, or tick")
+
+
 @llm_app.command("check")
 def llm_check() -> None:
     settings = load_settings()
@@ -392,6 +432,120 @@ def _resolve_cli_symbols(symbols: str | None, universe: str | None) -> list[str]
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from exc
     return None
+
+
+@factory_app.command("status")
+def factory_status() -> None:
+    """Promotion-ladder view: Validated / Provisional / Watch / Rejected.
+
+    Confidence here is calendar time survived, not re-analysis: Provisional
+    rows show days of fresh OOS data still required before promotion.
+    """
+    from factor_mining.factory import load_factory_state
+    from factor_mining.models import UTC as _UTC
+
+    settings = load_settings()
+    store = MetadataStore(settings.data.sqlite_path)
+    now = datetime.now(_UTC)
+
+    validated = store.list_research_survivors(status="promoted")
+    provisional = store.list_research_survivors(status="active")
+    rejected = store.list_research_survivors(status="retired")
+    watch: list = []
+    seen_watch: set[str] = set()
+    for item in store.list_near_misses(since_days=settings.factory.watch_window_days, actionable_only=True):
+        if item.candidate_id in seen_watch or item.primary_reason == "production_passed":
+            continue
+        seen_watch.add(item.candidate_id)
+        watch.append(item)
+    # family argument is irrelevant for the third (global) element
+    _, _, global_lineages = store.trial_counts("momentum")
+
+    typer.echo(f"Validated ({len(validated)}) — production tier")
+    for record in validated[:20]:
+        typer.echo(
+            f"  {record.candidate_id[:22]:24s} sharpe={record.sharpe:+.2f} "
+            f"reason={record.status_reason or 'production_gate_passed'}"
+        )
+    typer.echo(f"Provisional ({len(provisional)}) — accruing OOS days on the paper clock")
+    for record in provisional[:20]:
+        elapsed = (now - record.paper_trade_start_date.astimezone(_UTC)).days
+        days_left = max(0, int(record.required_oos_days) - elapsed)
+        trades_needed = record.current_trades + record.required_additional_trades
+        typer.echo(
+            f"  {record.candidate_id[:22]:24s} days_left={days_left:3d} "
+            f"trades={record.current_trades}/{trades_needed} "
+            f"failstreak={record.consecutive_recheck_failures}"
+        )
+    typer.echo(f"Watch ({len(watch)}) — actionable near-misses, last {settings.factory.watch_window_days}d")
+    for item in watch[:20]:
+        repairs = len(item.repair_actions) + len(item.suggested_param_variants)
+        typer.echo(f"  {item.candidate_id[:22]:24s} {item.primary_reason} repair_paths={repairs}")
+    typer.echo(f"Rejected ({len(rejected)})")
+    for record in rejected[:10]:
+        typer.echo(f"  {record.candidate_id[:22]:24s} {record.status_reason or ''}")
+
+    denominator = f"\n{len(validated)} validated of {global_lineages} independent lineages searched"
+    archived_lineages = store.archived_trial_lineage_count()
+    if archived_lineages:
+        denominator += f" ({archived_lineages} dev lineages archived out of the count)"
+    typer.echo(denominator)
+    state = load_factory_state(store)
+    typer.echo(f"last discovery: {state.get('last_discovery_at') or 'never'} (run {state.get('last_discovery_run_id') or '-'})")
+    typer.echo(f"last recheck:   {state.get('last_recheck_at') or 'never'} (run {state.get('last_recheck_run_id') or '-'})")
+
+
+@ledger_app.command("archive")
+def ledger_archive(
+    before: str = typer.Option(..., "--before", help="Cutoff date YYYY-MM-DD (UTC): trials evaluated before this date move to trials_archive."),
+    yes: bool = typer.Option(False, "--yes", help="Required. This removes the moved lineages from live G1/FDR trial counts by design."),
+) -> None:
+    """Statistical reset (WS6b): move pre-cutoff trials out of the live ledger.
+
+    Archived lineages stop counting toward the deflated-Sharpe N and family
+    FDR multiplicity — deliberate amnesty for dev-phase trials that were spent
+    debugging the machine, not searching for alpha. Rows are preserved in
+    trials_archive, never deleted.
+    """
+    from factor_mining.models import UTC as _UTC
+
+    settings = load_settings()
+    store = MetadataStore(settings.data.sqlite_path)
+    try:
+        cutoff = datetime.strptime(before, "%Y-%m-%d").replace(tzinfo=_UTC)
+    except ValueError as exc:
+        raise typer.BadParameter("--before must be YYYY-MM-DD") from exc
+
+    hot_rows, hot_lineages, move_rows, move_lineages = store.trial_archive_preview(cutoff)
+    typer.echo(f"live ledger: {hot_rows} rows / {hot_lineages} independent lineages")
+    typer.echo(f"would move:  {move_rows} rows / {move_lineages} lineages (evaluated before {before})")
+    if move_rows == 0:
+        typer.echo("nothing to archive")
+        return
+    if not yes:
+        typer.echo("refusing without --yes: this lowers the G1/FDR multiplicity bar by design")
+        raise typer.Exit(code=1)
+    moved = store.archive_trials(cutoff)
+    _, _, global_lineages = store.trial_counts("momentum")
+    typer.echo(
+        f"archived {moved} rows; live ledger now {hot_rows - moved} rows / "
+        f"{global_lineages} lineages ({store.archived_trial_lineage_count()} lineages in trials_archive)"
+    )
+
+
+def _poll_pipeline_stop(
+    store: MetadataStore, run_id: str, stop_event: threading.Event, interval_s: float = 5.0
+) -> None:
+    """Set stop_event when the run's status flips to 'stopping'. A transient
+    sqlite error must not kill the graceful-stop path — retry next tick."""
+    while not stop_event.is_set():
+        try:
+            if store.pipeline_run_status(run_id) == "stopping":
+                stop_event.set()
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(interval_s)
 
 
 def _parse_csv(value: str | None) -> list[str] | None:

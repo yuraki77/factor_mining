@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from factor_mining.models import ResearchSurvivorRecord, TrajectoryRecord, TrialRecord, UTC
+from factor_mining.models import NearMissAnalysis, ResearchSurvivorRecord, TrajectoryRecord, TrialRecord, UTC
 
 
 def _canonical_family(hypothesis_family: str) -> str:
@@ -63,6 +63,19 @@ class MetadataStore:
     
                     create index if not exists idx_trials_family_time
                         on trials(hypothesis_family, evaluated_at);
+
+                    -- WS6(b): dev-phase trials moved out of the live ledger.
+                    -- Archived lineages deliberately stop counting toward the
+                    -- DSR N / family FDR multiplicity (statistical reset).
+                    create table if not exists trials_archive (
+                        trial_id text primary key,
+                        candidate_id text not null,
+                        experiment_id text,
+                        hypothesis_family text not null,
+                        method_id text not null,
+                        evaluated_at text not null,
+                        lineage_id text
+                    );
     
                     create table if not exists artifacts (
                         artifact_id text primary key,
@@ -111,6 +124,20 @@ class MetadataStore:
 
                     create index if not exists idx_research_survivors_status_updated
                         on research_survivors(status, updated_at);
+
+                    create table if not exists near_misses (
+                        id text primary key,
+                        candidate_id text not null,
+                        experiment_id text not null,
+                        run_id text,
+                        primary_reason text not null,
+                        actionable integer not null,
+                        payload_json text not null,
+                        created_at text not null
+                    );
+
+                    create index if not exists idx_near_misses_created
+                        on near_misses(created_at);
 
                     create table if not exists trajectories (
                         trajectory_id text primary key,
@@ -195,6 +222,39 @@ class MetadataStore:
             global_count = conn.execute("select count(distinct lineage_id) from trials").fetchone()[0]
         return int(family_count), int(rolling_count), int(global_count)
 
+    def trial_archive_preview(self, cutoff: datetime) -> tuple[int, int, int, int]:
+        """(live rows, live lineages, rows that would move, lineages that would move)."""
+        iso = cutoff.astimezone(UTC).isoformat()
+        with closing(self.connect()) as conn:
+            hot_rows = conn.execute("select count(*) from trials").fetchone()[0]
+            hot_lineages = conn.execute("select count(distinct lineage_id) from trials").fetchone()[0]
+            move_rows = conn.execute("select count(*) from trials where evaluated_at < ?", (iso,)).fetchone()[0]
+            move_lineages = conn.execute(
+                "select count(distinct lineage_id) from trials where evaluated_at < ?", (iso,)
+            ).fetchone()[0]
+        return int(hot_rows), int(hot_lineages), int(move_rows), int(move_lineages)
+
+    def archive_trials(self, cutoff: datetime) -> int:
+        """WS6(b) statistical reset: move pre-cutoff trials to trials_archive.
+
+        Archived lineages stop counting toward the DSR N, family FDR
+        multiplicity and the global denominator — deliberate amnesty for
+        dev-phase trials that were spent debugging the machine, not searching
+        for alpha. One transaction: every row moves or none do; rows are
+        preserved in trials_archive, never deleted."""
+        iso = cutoff.astimezone(UTC).isoformat()
+        with closing(self.connect()) as conn:
+            with conn:
+                before = conn.total_changes
+                conn.execute("insert into trials_archive select * from trials where evaluated_at < ?", (iso,))
+                inserted = conn.total_changes - before
+                conn.execute("delete from trials where evaluated_at < ?", (iso,))
+        return inserted
+
+    def archived_trial_lineage_count(self) -> int:
+        with closing(self.connect()) as conn:
+            return int(conn.execute("select count(distinct lineage_id) from trials_archive").fetchone()[0])
+
     def save_artifact(self, artifact_id: str, kind: str, payload: dict) -> None:
         with closing(self.connect()) as conn:
             with conn:
@@ -215,6 +275,17 @@ class MetadataStore:
         if row is None:
             return None
         return json.loads(row["payload_json"])
+
+    def delete_artifacts_with_prefix(self, prefix: str) -> int:
+        """Remove artifacts by id prefix (an abandoned run's checkpoints).
+        ``_`` and ``%`` are escaped — run ids contain underscores, which are
+        LIKE wildcards and would otherwise over-match."""
+        like = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        with closing(self.connect()) as conn:
+            with conn:
+                before = conn.total_changes
+                conn.execute("delete from artifacts where artifact_id like ? escape '\\'", (like,))
+                return conn.total_changes - before
 
     def delete_artifacts(self, artifact_ids: set[str]) -> int:
         if not artifact_ids:
@@ -428,9 +499,14 @@ class MetadataStore:
             for record in records:
                 previous = existing.get(record.candidate_id)
                 if previous is not None:
+                    # Freshly built round records always default the recheck
+                    # bookkeeping to zero — preserve it like the paper clock,
+                    # or every upsert would wipe the demotion failure streak.
                     record = record.model_copy(update={
                         "paper_trade_start_date": previous.paper_trade_start_date,
                         "created_at": previous.created_at,
+                        "consecutive_recheck_failures": previous.consecutive_recheck_failures,
+                        "last_recheck_at": previous.last_recheck_at,
                     })
                 rows.append((
                     record.candidate_id,
@@ -500,6 +576,100 @@ class MetadataStore:
                     ),
                 )
 
+    def update_research_survivor_fields(self, candidate_id: str, **fields: Any) -> None:
+        """Patch payload fields on one survivor without rebuilding the record
+        (recheck bookkeeping: failure streak, last_recheck_at)."""
+        if not fields:
+            return
+        with closing(self.connect()) as conn:
+            row = conn.execute(
+                "select payload_json from research_survivors where candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if row is None:
+                return
+            record = ResearchSurvivorRecord.model_validate(json.loads(row["payload_json"]))
+            now = datetime.now(UTC)
+            updated = record.model_copy(update={**fields, "updated_at": now})
+            with conn:
+                conn.execute(
+                    "update research_survivors set payload_json = ?, updated_at = ? where candidate_id = ?",
+                    (
+                        json.dumps(updated.model_dump(mode="json"), default=str, sort_keys=True),
+                        now.isoformat(),
+                        candidate_id,
+                    ),
+                )
+
+    # ── Near-miss methods (durable Watch stratum) ───────────────────
+
+    def save_near_misses(self, items: list[NearMissAnalysis], run_id: str | None = None) -> None:
+        """Accumulate near-misses across runs. The per-round artifact is
+        insert-or-replace on artifact_scope and vanishes on the next run;
+        this table is what makes the Watch stratum survive."""
+        if not items:
+            return
+        now = datetime.now(UTC).isoformat()
+        rows = [
+            (
+                f"{item.experiment_id}:{item.candidate_id}",
+                item.candidate_id,
+                item.experiment_id,
+                run_id,
+                item.primary_reason,
+                int(item.actionable),
+                json.dumps(item.model_dump(mode="json"), default=str, sort_keys=True),
+                now,
+            )
+            for item in items
+        ]
+        with closing(self.connect()) as conn:
+            with conn:
+                conn.executemany(
+                    """
+                    insert into near_misses
+                        (id, candidate_id, experiment_id, run_id, primary_reason, actionable, payload_json, created_at)
+                    values (?, ?, ?, ?, ?, ?, ?, ?)
+                    on conflict(id) do update set
+                        run_id = excluded.run_id,
+                        primary_reason = excluded.primary_reason,
+                        actionable = excluded.actionable,
+                        payload_json = excluded.payload_json,
+                        created_at = excluded.created_at
+                    """,
+                    rows,
+                )
+
+    def list_near_misses(
+        self,
+        *,
+        since_days: int | None = None,
+        actionable_only: bool = False,
+        limit: int = 500,
+    ) -> list[NearMissAnalysis]:
+        query = "select payload_json from near_misses"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if since_days is not None:
+            clauses.append("created_at >= ?")
+            params.append((datetime.now(UTC) - timedelta(days=since_days)).isoformat())
+        if actionable_only:
+            clauses.append("actionable = 1")
+        if clauses:
+            query += " where " + " and ".join(clauses)
+        query += " order by created_at desc limit ?"
+        params.append(limit)
+        with closing(self.connect()) as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [NearMissAnalysis.model_validate(json.loads(row["payload_json"])) for row in rows]
+
+    def prune_near_misses(self, *, before_days: int) -> int:
+        cutoff = (datetime.now(UTC) - timedelta(days=before_days)).isoformat()
+        with closing(self.connect()) as conn:
+            with conn:
+                before = conn.total_changes
+                conn.execute("delete from near_misses where created_at < ?", (cutoff,))
+                return conn.total_changes - before
 
     # ── Trajectory methods ──────────────────────────────────────────
 
