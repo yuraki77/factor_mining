@@ -136,6 +136,69 @@ def test_discovery_child_mines_llm_hypotheses_unless_disabled(tmp_path, monkeypa
     assert "--llm" not in calls[0]
 
 
+def test_worker_cap_flows_to_both_child_kinds(tmp_path, monkeypatch) -> None:
+    """max_workers is the lever that lowers the RAM peak (fewer pool
+    processes) rather than merely detecting it; both discovery and recheck
+    children must inherit it, and no flag may leak when unset."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(worker, "_run_supervised_child", lambda args, s, st: calls.append(args) or (0, "r"))
+    monkeypatch.setattr(factory, "current_extents_ms", lambda _s: {})
+
+    settings = _settings(tmp_path, max_workers=4)
+    worker.run_discovery(settings, _store(settings))
+    worker.run_recheck(settings, _store(settings))
+    assert all("--workers" in c and "4" in c for c in calls)
+
+    calls.clear()
+    settings = _settings(tmp_path)  # max_workers unset
+    worker.run_discovery(settings, _store(settings))
+    assert "--workers" not in calls[0]
+
+
+class _FakeProc:
+    def __init__(self, rss: int, children: list["_FakeProc"] | None = None, dying: bool = False) -> None:
+        self._rss = rss
+        self._children = children or []
+        self._dying = dying
+
+    def memory_info(self):
+        if self._dying:
+            raise RuntimeError("process already gone")
+        from types import SimpleNamespace
+
+        return SimpleNamespace(rss=self._rss)
+
+    def children(self, recursive: bool = False):
+        return list(self._children)
+
+
+def test_tree_rss_counts_the_pool_not_just_the_parent() -> None:
+    """The pipeline's memory lives in its ProcessPoolExecutor workers; a
+    parent-only reading under-measures by roughly the whole pool and the
+    watchdog would never fire before the machine swap-storms."""
+    parent = _FakeProc(1_000, children=[_FakeProc(7_000), _FakeProc(9_000), _FakeProc(5_000, dying=True)])
+    assert worker._tree_rss_bytes(parent) == 17_000  # dying worker skipped, not fatal
+
+
+def test_supervise_trips_on_process_tree_rss(tmp_path, monkeypatch) -> None:
+    settings = _settings(tmp_path, max_rss_gb=0.001)
+    store = _store(settings)
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    monkeypatch.setattr(worker, "_tree_rss_bytes", lambda proc: 10**12)
+    seen: dict = {}
+
+    def fake_escalate(proc, st, *, run_id, reason, grace_seconds=0.1):
+        seen["reason"] = reason
+        proc.kill()
+        proc.wait()
+        return -9
+
+    monkeypatch.setattr(worker, "_escalate", fake_escalate)
+    code = worker._supervise(process, store, settings, run_id=None)
+    assert seen["reason"] == "max_rss_gb"
+    assert code == -9
+
+
 def test_abandon_after_sync_prunes_only_that_runs_checkpoints(tmp_path) -> None:
     """Post-sync the I3 fingerprint can never match again — the marker and
     checkpoints must go. Underscores in run ids are LIKE wildcards; a sloppy

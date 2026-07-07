@@ -21,7 +21,7 @@ import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 
@@ -125,6 +125,7 @@ def run_discovery(settings: Settings, store: MetadataStore) -> int:
     args = ["mine", "run", "--trial-budget", str(settings.factory.trial_budget_per_round)]
     if settings.factory.use_llm:
         args.append("--llm")
+    args.extend(_worker_cap_args(settings))
     code, run_id = _run_supervised_child(args, settings, store)
     if code == 0:
         factory.record_discovery_completed(store, run_id=run_id or "unknown", extents_ms=extents)
@@ -135,7 +136,8 @@ def run_discovery(settings: Settings, store: MetadataStore) -> int:
 
 
 def run_recheck(settings: Settings, store: MetadataStore) -> int:
-    code, run_id = _run_supervised_child(["mine", "verify-survivors"], settings, store)
+    args = ["mine", "verify-survivors", *_worker_cap_args(settings)]
+    code, run_id = _run_supervised_child(args, settings, store)
     if code == 0:
         factory.record_recheck_completed(store, run_id=run_id or "unknown")
     else:
@@ -202,6 +204,26 @@ def _mark_stale_run_failed(store: MetadataStore, settings: Settings) -> None:
         logger.warning("marked stale run %s failed (age %.1fh)", active["run_id"], age_hours)
 
 
+def _worker_cap_args(settings: Settings) -> list[str]:
+    if settings.factory.max_workers is None:
+        return []
+    return ["--workers", str(int(settings.factory.max_workers))]
+
+
+def _tree_rss_bytes(proc: Any) -> int:
+    """RSS of the child and its whole process tree. The pipeline fans out
+    into a ProcessPoolExecutor, so the pool workers — not the direct child —
+    hold most of the memory; a parent-only check under-measures by roughly
+    the entire pool."""
+    total = int(proc.memory_info().rss)
+    for child in proc.children(recursive=True):
+        try:
+            total += int(child.memory_info().rss)
+        except Exception:  # noqa: BLE001 - pool workers come and go mid-scan
+            continue
+    return total
+
+
 def _run_supervised_child(
     cli_args: list[str], settings: Settings, store: MetadataStore
 ) -> tuple[int, str | None]:
@@ -253,7 +275,7 @@ def _supervise(
             breach = "max_run_hours"
         elif proc_info is not None and rss_cap_bytes is not None:
             try:
-                if proc_info.memory_info().rss > rss_cap_bytes:
+                if _tree_rss_bytes(proc_info) > rss_cap_bytes:
                     breach = "max_rss_gb"
             except Exception:  # noqa: BLE001 - child may be exiting under us
                 proc_info = None

@@ -135,4 +135,8 @@ factory:
   sync_minute_utc: 15
   recheck_interval_days: 1
   max_run_hours: 12.0
-  max_rss_gb: null
+  # 24 GB machine, ~20 GB historical peak: 21 is the "about to swap-storm"
+  # tripwire (process-tree RSS), and 4 workers keeps the peak down in the
+  # first place. Watchdog kills are safe — checkpoints + resume ratchet.
+  max_rss_gb: 21.0
+  max_workers: 4

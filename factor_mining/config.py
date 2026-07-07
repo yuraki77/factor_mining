@@ -200,6 +200,9 @@ class FactoryConfig(BaseModel):
     recheck_interval_days: int = 1
     max_run_hours: float = 12.0
     max_rss_gb: float | None = None
+    # Cap for child pipelines' backtest pool. Fewer workers is the only lever
+    # that lowers the RAM peak (vs. detecting it); a nightly factory has time.
+    max_workers: int | None = None
 
 
 class Settings(BaseModel):
