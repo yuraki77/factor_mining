@@ -125,6 +125,8 @@ def run_discovery(settings: Settings, store: MetadataStore) -> int:
     args = ["mine", "run", "--trial-budget", str(settings.factory.trial_budget_per_round)]
     if settings.factory.use_llm:
         args.append("--llm")
+        if settings.factory.research_brief:
+            args.extend(["--brief", settings.factory.research_brief])
     args.extend(_worker_cap_args(settings))
     code, run_id = _run_supervised_child(args, settings, store)
     if code == 0:

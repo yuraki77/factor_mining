@@ -190,6 +190,11 @@ class FactoryConfig(BaseModel):
 
     enabled: bool = False
     use_llm: bool = True
+    # Standing research brief injected into LLM hypothesis generation for
+    # factory discovery rounds ("" = no brief). Aim it with near-miss
+    # diagnostics: it changes which candidates get minted, which is where
+    # budgeted lineages should be spent.
+    research_brief: str = ""
     min_new_days: float = 1.0
     trial_budget_per_round: int = 400
     family_budget_floor: int = 20

@@ -136,6 +136,30 @@ def test_discovery_child_mines_llm_hypotheses_unless_disabled(tmp_path, monkeypa
     assert "--llm" not in calls[0]
 
 
+def test_research_brief_reaches_llm_discovery_only(tmp_path, monkeypatch) -> None:
+    """The standing brief steers which candidates get minted — but only when
+    the LLM is generating hypotheses; the deterministic defaults ignore
+    briefs, so passing one without --llm would be a silent no-op."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(worker, "_run_supervised_child", lambda args, s, st: calls.append(args) or (0, "r"))
+    monkeypatch.setattr(factory, "current_extents_ms", lambda _s: {})
+
+    settings = _settings(tmp_path, research_brief="funding-conditioned, low turnover")
+    worker.run_discovery(settings, _store(settings))
+    assert "--brief" in calls[0]
+    assert calls[0][calls[0].index("--brief") + 1] == "funding-conditioned, low turnover"
+
+    calls.clear()
+    settings = _settings(tmp_path, use_llm=False, research_brief="funding-conditioned, low turnover")
+    worker.run_discovery(settings, _store(settings))
+    assert "--brief" not in calls[0]
+
+    calls.clear()
+    settings = _settings(tmp_path)  # brief defaults empty
+    worker.run_discovery(settings, _store(settings))
+    assert "--brief" not in calls[0]
+
+
 def test_worker_cap_flows_to_both_child_kinds(tmp_path, monkeypatch) -> None:
     """max_workers is the lever that lowers the RAM peak (fewer pool
     processes) rather than merely detecting it; both discovery and recheck

@@ -126,6 +126,22 @@ evolutionary:
 factory:
   enabled: false
   use_llm: true
+  # Grounded in near-miss diagnostics 2026-07-07: cost_destroyed_edge and
+  # funding_state_mixing dominate; short Sharpe -4.3 vs long +0.2;
+  # funding-conditioned |IC| ~3x raw; best horizon ~48 bars.
+  research_brief: >-
+    BTCUSDT/ETHUSDT perpetual futures, 5m bars. Hard cost constraint:
+    production requires break-even cost > 12 bps round-trip (taker 5 bps +
+    slippage per side) - propose only low-turnover mechanisms with average
+    holding >= 48 bars (~4h, ideally 100-300) and explicit entry hysteresis;
+    no signal whose edge pays out on the next bar. Strongest prior evidence:
+    funding-state-conditioned signals carry ~3x the IC of unconditional ones -
+    condition entries, exits, or position size on funding regime (sign,
+    extremes, time-to-funding-settlement). Short-side performance has been
+    persistently negative: prefer long-biased mechanisms, or gate shorts
+    behind demanding conditions (e.g. extreme positive funding plus downtrend
+    regime). Target payoff horizon ~48 bars. Avoid plain mean-reversion
+    variants without an explicit cost story - that family is heavily explored.
   min_new_days: 1.0
   trial_budget_per_round: 400
   family_budget_floor: 20
