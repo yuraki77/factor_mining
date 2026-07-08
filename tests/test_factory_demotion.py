@@ -7,6 +7,8 @@ would otherwise book several "consecutive" failures in a single run.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 from factor_mining.config import Settings
 from factor_mining.models import (
     BacktestResult,
@@ -115,6 +117,68 @@ def test_upsert_preserves_failure_streak_like_the_paper_clock(tmp_path) -> None:
     (record,) = store.list_research_survivors(status=None)
     assert record.current_trades == 42
     assert record.consecutive_recheck_failures == 2
+
+
+def _aged_store(tmp_path, *, days: int = 120) -> MetadataStore:
+    store = MetadataStore(tmp_path / "meta.sqlite3")
+    store.upsert_research_survivors([
+        ResearchSurvivorRecord(
+            candidate_id=_CID,
+            experiment_id=_EID,
+            paper_trade_start_date=datetime.now(UTC) - timedelta(days=days),
+        )
+    ])
+    return store
+
+
+def _ladder_recheck(store: MetadataStore, *, break_even_bps: float, sharpe: float) -> None:
+    result = _result(oos_trades=150).model_copy(update={
+        "metrics_primary": MetricsBlock(sharpe=sharpe),
+        "break_even_cost_bps": break_even_bps,
+        "actual_cost_bps": 6.0,
+    })
+    _update_research_survivor_store(
+        store=store,
+        records=[],
+        rechecked_candidate_ids={_CID},
+        research_gates=[_gate("research_survivor")],
+        results=[result],
+        fdr_map={_EID: 0.01},  # gross signal clearly "significant"
+        settings=Settings(),
+        allow_promotion=True,
+    )
+
+
+def test_ladder_promotion_requires_positive_cost_margin_and_net_sharpe(tmp_path) -> None:
+    """FDR measures GROSS predictive power. Post-reset shelves hold survivors
+    with 1000+ trades, tiny FDR p, and cost_margin ~ -12bps — without the net
+    terms they would age 90 days and promote into Validated while losing
+    money after costs."""
+    store = _aged_store(tmp_path)
+    _ladder_recheck(store, break_even_bps=1.0, sharpe=1.0)  # margin 1 - 2*6 = -11
+    (record,) = store.list_research_survivors(status=None)
+    assert record.status == "active", "negative cost margin must block promotion"
+
+    _ladder_recheck(store, break_even_bps=30.0, sharpe=-0.5)  # margin +18, net negative
+    (record,) = store.list_research_survivors(status=None)
+    assert record.status == "active", "negative net sharpe must block promotion"
+
+    _ladder_recheck(store, break_even_bps=30.0, sharpe=1.0)
+    (record,) = store.list_research_survivors(status=None)
+    assert record.status == "promoted"
+    assert record.status_reason == "promotion_criteria_met"
+
+
+def test_active_survivor_listing_scales_past_default_limit(tmp_path) -> None:
+    """Recheck paths must see the WHOLE shelf: under the old default limit of
+    200, survivor #201+ was silently never rechecked — and therefore never
+    demoted — so the shelf could only grow."""
+    store = MetadataStore(tmp_path / "meta.sqlite3")
+    store.upsert_research_survivors([
+        ResearchSurvivorRecord(candidate_id=f"c{i}", experiment_id=f"e{i}") for i in range(250)
+    ])
+    assert len(store.list_research_survivors(status="active")) == 200
+    assert len(store.list_research_survivors(status="active", limit=10_000)) == 250
 
 
 def test_pre_factory_payloads_still_parse() -> None:

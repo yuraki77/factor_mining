@@ -853,7 +853,9 @@ def _run_pipeline_impl(
         trial_budget=trial_budget,
     )
     checkpoint_source_run_id = resume_run_id or run_id
-    active_survivor_records = store.list_research_survivors(status="active") if store else []
+    # limit must cover the whole shelf: anything past it is silently never
+    # rechecked (and so never demoted); demotion keeps the shelf bounded.
+    active_survivor_records = store.list_research_survivors(status="active", limit=10_000) if store else []
     survivor_seed_candidates = _survivor_seed_candidates(active_survivor_records, result.errors)
     survivor_candidate_ids = {candidate.candidate_id for candidate in survivor_seed_candidates}
     if survivor_seed_candidates:
@@ -1351,7 +1353,7 @@ def verify_research_survivors(
     result = PipelineResult()
     try:
         _step_header(1, "Verifying active Research Survivors")
-        records = store.list_research_survivors(status="active")
+        records = store.list_research_survivors(status="active", limit=10_000)
         candidates = _survivor_seed_candidates(records, result.errors)
         if not candidates:
             _log("No active research survivors with valid candidate payloads.")
@@ -4213,9 +4215,25 @@ def _update_research_survivor_store(
         )
         max_failures = int(settings.factory.demotion_max_consecutive_failures)
         prior_failures = int(stored.consecutive_recheck_failures) if stored is not None else 0
+        # Ladder promotion must be earned NET of costs: the FDR term measures
+        # gross predictive power, so without the margin/net-sharpe terms a
+        # signal-strong candidate that loses money after costs could sit out
+        # its 90 days and promote into the Validated tier.
+        cost_margin_bps = (
+            float(result.break_even_cost_bps)
+            - float(settings.gatecheck.break_even_cost_multiple) * float(result.actual_cost_bps)
+        )
+        net_sharpe = float(result.metrics_primary.sharpe)
         if allow_promotion and gate.status == "production_passed":
             store.update_research_survivor_status(candidate_id, "promoted", "production_gate_passed")
-        elif allow_promotion and fdr_pvalue < promotion_fdr and current_trades >= min_trades and elapsed_days >= required_days:
+        elif (
+            allow_promotion
+            and fdr_pvalue < promotion_fdr
+            and current_trades >= min_trades
+            and elapsed_days >= required_days
+            and cost_margin_bps > 0.0
+            and net_sharpe > 0.0
+        ):
             store.update_research_survivor_status(candidate_id, "promoted", "promotion_criteria_met")
         elif gate.status == "rejected" and current_trades >= min_trades:
             store.update_research_survivor_status(candidate_id, "retired", "rejected_after_min_trades")
