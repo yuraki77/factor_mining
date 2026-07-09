@@ -14,8 +14,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from factor_mining.backtest.engine import _break_even_cost_bps, _strategy_returns
-from factor_mining.config import CostConfig, Settings
+from factor_mining.backtest.engine import _break_even_cost_bps, _strategy_returns, run_backtest
+from factor_mining.config import CostConfig, Settings, apply_trade_overrides, costs_for_market
+from factor_mining.models import CandidateStrategySpec
 
 
 def _frame(opens: list[float], quote_volumes: list[float]) -> pd.DataFrame:
@@ -99,3 +100,57 @@ def test_zero_turnover_falls_back_to_first_trade_rate() -> None:
     assert total_cost == 0.0
     assert realized_bps == pytest.approx(6.0), "rate a first trade would pay, not 0"
     assert _break_even_cost_bps(net, position, total_cost_return=total_cost) == 0.0
+
+
+# ── WS1: per-market costs ───────────────────────────────────────────────────
+
+def _market_settings() -> Settings:
+    return Settings().model_copy(update={
+        "costs": CostConfig(
+            taker_bps=5.0, slippage_base_bps=1.0, slippage_k=0.0,
+            per_market={"spot": {"taker_bps": 10.0}, "um_futures": {"taker_bps": 5.0}},
+        )
+    })
+
+
+def test_costs_for_market_layers_only_listed_fields() -> None:
+    settings = _market_settings()
+    spot = costs_for_market(settings, "spot")
+    assert spot.taker_bps == 10.0            # overridden
+    assert spot.slippage_base_bps == 1.0     # inherited from base
+    assert costs_for_market(settings, "um_futures").taker_bps == 5.0
+    # an unlisted market falls back to the base object unchanged
+    assert costs_for_market(settings, "unknown") is settings.costs
+
+
+def test_engine_prices_spot_higher_than_futures() -> None:
+    """Same signal, same data — only the market differs — must cost more on spot
+    (10bps taker) than um_futures (5bps), so break-even/realized diverge by market."""
+    frame = _frame([100.0, 100.0, 100.5, 100.5], [1e9] * 4)
+    settings = _market_settings()
+    sig = pd.Series([1.0, 1.0, 1.0, 0.0])
+
+    def _cand(market: str) -> CandidateStrategySpec:
+        return CandidateStrategySpec(
+            candidate_id=f"c_{market}", hypothesis_id="h", method_id="factor_scoring",
+            hypothesis_family="momentum", symbol="BTCUSDT", market=market, interval="5m",
+            params={"position_buffer": 0.0},
+        )
+
+    spot = run_backtest(frame, sig, _cand("spot"), settings)
+    fut = run_backtest(frame, sig, _cand("um_futures"), settings)
+    assert spot.actual_cost_bps == pytest.approx(11.0)   # 10 taker + 1 base slippage
+    assert fut.actual_cost_bps == pytest.approx(6.0)      # 5 + 1
+    assert spot.actual_cost_bps > fut.actual_cost_bps
+
+
+def test_global_override_composes_and_wins_over_per_market() -> None:
+    """A run-scoped scenario knob must reach every market: overriding taker globally
+    propagates into per-market entries (wins on collision), while a non-overlapping
+    slippage override still layers on both."""
+    settings = _market_settings()
+    scenario = apply_trade_overrides(settings, taker_bps=3.0, slippage_base_bps=2.0)
+    spot = costs_for_market(scenario, "spot")
+    assert spot.taker_bps == 3.0             # global scenario wins over per-market 10
+    assert spot.slippage_base_bps == 2.0     # non-overlapping override applies too
+    assert costs_for_market(scenario, "um_futures").taker_bps == 3.0

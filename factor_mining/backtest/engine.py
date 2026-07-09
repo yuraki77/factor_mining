@@ -6,7 +6,7 @@ import uuid
 import numpy as np
 import pandas as pd
 
-from factor_mining.config import Settings
+from factor_mining.config import CostConfig, Settings, costs_for_market
 from factor_mining.hypotheses.discovered import boundary_conditions
 from factor_mining.models import (
     BacktestResult,
@@ -426,12 +426,14 @@ def evaluate_strategy_path(
             tp_tiers=tiers, trailing_stop_pct=tr_pct, trailing_after_first_tp=tr_after_tp,
         )
 
+    costs = costs_for_market(settings, candidate.market)
     primary_returns, primary_cost_bps, avg_participation, primary_total_cost = _strategy_returns(
         frame,
         open_returns,
         vol_target_position,
         settings=settings,
         funding=funding,
+        costs=costs,
     )
     secondary_returns, _, _, _ = _strategy_returns(
         frame,
@@ -439,6 +441,7 @@ def evaluate_strategy_path(
         fixed_position,
         settings=settings,
         funding=funding,
+        costs=costs,
     )
     return StrategyPath(
         frame=frame,
@@ -653,25 +656,30 @@ def _strategy_returns(
     *,
     settings: Settings,
     funding: pd.DataFrame | None,
+    costs: "CostConfig | None" = None,
 ) -> tuple[pd.Series, float, float, float]:
     """Returns (net_returns, realized_cost_bps, avg_participation, total_cost_return).
+
+    ``costs`` is the market-resolved cost config (``costs_for_market``); it defaults to
+    ``settings.costs`` so non-engine callers are unaffected.
 
     ``realized_cost_bps`` is TURNOVER-WEIGHTED: total cost paid / total turnover. The
     previous per-bar mean of the cost *rate* counted idle bars at the ~base rate, so a
     sparse trader showed ~6bps "actual cost" regardless of what it actually paid, and
     G8's right-hand side was diluted. Zero-turnover positions fall back to the
     taker+base rate (the cost a first trade would pay)."""
+    costs = costs if costs is not None else settings.costs
     order_notional = settings.position_sizing.fixed_notional_usd * position.diff().abs().fillna(position.abs())
     participation = (order_notional / frame["quote_volume"].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    slippage_bps = settings.costs.slippage_base_bps + settings.costs.slippage_k * (participation.clip(lower=0.0) ** settings.costs.slippage_gamma)
+    slippage_bps = costs.slippage_base_bps + costs.slippage_k * (participation.clip(lower=0.0) ** costs.slippage_gamma)
     turnover = position.diff().abs().fillna(position.abs())
-    cost_returns = (turnover * (settings.costs.taker_bps + slippage_bps) / 10_000.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    cost_returns = (turnover * (costs.taker_bps + slippage_bps) / 10_000.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
     total_turnover = float(turnover.sum())
     total_cost_return = float(cost_returns.sum())
     if total_turnover > 0.0:
         realized_cost_bps = total_cost_return / total_turnover * 10_000.0
     else:
-        realized_cost_bps = float(settings.costs.taker_bps + settings.costs.slippage_base_bps)
+        realized_cost_bps = float(costs.taker_bps + costs.slippage_base_bps)
     funding_returns = _apply_funding(position, frame, funding)
     strategy_returns = (position * open_returns.fillna(0.0) + funding_returns - cost_returns).replace([np.inf, -np.inf], np.nan).fillna(0.0)
     return strategy_returns, realized_cost_bps, float(participation.mean()), total_cost_return

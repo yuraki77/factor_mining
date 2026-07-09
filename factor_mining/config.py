@@ -105,6 +105,11 @@ class CostConfig(BaseModel):
     slippage_base_bps: float = 1.0
     slippage_k: float = 25.0
     slippage_gamma: float = 0.5
+    # Per-market partial overrides, e.g. {"spot": {"taker_bps": 10.0}}. Binance
+    # regular-tier spot taker (~10bps) is double USDT-M futures (~5bps); a single
+    # global taker cannot express that, and used the futures rate for spot too.
+    # Resolved by ``costs_for_market``; only the listed fields override the base.
+    per_market: dict[str, dict[str, float]] = Field(default_factory=dict)
 
 
 class CapacityConfig(BaseModel):
@@ -266,8 +271,28 @@ def apply_trade_overrides(
     if position_updates:
         updates["position_sizing"] = settings.position_sizing.model_copy(update=position_updates)
     if cost_updates:
-        updates["costs"] = settings.costs.model_copy(update=cost_updates)
+        new_costs = settings.costs.model_copy(update=cost_updates)
+        # A run-scoped global cost override is a scenario knob ("what if taker were X"),
+        # so it must reach every market — propagate it into the per-market entries too,
+        # otherwise a market pinned in ``per_market`` would silently ignore the scenario.
+        if settings.costs.per_market:
+            merged = {
+                market: {**overrides, **cost_updates}
+                for market, overrides in settings.costs.per_market.items()
+            }
+            new_costs = new_costs.model_copy(update={"per_market": merged})
+        updates["costs"] = new_costs
     return settings.model_copy(update=updates) if updates else settings
+
+
+def costs_for_market(settings: Settings, market: str | None) -> CostConfig:
+    """Effective cost config for a market: the base costs with any ``per_market``
+    overrides layered on top. Absent an entry, returns the base unchanged. This is the
+    only place spot-vs-futures fee asymmetry enters the engine."""
+    overrides = settings.costs.per_market.get(str(market or ""))
+    if not overrides:
+        return settings.costs
+    return settings.costs.model_copy(update=dict(overrides))
 
 
 def load_settings(path: Path | None = None) -> Settings:

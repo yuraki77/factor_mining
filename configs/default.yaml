@@ -73,6 +73,15 @@ costs:
   slippage_base_bps: 1.0
   slippage_k: 25.0
   slippage_gamma: 0.5
+  # Per-market taker fees (Binance regular tier, 2026-07): spot ~10bps vs USDT-M
+  # futures ~5bps. Replace with your actual VIP/BNB-discount tier — one edit here
+  # and every backtest re-prices. apply_trade_overrides still layers global
+  # scenario knobs on top of these.
+  per_market:
+    spot:
+      taker_bps: 10.0
+    um_futures:
+      taker_bps: 5.0
 
 capacity:
   adv_participation: 0.05
