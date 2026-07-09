@@ -4188,9 +4188,14 @@ def _update_research_survivor_store(
     # The stored records carry the preserved paper_trade_start_date (upsert
     # keeps the original clock); promotion must age against that, not against
     # this round's freshly built records.
+    # Rechecked candidates are active survivors by construction, so load the
+    # active shelf (not status=None): status=None with the default limit would
+    # return the newest ~200 rows across all statuses — after a reset the
+    # retired backlog crowds the window and most active survivors get no
+    # paper clock, silently freezing their promotion/demotion.
     stored_by_candidate = {
         record.candidate_id: record
-        for record in store.list_research_survivors(status=None)
+        for record in store.list_research_survivors(status="active", limit=10_000)
     }
     gate_by_candidate = {gate.candidate_id: gate for gate in research_gates}
     result_by_candidate = {result.candidate_id: result for result in results}

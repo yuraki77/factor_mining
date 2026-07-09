@@ -96,6 +96,12 @@ def factory_tick(settings: Settings, store: MetadataStore, client: BinanceArchiv
         removed = store.prune_artifacts(kind="pipeline_checkpoint", max_unprotected_rows=500)
         if removed:
             logger.info("pruned %d old pipeline checkpoints", removed)
+    # near_misses gains rows every round but the Watch stratum only reads back
+    # watch_window_days; keep a generous multiple so nothing in the live window
+    # is ever at risk, and the table stops growing unbounded under nightly runs.
+    dropped = store.prune_near_misses(before_days=max(1, 4 * settings.factory.watch_window_days))
+    if dropped:
+        logger.info("pruned %d stale near-misses", dropped)
 
 
 def decide_action(store: MetadataStore, settings: Settings, *, now: datetime | None = None) -> str:

@@ -169,6 +169,44 @@ def test_ladder_promotion_requires_positive_cost_margin_and_net_sharpe(tmp_path)
     assert record.status_reason == "promotion_criteria_met"
 
 
+def test_recheck_finds_paper_clock_behind_a_large_retired_backlog(tmp_path) -> None:
+    """After a reset the retired backlog (26k+) dwarfs the active shelf. The
+    store-side promotion/demotion must load the ACTIVE shelf, not status=None
+    with the default 200-row window — otherwise the retired rows crowd out
+    active survivors' paper clocks and freeze their ladder progress. Here an
+    aged, cost-positive survivor sitting behind 300 retired rows must still
+    promote."""
+    store = MetadataStore(tmp_path / "meta.sqlite3")
+    store.upsert_research_survivors([
+        ResearchSurvivorRecord(candidate_id=f"dead-{i}", experiment_id=f"e-{i}", status="retired")
+        for i in range(300)
+    ])
+    store.upsert_research_survivors([
+        ResearchSurvivorRecord(
+            candidate_id=_CID,
+            experiment_id=_EID,
+            paper_trade_start_date=datetime.now(UTC) - timedelta(days=120),
+        )
+    ])
+    result = _result(oos_trades=150).model_copy(update={
+        "metrics_primary": MetricsBlock(sharpe=1.0),
+        "break_even_cost_bps": 30.0,
+        "actual_cost_bps": 6.0,
+    })
+    _update_research_survivor_store(
+        store=store,
+        records=[],
+        rechecked_candidate_ids={_CID},
+        research_gates=[_gate("research_survivor")],
+        results=[result],
+        fdr_map={_EID: 0.01},
+        settings=Settings(),
+        allow_promotion=True,
+    )
+    promoted = {r.candidate_id: r for r in store.list_research_survivors(status="promoted", limit=10_000)}
+    assert _CID in promoted, "aged survivor behind the retired backlog must still promote"
+
+
 def test_active_survivor_listing_scales_past_default_limit(tmp_path) -> None:
     """Recheck paths must see the WHOLE shelf: under the old default limit of
     200, survivor #201+ was silently never rechecked — and therefore never

@@ -372,13 +372,16 @@ def data_end_ms(settings: Settings, *, symbol: str, market: str | None = None) -
     is cheap enough for the factory worker's nightly arrival poll."""
     try:
         paths = resolve_frame_paths(settings, symbol=symbol, market=market or None)
-        end_ms = 0
-        for path in paths:
-            column = pd.read_parquet(path, columns=["open_time"])["open_time"]
-            numeric = pd.to_numeric(column, errors="coerce").dropna()
-            if len(numeric):
-                end_ms = max(end_ms, int(numeric.max()))
-        return end_ms
+        # resolve_frame_paths returns partitions sorted by path, and
+        # year=YYYY/month=MM sorts chronologically, so the newest bar lives in
+        # the last file. Reading only it turns a ~500-partition scan into one
+        # column read on the nightly arrival poll. (Flat single-file layouts
+        # are unaffected — the list has one element.)
+        if not paths:
+            return 0
+        column = pd.read_parquet(paths[-1], columns=["open_time"])["open_time"]
+        numeric = pd.to_numeric(column, errors="coerce").dropna()
+        return int(numeric.max()) if len(numeric) else 0
     except Exception:  # noqa: BLE001 - missing/corrupt parquet reads as "no data yet"
         return 0
 

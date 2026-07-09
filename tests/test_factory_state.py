@@ -61,6 +61,33 @@ def test_data_end_ms_missing_parquet_reads_as_no_data(tmp_path: Path) -> None:
     assert data_end_ms(settings, symbol="BTCUSDT", market="spot") == 0
 
 
+def _write_partition(root: Path, *, year: str, month: str, open_times: list[int]) -> None:
+    part = root / "market=spot" / "dataset=klines" / "symbol=BTCUSDT" / "interval=5m" / f"year={year}" / f"month={month}"
+    part.mkdir(parents=True, exist_ok=True)
+    n = len(open_times)
+    pd.DataFrame(
+        {
+            "open_time": open_times,
+            "open": [1.0] * n, "high": [1.0] * n, "low": [1.0] * n,
+            "close": [1.0] * n, "volume": [1.0] * n,
+        }
+    ).to_parquet(part / "data.parquet", index=False)
+
+
+def test_data_end_ms_reads_only_the_newest_partition(tmp_path: Path) -> None:
+    """The nightly poll must not scan the whole ~500-file warehouse to find the
+    max open_time. Partitions sort chronologically, so only the newest is read
+    — encoded here by a deliberately larger (impossible-in-reality) value in an
+    OLDER partition that must be ignored, proving we don't fall back to a full
+    scan while still returning the true latest bar."""
+    settings = _settings(tmp_path)
+    root = settings.data.parquet_dir
+    _write_partition(root, year="2026", month="06", open_times=[500, 300])
+    _write_partition(root, year="2024", month="01", open_times=[999_999])  # stale sentinel, must be skipped
+
+    assert data_end_ms(settings, symbol="BTCUSDT", market="spot") == 500
+
+
 def test_discovery_fires_at_go_live_when_no_extent_recorded() -> None:
     """First factory run has no baseline — it must fire once to establish one."""
     assert factory.discovery_due({"BTCUSDT/spot": 500 * _DAY_MS}, {}, min_new_days=1.0)

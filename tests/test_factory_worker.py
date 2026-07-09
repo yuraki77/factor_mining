@@ -223,6 +223,43 @@ def test_supervise_trips_on_process_tree_rss(tmp_path, monkeypatch) -> None:
     assert code == -9
 
 
+def test_factory_tick_prunes_stale_near_misses(tmp_path, monkeypatch) -> None:
+    """near_misses gains rows every round but Watch only reads back
+    watch_window_days; without pruning the table grows unbounded under nightly
+    cadence. The tick must drop rows well outside the window and keep recent
+    ones."""
+    from contextlib import closing
+    from datetime import datetime as _dt
+
+    from factor_mining.models import NearMissAnalysis
+
+    settings = _settings(tmp_path, watch_window_days=30)
+    store = _store(settings)
+    store.save_near_misses([
+        NearMissAnalysis(experiment_id="e-old", candidate_id="c-old", primary_reason="regime_mixing"),
+        NearMissAnalysis(experiment_id="e-new", candidate_id="c-new", primary_reason="regime_mixing"),
+    ])
+    stale = (datetime.now(UTC) - timedelta(days=200)).isoformat()  # past 4*30d retention
+    with closing(store.connect()) as conn:
+        with conn:
+            conn.execute("update near_misses set created_at = ? where candidate_id = ?", (stale, "c-old"))
+
+    # neutralize the rest of the tick: no sync, nothing to do
+    monkeypatch.setattr(worker, "_attempt_pending_resume", lambda *a, **k: None)
+    monkeypatch.setattr(worker, "_abandon_pending_resume", lambda *a, **k: None)
+    monkeypatch.setattr(worker, "_mark_stale_run_failed", lambda *a, **k: None)
+    monkeypatch.setattr(worker, "decide_action", lambda *a, **k: "idle")
+
+    class _FakeClient:
+        def sync(self):
+            return []
+
+    worker.factory_tick(settings, store, _FakeClient())
+
+    remaining = {nm.candidate_id for nm in store.list_near_misses()}
+    assert remaining == {"c-new"}
+
+
 def test_abandon_after_sync_prunes_only_that_runs_checkpoints(tmp_path) -> None:
     """Post-sync the I3 fingerprint can never match again — the marker and
     checkpoints must go. Underscores in run ids are LIKE wildcards; a sloppy
