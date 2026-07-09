@@ -226,6 +226,7 @@ def _diagnostics(
         "fdr_adjusted_pvalue": _gate_item_value(gatecheck, "G3"),
         "pbo": result.pbo,
         "cost_drag_sharpe": cost_drag,
+        # gross break-even vs 2× realized cost since the 2026-07 meter fix
         "cost_margin_bps": result.break_even_cost_bps - 2.0 * result.actual_cost_bps,
         "break_even_cost_bps": result.break_even_cost_bps,
         "actual_cost_bps": result.actual_cost_bps,

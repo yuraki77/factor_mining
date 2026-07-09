@@ -191,6 +191,8 @@ def build_research_survivor_records(
                 fdr_pvalue=fdr_pvalue,
                 sharpe=result.metrics_primary.sharpe,
                 dsr=result.deflated_sharpe,
+                # gross break-even vs 2× realized (turnover-weighted) cost since the
+                # 2026-07 meter fix — see engine._break_even_cost_bps / _strategy_returns
                 cost_margin_bps=result.break_even_cost_bps - 2.0 * result.actual_cost_bps,
                 production_gate_failures=gate.production_gate_failures,
                 evidence_flags=gate.evidence_flags,

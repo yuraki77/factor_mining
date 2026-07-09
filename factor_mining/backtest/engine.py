@@ -62,6 +62,9 @@ class StrategyPath:
     fixed_returns: pd.Series
     avg_cost_bps: float
     avg_participation: float
+    # Primary leg's total cost drag in return units (sum of per-bar cost_returns);
+    # lets break-even be computed GROSS without re-running the cost model.
+    total_cost_return: float = 0.0
 
 
 def _metrics_from_returns(returns: pd.Series, *, interval: str, trade_count: int, pnl: float) -> MetricsBlock:
@@ -423,14 +426,14 @@ def evaluate_strategy_path(
             tp_tiers=tiers, trailing_stop_pct=tr_pct, trailing_after_first_tp=tr_after_tp,
         )
 
-    primary_returns, primary_cost_bps, avg_participation = _strategy_returns(
+    primary_returns, primary_cost_bps, avg_participation, primary_total_cost = _strategy_returns(
         frame,
         open_returns,
         vol_target_position,
         settings=settings,
         funding=funding,
     )
-    secondary_returns, _, _ = _strategy_returns(
+    secondary_returns, _, _, _ = _strategy_returns(
         frame,
         open_returns,
         fixed_position,
@@ -447,6 +450,7 @@ def evaluate_strategy_path(
         fixed_returns=secondary_returns,
         avg_cost_bps=primary_cost_bps,
         avg_participation=avg_participation,
+        total_cost_return=primary_total_cost,
     )
 
 
@@ -582,7 +586,9 @@ def run_backtest(
         )
     adv = float(frame["quote_volume"].tail(min(len(frame), 288 * 30)).sum() / max(1, min(len(frame), 288 * 30) / 288))
     estimated_capacity = adv * settings.capacity.adv_participation
-    break_even_cost_bps = _break_even_cost_bps(primary_returns, vol_target_position)
+    break_even_cost_bps = _break_even_cost_bps(
+        primary_returns, vol_target_position, total_cost_return=path.total_cost_return
+    )
     expected_ic_mid = abs(float(candidate.params.get("expected_ic_mid", 0.02))) or 0.02
     observed_ic = abs(float(ic_series.mean(skipna=True))) if not ic_series.dropna().empty else 0.0
     window_stability = compute_oos_window_diagnostics(
@@ -647,16 +653,28 @@ def _strategy_returns(
     *,
     settings: Settings,
     funding: pd.DataFrame | None,
-) -> tuple[pd.Series, float, float]:
+) -> tuple[pd.Series, float, float, float]:
+    """Returns (net_returns, realized_cost_bps, avg_participation, total_cost_return).
+
+    ``realized_cost_bps`` is TURNOVER-WEIGHTED: total cost paid / total turnover. The
+    previous per-bar mean of the cost *rate* counted idle bars at the ~base rate, so a
+    sparse trader showed ~6bps "actual cost" regardless of what it actually paid, and
+    G8's right-hand side was diluted. Zero-turnover positions fall back to the
+    taker+base rate (the cost a first trade would pay)."""
     order_notional = settings.position_sizing.fixed_notional_usd * position.diff().abs().fillna(position.abs())
     participation = (order_notional / frame["quote_volume"].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
     slippage_bps = settings.costs.slippage_base_bps + settings.costs.slippage_k * (participation.clip(lower=0.0) ** settings.costs.slippage_gamma)
     turnover = position.diff().abs().fillna(position.abs())
-    avg_cost_bps = float((settings.costs.taker_bps + slippage_bps).replace([np.inf, -np.inf], np.nan).fillna(0).mean())
-    cost_returns = turnover * (settings.costs.taker_bps + slippage_bps) / 10_000.0
+    cost_returns = (turnover * (settings.costs.taker_bps + slippage_bps) / 10_000.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    total_turnover = float(turnover.sum())
+    total_cost_return = float(cost_returns.sum())
+    if total_turnover > 0.0:
+        realized_cost_bps = total_cost_return / total_turnover * 10_000.0
+    else:
+        realized_cost_bps = float(settings.costs.taker_bps + settings.costs.slippage_base_bps)
     funding_returns = _apply_funding(position, frame, funding)
     strategy_returns = (position * open_returns.fillna(0.0) + funding_returns - cost_returns).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    return strategy_returns, avg_cost_bps, float(participation.mean())
+    return strategy_returns, realized_cost_bps, float(participation.mean()), total_cost_return
 
 
 def _position_buffer_threshold(candidate: CandidateStrategySpec) -> float:
@@ -676,11 +694,19 @@ def _apply_side_mode(signals: pd.Series, candidate: CandidateStrategySpec) -> pd
     return signals
 
 
-def _break_even_cost_bps(returns: pd.Series, position: pd.Series) -> float:
+def _break_even_cost_bps(returns: pd.Series, position: pd.Series, *, total_cost_return: float = 0.0) -> float:
+    """GROSS break-even cost level: the per-unit-turnover cost at which net PnL hits
+    zero. ``returns`` are net of costs, so the cost drag is added back before dividing.
+    The previous formula divided NET PnL by turnover — i.e. margin *above* current
+    costs — which made G8 (break_even > 2× actual) effectively demand gross break-even
+    > ~3× cost, one full multiple harsher than its stated intent. Anchor identity:
+    a strategy whose gross PnL exactly equals its cost paid has break_even == its
+    realized cost rate (not zero)."""
     turnover = float(position.diff().abs().sum())
     if turnover <= 0:
         return 0.0
-    return float(max(0.0, returns.sum()) / turnover * 10_000.0)
+    gross_pnl = float(returns.sum()) + float(total_cost_return)
+    return float(max(0.0, gross_pnl) / turnover * 10_000.0)
 
 
 def _normalize_trial_counts(counts: dict[str, int]) -> dict[str, int]:
