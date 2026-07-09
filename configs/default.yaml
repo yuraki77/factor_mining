@@ -73,10 +73,15 @@ costs:
   slippage_base_bps: 1.0
   slippage_k: 25.0
   slippage_gamma: 0.5
-  # Per-market taker fees (Binance regular tier, 2026-07): spot ~10bps vs USDT-M
-  # futures ~5bps. Replace with your actual VIP/BNB-discount tier — one edit here
-  # and every backtest re-prices. apply_trade_overrides still layers global
-  # scenario knobs on top of these.
+  # Per-market taker fees. DELIBERATELY CONSERVATIVE: Binance REGULAR tier (2026-07),
+  # taker-only, no VIP/BNB discount — the fee floor. This is a gate, so a pessimistic
+  # cost is the correct default: VIP levels and BNB discounts only go DOWN from here,
+  # so a real (better) tier makes G8 easier, never harder. Anything that clears the
+  # gate at these fees clears it at yours. LEAVE AS-IS unless you KNOW your effective
+  # taker is worse than regular tier (it can't be, on fees alone). The one direction
+  # this is wrong: if you execute as a MAKER (~2bps / rebate), the gate is too STRICT
+  # and may reject tradeable strategies — model that as a separate scenario tier rather
+  # than lowering these. apply_trade_overrides still layers global scenario knobs on top.
   per_market:
     spot:
       taker_bps: 10.0
