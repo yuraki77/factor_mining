@@ -66,7 +66,9 @@ def _print_report(report: CalibrationReport, *, nominal: float) -> None:
     print("  Reading it: FAR deduped-N is the rate the live pipeline runs at. If G1/G3/ALL")
     print("  deduped-N sit at or below nominal, the FAR control holds and finding A is benign.")
     print("  If deduped-N exceeds nominal while raw-N does not, the dedup inflates the FAR.")
-    print("  Power should be high — a harness that rejects everything is broken, not calibrated.\n")
+    print("  Power should be high — a harness that rejects everything is broken, not calibrated.")
+    print("  G2/PBO is pool-relative and fails closed on standalone trials (shows 0% by")
+    print("  construction); ALL therefore ANDs only the standalone-measurable gates.\n")
 
 
 def main() -> None:

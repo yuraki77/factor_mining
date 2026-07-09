@@ -24,6 +24,7 @@ Nothing here writes to any store — it is pure computation over an in-memory fr
 from __future__ import annotations
 
 import math
+from collections import Counter
 from dataclasses import dataclass
 
 import numpy as np
@@ -39,8 +40,15 @@ from factor_mining.validation.gatecheck import run_gatecheck
 
 # FAR-controlling gates only. G8 (cost margin) and G10 (capacity) are the economic axis:
 # they pass/fail on real data regardless of predictive nullity, so including them would
-# conflate the two axes and corrupt the false-acceptance-rate number. Excluded by design.
+# conflate the two axes and corrupt the false-acceptance-rate number. Excluded by design
+# from the FAR arms; the POWER harness measures both axes — separating them is its point.
 STATISTICAL_GATES: tuple[str, ...] = ("G1", "G2", "G3", "G5", "G7")
+ECONOMIC_GATES: tuple[str, ...] = ("G8", "G10")
+# G2/PBO is batch-relative (CSCV over a candidate pool; standalone run_backtest returns
+# pbo=None and the gate fails closed), so no single-signal harness trial can ever pass it.
+# It stays in per-gate reports — visibly fail-closed — but composites AND only the gates
+# measurable standalone; for FAR this makes the composite a conservative upper bound.
+STANDALONE_AND_GATES: tuple[str, ...] = ("G1", "G3", "G5", "G7")
 _ALL = "ALL_STAT"
 
 
@@ -57,18 +65,37 @@ def rotate_signal(signal, rng: np.random.Generator, min_gap: int) -> np.ndarray:
     return np.roll(arr, k)
 
 
-def plant_signal(frame: pd.DataFrame, rng: np.random.Generator, *, alpha: float, noise: float) -> np.ndarray:
-    """Power arm: a signal with genuine (clairvoyant) edge over the engine's next-bar open
-    return. The engine trades ``signals.shift(1)`` against ``open[t+1]/open[t]-1``, so the
-    signal at ``t`` must predict the return realised over ``[t+1, t+2]`` — i.e. ``fwd`` twice
-    shifted. Deliberately look-ahead: it is a positive control proving the gates *can*
-    accept a real edge, not a strategy."""
+def plant_signal_with_horizon(
+    frame: pd.DataFrame, rng: np.random.Generator, *, alpha: float, noise: float, horizon: int
+) -> np.ndarray:
+    """A signal with genuine (clairvoyant) edge whose payoff accrues over ``horizon`` bars.
+
+    The engine fills ``signals.shift(1)`` at ``open[t+1]``, so the signal at ``t`` predicts
+    the path ``open[t+1] → open[t+1+horizon]``. Overlapping targets make the signal
+    ~``horizon``-bar autocorrelated, so positions persist and turnover falls ≈ 1/horizon —
+    the realistic profile for slow alphas, and what lets the cost gates be measured fairly
+    (a per-bar edge churns every bar and dies on costs regardless of statistical strength).
+    Deliberately look-ahead: a controlled-strength positive control, not a strategy.
+    With ``noise=1``, ``alpha`` ≈ the signal↔target correlation for small values.
+
+    The noise shares the horizon's timescale (variance-preserving rolling smooth):
+    per-bar iid noise would make even a slow alpha churn its position every bar, so
+    turnover — not evidence — would dominate every gate and the cost axis could never
+    be measured fairly (the first smoke run showed exactly that: netSR ≈ −160 at α=0)."""
+    n = len(frame)
     open_ = pd.Series(frame["open"].to_numpy(dtype=float))
-    fwd = open_.shift(-1) / open_ - 1.0
-    target = fwd.shift(-1)
+    target = open_.shift(-(1 + int(horizon))) / open_.shift(-1) - 1.0
     std = float(target.std()) or 1.0
     z = ((target - float(target.mean())) / std).fillna(0.0).to_numpy()
-    return np.tanh(alpha * z + noise * rng.standard_normal(len(frame)))
+    eps = rng.standard_normal(n)
+    if int(horizon) > 1:
+        eps = pd.Series(eps).rolling(int(horizon), min_periods=1).mean().to_numpy() * math.sqrt(float(horizon))
+    return np.tanh(alpha * z + noise * eps)
+
+
+def plant_signal(frame: pd.DataFrame, rng: np.random.Generator, *, alpha: float, noise: float) -> np.ndarray:
+    """FAR power arm: next-bar (horizon=1) planted edge."""
+    return plant_signal_with_horizon(frame, rng, alpha=alpha, noise=noise, horizon=1)
 
 
 def calibration_settings(settings: Settings, *, n_resamples: int = 250) -> Settings:
@@ -107,16 +134,15 @@ def default_candidates(
     return out
 
 
-def gate_trial(
+def _evaluate(
     frame: pd.DataFrame,
     signal,
     candidate: CandidateStrategySpec,
     settings: Settings,
     *,
     effective_trials: int,
-) -> dict[str, bool]:
-    """One backtest → gatecheck under trial count ``effective_trials``. Returns per-gate
-    pass booleans (condition held) plus ``ALL_STAT`` = all statistical gates passed.
+):
+    """One backtest → gatecheck under trial count ``effective_trials``.
 
     ``effective_trials`` feeds both N-dependent FAR gates: G1 via the DSR expected-max
     penalty inside ``run_backtest``, and G3 via the BH-FDR multiplicity here."""
@@ -129,9 +155,24 @@ def gate_trial(
     raw_p = combined_ic_tstat_pvalue(result.ic_tstat_nw, result.rankic_tstat_nw)
     fdr_p = benjamini_hochberg([raw_p], n_tests=int(effective_trials))[0]
     gate = run_gatecheck(result, settings, method=get_method(candidate.method_id), fdr_adjusted_pvalue=fdr_p)
+    return gate, result
+
+
+def gate_trial(
+    frame: pd.DataFrame,
+    signal,
+    candidate: CandidateStrategySpec,
+    settings: Settings,
+    *,
+    effective_trials: int,
+) -> dict[str, bool]:
+    """FAR-arm view: per-statistical-gate pass booleans plus ``ALL_STAT`` — the AND of the
+    standalone-measurable gates (G2 is pool-relative and fails closed here, so including it
+    would make the composite trivially zero instead of a measured rate)."""
+    gate, _ = _evaluate(frame, signal, candidate, settings, effective_trials=effective_trials)
     status = {item.rule_id: item.status for item in gate.items}
     passed = {g: (status.get(g) == "pass") for g in STATISTICAL_GATES}
-    passed[_ALL] = all(passed[g] for g in STATISTICAL_GATES)
+    passed[_ALL] = all(passed[g] for g in STANDALONE_AND_GATES)
     return passed
 
 
@@ -243,3 +284,138 @@ def calibrate(
         n_dedup=n_dedup,
         n_raw=n_raw,
     )
+
+
+# ── Power calibration: how strong must a real alpha be? ─────────────────────
+#
+# The FAR harness measures whether noise gets through (it shouldn't); this measures
+# how strong truth must be to get through. Composites separate the two axes:
+#   ALL_STAT   — standalone-measurable statistical gates (G1, G3, G5, G7)
+#   ALL_ECON   — economic gates (G8 cost margin, G10 capacity)
+#   PROD_X_PBO — the production blocking verdict modulo G2 (G2 is pool-relative and
+#                fails closed on standalone trials, so the raw verdict is trivially
+#                False here; "no blocking failure other than G2" is the honest proxy).
+
+POWER_COMPOSITES: tuple[str, ...] = ("ALL_STAT", "ALL_ECON", "PROD_X_PBO")
+
+
+@dataclass
+class PowerTrial:
+    alpha: float
+    horizon: int
+    gross_sharpe: float
+    net_sharpe: float
+    break_even_cost_bps: float
+    actual_cost_bps: float
+    factor_turnover: float
+    avg_holding_period_bars: float
+    oos_trade_count: int
+    passes: dict[str, bool]
+    failed_blocking: tuple[str, ...]
+
+
+def power_trial(
+    frame: pd.DataFrame,
+    signal,
+    candidate: CandidateStrategySpec,
+    settings: Settings,
+    *,
+    effective_trials: int,
+    alpha: float,
+    horizon: int,
+) -> PowerTrial:
+    """One planted-edge trial through the FULL gate stack, reporting achieved market-unit
+    metrics so 'how strong' reads in Sharpe, not in the alpha knob. Blocking failures are
+    identified structurally: blocking rules emit status=='fail', advisory rules 'warn'."""
+    gate, result = _evaluate(frame, signal, candidate, settings, effective_trials=effective_trials)
+    status = {item.rule_id: item.status for item in gate.items}
+    passes = {rule_id: (value == "pass") for rule_id, value in status.items()}
+    passes["ALL_STAT"] = all(passes.get(g, False) for g in STANDALONE_AND_GATES)
+    passes["ALL_ECON"] = all(passes.get(g, False) for g in ECONOMIC_GATES)
+    failed_blocking = tuple(sorted(item.rule_id for item in gate.items if item.status == "fail"))
+    passes["PROD_X_PBO"] = set(failed_blocking) <= {"G2"}
+    return PowerTrial(
+        alpha=float(alpha),
+        horizon=int(horizon),
+        gross_sharpe=float(result.metrics_gross.sharpe) if result.metrics_gross else 0.0,
+        net_sharpe=float(result.metrics_primary.sharpe),
+        break_even_cost_bps=float(result.break_even_cost_bps),
+        actual_cost_bps=float(result.actual_cost_bps),
+        factor_turnover=float(result.factor_turnover),
+        avg_holding_period_bars=float(result.avg_holding_period_bars),
+        oos_trade_count=int(result.oos_trade_count),
+        passes=passes,
+        failed_blocking=failed_blocking,
+    )
+
+
+def power_sweep(
+    frame: pd.DataFrame,
+    candidate: CandidateStrategySpec,
+    settings: Settings,
+    *,
+    alphas,
+    horizon: int,
+    draws: int,
+    effective_trials: int = 400,
+    noise: float = 1.0,
+    resamples: int = 250,
+    seed: int = 0,
+) -> list[PowerTrial]:
+    """Sweep planted-edge strength at one payoff horizon. One candidate spec suffices:
+    the planted signal replaces the candidate's own signal — the spec only supplies
+    interval/method/cost context — so alphas × draws control the Monte Carlo."""
+    cs = calibration_settings(settings, n_resamples=resamples)
+    rng = np.random.default_rng(seed)
+    trials: list[PowerTrial] = []
+    for alpha in alphas:
+        for _ in range(draws):
+            sig = plant_signal_with_horizon(frame, rng, alpha=float(alpha), noise=noise, horizon=horizon)
+            trials.append(
+                power_trial(frame, sig, candidate, cs, effective_trials=effective_trials, alpha=float(alpha), horizon=horizon)
+            )
+    return trials
+
+
+def summarize_power(trials: list[PowerTrial], gates: tuple[str, ...]) -> list[dict]:
+    """Per (horizon, alpha): mean achieved metrics, pass rates, blocking-failure shares
+    (the failure-share ranking is what names the binding constraint at each strength)."""
+    grouped: dict[tuple[int, float], list[PowerTrial]] = {}
+    for trial in trials:
+        grouped.setdefault((trial.horizon, trial.alpha), []).append(trial)
+    rows: list[dict] = []
+    for horizon, alpha in sorted(grouped):
+        batch = grouped[(horizon, alpha)]
+        n = len(batch)
+        failure_share: Counter[str] = Counter()
+        for trial in batch:
+            failure_share.update(trial.failed_blocking)
+        rows.append({
+            "horizon": horizon,
+            "alpha": alpha,
+            "n": n,
+            "gross_sharpe": sum(t.gross_sharpe for t in batch) / n,
+            "net_sharpe": sum(t.net_sharpe for t in batch) / n,
+            "break_even_cost_bps": sum(t.break_even_cost_bps for t in batch) / n,
+            "turnover": sum(t.factor_turnover for t in batch) / n,
+            "holding_bars": sum(t.avg_holding_period_bars for t in batch) / n,
+            "oos_trades": sum(t.oos_trade_count for t in batch) / n,
+            "rates": {g: sum(1 for t in batch if t.passes.get(g, False)) / n for g in gates},
+            "blocking_failure_share": {g: c / n for g, c in failure_share.most_common()},
+        })
+    return rows
+
+
+def minimum_detectable_alpha(rows: list[dict], gate: str, *, level: float = 0.5) -> dict | None:
+    """Smallest swept alpha whose ``gate`` pass rate reaches ``level``, with the achieved
+    gross/net Sharpe at that strength — so the answer reads in market units. None if the
+    sweep never reaches ``level`` (the gate is beyond the swept range)."""
+    for row in sorted(rows, key=lambda r: r["alpha"]):
+        if row["rates"].get(gate, 0.0) >= level:
+            return {
+                "alpha": row["alpha"],
+                "gross_sharpe": row["gross_sharpe"],
+                "net_sharpe": row["net_sharpe"],
+                "rate": row["rates"][gate],
+            }
+    return None
