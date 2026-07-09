@@ -89,6 +89,8 @@ def main() -> None:
     ap.add_argument("--horizons", default="1,48")
     ap.add_argument("--draws", type=int, default=20, help="Planted draws per (horizon, alpha) cell.")
     ap.add_argument("--n-trials", type=int, default=400, help="Effective trial count N fed to G1/G3 (a round's budget).")
+    ap.add_argument("--entry-band", type=float, default=0.0, help="Hysteresis entry band on the planted signal (0 = off).")
+    ap.add_argument("--exit-band", type=float, default=0.0, help="Hysteresis exit band (< entry).")
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -98,6 +100,10 @@ def main() -> None:
     candidate = default_candidates(
         families=("momentum",), lookbacks=(12,), symbol=args.symbol, market=args.market
     )[0]
+    if args.entry_band > 0.0 or args.exit_band > 0.0:
+        candidate.params["entry_band"] = args.entry_band
+        candidate.params["exit_band"] = args.exit_band
+        print(f"Hysteresis band on planted signal: entry={args.entry_band}, exit={args.exit_band}")
     alphas = _parse_floats(args.alphas)
     horizons = _parse_ints(args.horizons)
     cells = [(h, a) for h in horizons for a in alphas]
