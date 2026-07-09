@@ -1408,16 +1408,23 @@ def _combo_turnover_controls(combo: dict, components: list[dict], result_by_cand
         default=_combo_float(turnover_control, "position_buffer", default=0.15),
     )
 
-    if max_turnover > 0.20 or worst_cost_drag > 1.0:
-        smooth_span = max(smooth_span, 48)
-        signal_threshold = max(signal_threshold, 0.25)
-        position_buffer = max(position_buffer, 0.20)
-
-    return {
+    controls = {
         "smooth_span": smooth_span,
         "signal_threshold": signal_threshold,
         "position_buffer": position_buffer,
     }
+    if max_turnover > 0.20 or worst_cost_drag > 1.0:
+        controls["smooth_span"] = max(smooth_span, 48)
+        controls["signal_threshold"] = max(signal_threshold, 0.25)
+        controls["position_buffer"] = max(position_buffer, 0.20)
+        # Hysteresis band: hold through conviction, release on decay, so the combo
+        # trades on fewer, larger moves that can clear the round-trip cost (G8). Kept
+        # only when the turnover/cost-drag diagnostic fires — off otherwise.
+        entry_band = _combo_float(combo, "entry_band", default=_combo_float(turnover_control, "entry_band", default=0.30))
+        exit_band = _combo_float(combo, "exit_band", default=_combo_float(turnover_control, "exit_band", default=0.15))
+        controls["entry_band"] = max(entry_band, 0.30)
+        controls["exit_band"] = min(max(exit_band, 0.10), controls["entry_band"])
+    return controls
 
 
 def _combo_factor_ids(combo: dict) -> list[str]:

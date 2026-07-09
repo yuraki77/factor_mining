@@ -283,6 +283,9 @@ _LOCAL_TUNING_LOOKBACKS = (6, 12, 24, 48, 96)
 _LOCAL_TUNING_SMOOTH_SPANS = (1, 12, 24, 48, 96)
 _LOCAL_TUNING_SIGNAL_THRESHOLDS = (0.0, 0.10, 0.20, 0.30)
 _LOCAL_TUNING_POSITION_BUFFERS = (0.05, 0.10, 0.20, 0.30)
+# Coupled (entry_band, exit_band) hysteresis pairs, offered only to turnover-heavy
+# parents (the ones G8 rejects for churn). exit < entry gives genuine hysteresis.
+_LOCAL_TUNING_BANDS = ((0.30, 0.15), (0.45, 0.22))
 _LOCAL_TUNING_ZSCORE_WINDOWS = (96, 288, 576)
 _LOCAL_TUNING_TANH_SCALES = (1.0, 2.0, 3.0)
 _LOCAL_TUNING_MIN_PRIORITY = 1.75
@@ -2894,23 +2897,31 @@ def _local_tuning_param_grid(
     )
     zscore_values = _local_tuning_zscore_values(parent)
     tanh_values = _local_tuning_tanh_values(parent)
+    band_values = _local_tuning_band_values(parent, result)
     base_signature = _json_dumps_sorted(_repair_signature_params(parent.params))
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
 
-    for lookback, smooth_span, signal_threshold, position_buffer, zscore_window, tanh_scale in product(
+    for lookback, smooth_span, signal_threshold, position_buffer, zscore_window, tanh_scale, band in product(
         lookback_values,
         smooth_values,
         threshold_values,
         buffer_values,
         zscore_values,
         tanh_values,
+        band_values,
     ):
         params: dict[str, Any] = {
             "smooth_span": int(smooth_span),
             "signal_threshold": round(float(signal_threshold), 6),
             "position_buffer": round(float(position_buffer), 6),
         }
+        entry_band, exit_band = band
+        # Only stamp band keys when active, so a (0,0) pair yields a signature
+        # byte-identical to today — low-turnover grids are unchanged.
+        if entry_band > 0.0 or exit_band > 0.0:
+            params["entry_band"] = round(float(entry_band), 6)
+            params["exit_band"] = round(float(exit_band), 6)
         if lookback is not None:
             params["factor_lookback"] = int(lookback)
         if zscore_window is not None:
@@ -2945,6 +2956,31 @@ def _local_tuning_lookback_values(
         values.append(int(evidence.best_horizon_bars))
     values.extend(_LOCAL_TUNING_LOOKBACKS)
     return _ordered_unique_ints(values)
+
+
+def _local_tuning_band_values(
+    parent: CandidateStrategySpec, result: BacktestResult
+) -> list[tuple[float, float]]:
+    """Hysteresis-band pairs to try. Always includes the parent's current band (or the
+    (0,0) no-op), and adds active pairs ONLY for turnover-heavy or cost-dragged parents —
+    the signals G8 rejects for churn. A low-turnover parent gets a single-element list,
+    so its grid is byte-identical to before this axis existed."""
+    try:
+        current = (
+            max(0.0, float(parent.params.get("entry_band", 0.0) or 0.0)),
+            max(0.0, float(parent.params.get("exit_band", 0.0) or 0.0)),
+        )
+    except (TypeError, ValueError):
+        current = (0.0, 0.0)
+    values: list[tuple[float, float]] = [current]
+    cost_drag = 0.0
+    if result.metrics_gross is not None:
+        cost_drag = result.metrics_gross.sharpe - result.metrics_primary.sharpe
+    if result.factor_turnover > 0.15 or cost_drag > 1.0:
+        for pair in _LOCAL_TUNING_BANDS:
+            if pair not in values:
+                values.append(pair)
+    return values
 
 
 def _local_tuning_zscore_values(parent: CandidateStrategySpec) -> list[int | None]:
@@ -3050,6 +3086,8 @@ def _optimizer_style_param_diff(parent_params: dict[str, Any], child_params: dic
         "smooth_span",
         "signal_threshold",
         "position_buffer",
+        "entry_band",
+        "exit_band",
         "factor_lookback",
         "zscore_window",
         "tanh_scale",
@@ -3420,6 +3458,8 @@ def _repair_signature_params(params: dict[str, Any]) -> dict[str, Any]:
         "smooth_span",
         "signal_threshold",
         "position_buffer",
+        "entry_band",
+        "exit_band",
         "factor_lookback",
         "regime_filter",
         "funding_state_filter",

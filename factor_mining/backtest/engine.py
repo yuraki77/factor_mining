@@ -236,6 +236,41 @@ def _apply_position_buffer(target_position: pd.Series, threshold: float = 0.10) 
     return pd.Series(actual, index=target_position.index)
 
 
+def _apply_hysteresis_band(signal: pd.Series, *, entry_band: float, exit_band: float) -> pd.Series:
+    """Asymmetric entry/exit hysteresis on signal conviction. Flat until |signal| ≥
+    entry_band; once in, hold (passing the live signal through, sign flips allowed) until
+    |signal| ≤ exit_band, then flat. A signal hovering near zero no longer churns the
+    position every bar — it is taken only on conviction and released only on genuine
+    decay, cutting trade count so each trade must clear the round-trip cost, not die to
+    it. entry_band=exit_band=0 is a pass-through (today's behavior)."""
+    if entry_band <= 0.0 and exit_band <= 0.0:
+        return signal
+    exit_band = min(exit_band, entry_band)  # exit must be the looser threshold
+    arr = signal.to_numpy()
+    out = np.zeros_like(arr)
+    in_position = False
+    for i in range(len(arr)):
+        magnitude = abs(arr[i])
+        if in_position:
+            if magnitude <= exit_band:
+                in_position = False
+            else:
+                out[i] = arr[i]
+        elif magnitude >= entry_band:
+            in_position = True
+            out[i] = arr[i]
+    return pd.Series(out, index=signal.index)
+
+
+def _hysteresis_bands(candidate: CandidateStrategySpec) -> tuple[float, float]:
+    def _band(key: str) -> float:
+        try:
+            return max(0.0, min(float(candidate.params.get(key, 0.0)), 1.0))
+        except (TypeError, ValueError):
+            return 0.0
+    return _band("entry_band"), _band("exit_band")
+
+
 def _apply_exit_rules(
     position: pd.Series,
     open_returns: pd.Series,
@@ -398,6 +433,8 @@ def evaluate_strategy_path(
 
     open_returns = frame["open"].shift(-1) / frame["open"] - 1.0
     executable_signal = signals.shift(1).fillna(0.0)
+    entry_band, exit_band = _hysteresis_bands(candidate)
+    executable_signal = _apply_hysteresis_band(executable_signal, entry_band=entry_band, exit_band=exit_band)
     periods = annualization_factor(candidate.interval)
     bars_per_day = max(1.0, periods / 365.0)
     vol_window = max(2, int(settings.position_sizing.vol_window_days * bars_per_day))

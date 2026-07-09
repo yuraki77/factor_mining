@@ -154,3 +154,80 @@ def test_global_override_composes_and_wins_over_per_market() -> None:
     assert spot.taker_bps == 3.0             # global scenario wins over per-market 10
     assert spot.slippage_base_bps == 2.0     # non-overlapping override applies too
     assert costs_for_market(scenario, "um_futures").taker_bps == 3.0
+
+
+# ── WS2: hysteresis band ────────────────────────────────────────────────────
+
+def test_hysteresis_band_cuts_trades_and_keeps_direction() -> None:
+    """A signal that oscillates through zero must trade less under a band, because the
+    band holds through conviction and releases only on decay — but the trades it does
+    take must keep the signal's sign (the band gates magnitude, not direction)."""
+    from factor_mining.backtest.engine import _apply_hysteresis_band
+
+    # strong entries punctuating runs of sub-threshold wobble: raw tracks every wobble
+    # (a trade each), the band holds flat through them (enter only on the 0.5/-0.55 bars)
+    raw = pd.Series([0.5, 0.05, 0.09, 0.03, 0.07, 0.5, 0.06, -0.55, 0.04, 0.08])
+    banded = _apply_hysteresis_band(raw, entry_band=0.3, exit_band=0.1)
+
+    def _trades(s: pd.Series) -> int:
+        return int((s.diff().fillna(s).abs() > 1e-9).sum())
+
+    assert _trades(banded) < _trades(raw)          # 6 < 10
+    # every nonzero banded value keeps the raw sign at that bar (band gates magnitude)
+    for r, b in zip(raw, banded):
+        assert b == 0.0 or (b > 0) == (r > 0)
+
+
+def test_flat_band_is_identity() -> None:
+    """entry=exit=0 must be a pass-through so the whole feature is off by default and
+    every existing backtest is byte-identical."""
+    from factor_mining.backtest.engine import _apply_hysteresis_band
+
+    raw = pd.Series([0.0, 0.5, -0.3, 0.1, 0.0, -0.7])
+    out = _apply_hysteresis_band(raw, entry_band=0.0, exit_band=0.0)
+    assert out is raw  # untouched object, not just equal
+
+
+def test_band_reduces_backtest_turnover_end_to_end() -> None:
+    """Through the full engine: the same signal with an active band must trade less —
+    lower turnover — which is the whole point (fewer, larger trades that can clear
+    costs). Turnover is the continuous target; a slow oscillator spends real stretches
+    below the exit band where the band holds flat instead of tracking every wobble."""
+    n = 600
+    frame = _frame([100.0 + 5.0 * np.sin(i / 40.0) for i in range(n)], [1e9] * n)
+    sig = pd.Series(0.6 * np.sin(np.arange(n) / 20.0))  # slow: long sub-exit stretches
+    settings = _market_settings()
+
+    def _cand(bands: dict) -> CandidateStrategySpec:
+        return CandidateStrategySpec(
+            candidate_id="c", hypothesis_id="h", method_id="factor_scoring",
+            hypothesis_family="momentum", symbol="BTCUSDT", market="um_futures", interval="5m",
+            params={"position_buffer": 0.1, **bands},
+        )
+
+    plain = run_backtest(frame, sig, _cand({}), settings)
+    banded = run_backtest(frame, sig, _cand({"entry_band": 0.4, "exit_band": 0.15}), settings)
+    assert banded.factor_turnover < plain.factor_turnover
+    assert banded.oos_trade_count <= plain.oos_trade_count
+
+
+def test_combo_turnover_controls_emit_bands_only_when_churny() -> None:
+    """The optimizer's combo path must add band params when (and only when) the combo's
+    components are turnover-heavy — otherwise a fine low-turnover combo gets no band."""
+    from factor_mining.optimizers.traditional_optimizer import _combo_turnover_controls
+    from factor_mining.models import BacktestResult, MetricsBlock
+
+    def _res(cid: str, turnover: float) -> BacktestResult:
+        return BacktestResult(
+            experiment_id=f"e{cid}", candidate_id=cid, hypothesis_family="momentum",
+            method_id="factor_scoring", symbol="BTCUSDT", market="um_futures", interval="5m",
+            metrics_primary=MetricsBlock(sharpe=1.0), metrics_gross=MetricsBlock(sharpe=1.2),
+            factor_turnover=turnover,
+        )
+
+    components = [{"candidate_id": "a"}]
+    churny = _combo_turnover_controls({}, components, {"a": _res("a", 0.9)})
+    calm = _combo_turnover_controls({}, components, {"a": _res("a", 0.01)})
+
+    assert churny["entry_band"] >= 0.30 and 0.0 < churny["exit_band"] <= churny["entry_band"]
+    assert "entry_band" not in calm and "exit_band" not in calm

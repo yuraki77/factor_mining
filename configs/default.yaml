@@ -157,7 +157,11 @@ factory:
     persistently negative: prefer long-biased mechanisms, or gate shorts
     behind demanding conditions (e.g. extreme positive funding plus downtrend
     regime). Avoid plain mean-reversion variants without an explicit cost
-    story - that family is heavily explored.
+    story - that family is heavily explored. Specify explicit entry/exit
+    conviction bands (enter only on strong signal, hold until it decays) so
+    each trade is large enough that its expected move clears the round-trip
+    cost budget; a signal that flips every bar is destroyed by fees no matter
+    how predictive.
   min_new_days: 1.0
   trial_budget_per_round: 400
   family_budget_floor: 20
