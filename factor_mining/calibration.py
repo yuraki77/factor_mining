@@ -98,6 +98,31 @@ def plant_signal(frame: pd.DataFrame, rng: np.random.Generator, *, alpha: float,
     return plant_signal_with_horizon(frame, rng, alpha=alpha, noise=noise, horizon=1)
 
 
+def plant_regime_concentrated_signal(
+    frame: pd.DataFrame,
+    regimes,
+    kept_labels,
+    rng: np.random.Generator,
+    *,
+    alpha: float,
+    noise: float,
+    horizon: int,
+) -> np.ndarray:
+    """Clairvoyant edge ONLY inside ``kept_labels`` regimes; pure noise elsewhere.
+
+    This is the correct positive control for the regime-filter comparison: a *uniform*
+    clairvoyant signal has edge in every regime, so filtering can only remove good bars
+    and would make regime-conditioning look strictly harmful. A real regime-conditioned
+    signal has predictive power concentrated in some regimes and none in others — that is
+    exactly the shape where a regime filter should help, by zeroing the noise-regime
+    exposure that otherwise churns cost and dilutes IC."""
+    edge = plant_signal_with_horizon(frame, rng, alpha=alpha, noise=noise, horizon=horizon)
+    labels = np.asarray(regimes, dtype=object)
+    in_kept = np.isin(labels, list(kept_labels))
+    pure_noise = np.tanh(noise * rng.standard_normal(len(frame)))
+    return np.where(in_kept, edge, pure_noise)
+
+
 def calibration_settings(settings: Settings, *, n_resamples: int = 250) -> Settings:
     """Cheaper bootstrap + no permutation test. Neither changes *which* gates are being
     calibrated, and both dominate per-backtest cost, so this keeps a Monte-Carlo sweep
@@ -361,16 +386,33 @@ def power_sweep(
     noise: float = 1.0,
     resamples: int = 250,
     seed: int = 0,
+    regimes=None,
+    regime_keep=None,
+    regime_filter: bool = False,
 ) -> list[PowerTrial]:
     """Sweep planted-edge strength at one payoff horizon. One candidate spec suffices:
     the planted signal replaces the candidate's own signal — the spec only supplies
-    interval/method/cost context — so alphas × draws control the Monte Carlo."""
+    interval/method/cost context — so alphas × draws control the Monte Carlo.
+
+    When ``regimes``/``regime_keep`` are given, the edge is regime-concentrated (see
+    :func:`plant_regime_concentrated_signal`); ``regime_filter=True`` additionally zeroes
+    the signal outside the kept regimes (models ``regime_filter`` ON). Comparing the two
+    isolates whether filtering recovers a regime-concentrated edge."""
     cs = calibration_settings(settings, n_resamples=resamples)
     rng = np.random.default_rng(seed)
+    keep = list(regime_keep) if regime_keep else []
+    mask = np.isin(np.asarray(regimes, dtype=object), keep) if (regimes is not None and keep) else None
     trials: list[PowerTrial] = []
     for alpha in alphas:
         for _ in range(draws):
-            sig = plant_signal_with_horizon(frame, rng, alpha=float(alpha), noise=noise, horizon=horizon)
+            if mask is not None:
+                sig = plant_regime_concentrated_signal(
+                    frame, regimes, keep, rng, alpha=float(alpha), noise=noise, horizon=horizon
+                )
+                if regime_filter:
+                    sig = np.where(mask, sig, 0.0)
+            else:
+                sig = plant_signal_with_horizon(frame, rng, alpha=float(alpha), noise=noise, horizon=horizon)
             trials.append(
                 power_trial(frame, sig, candidate, cs, effective_trials=effective_trials, alpha=float(alpha), horizon=horizon)
             )

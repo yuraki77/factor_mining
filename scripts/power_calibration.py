@@ -21,6 +21,8 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ProcessPoolExecutor
 
+import numpy as np
+
 from factor_mining.calibration import (
     POWER_COMPOSITES,
     default_candidates,
@@ -47,7 +49,7 @@ def _print_horizon(rows: list[dict], horizon: int) -> None:
     hrows = [r for r in rows if r["horizon"] == horizon]
     print(f"\n== horizon {horizon} bars ==")
     header = (
-        f"  {'alpha':>6} {'grossSR':>8} {'netSR':>8} {'brkeven':>8} {'hold':>6} {'oosTrd':>7}"
+        f"  {'alpha':>6} {'grossSR':>8} {'netSR':>8} {'brkeven':>8} {'turnovr':>8} {'hold':>6} {'oosTrd':>7}"
         f"  {'G1':>5} {'G3':>5} {'G5':>5} {'G7':>5} {'STAT':>5} | {'G8':>5} {'G10':>5} {'ECON':>5} | {'PROD*':>6}  binding"
     )
     print(header)
@@ -59,7 +61,7 @@ def _print_horizon(rows: list[dict], horizon: int) -> None:
         band = " *" if REALISTIC_GROSS_SR[0] <= r["gross_sharpe"] <= REALISTIC_GROSS_SR[1] else "  "
         print(
             f"  {r['alpha']:>6.3f} {r['gross_sharpe']:>8.2f} {r['net_sharpe']:>8.2f}"
-            f" {r['break_even_cost_bps']:>8.1f} {r['holding_bars']:>6.0f} {r['oos_trades']:>7.0f}"
+            f" {r['break_even_cost_bps']:>8.1f} {r['turnover']:>8.4f} {r['holding_bars']:>6.0f} {r['oos_trades']:>7.0f}"
             f"  {rates['G1']:>5.0%} {rates['G3']:>5.0%} {rates['G5']:>5.0%} {rates['G7']:>5.0%}"
             f" {rates['ALL_STAT']:>5.0%} | {rates['G8']:>5.0%} {rates['G10']:>5.0%}"
             f" {rates['ALL_ECON']:>5.0%} | {rates['PROD_X_PBO']:>6.0%}{band}{binding}"
@@ -91,6 +93,8 @@ def main() -> None:
     ap.add_argument("--n-trials", type=int, default=400, help="Effective trial count N fed to G1/G3 (a round's budget).")
     ap.add_argument("--entry-band", type=float, default=0.0, help="Hysteresis entry band on the planted signal (0 = off).")
     ap.add_argument("--exit-band", type=float, default=0.0, help="Hysteresis exit band (< entry).")
+    ap.add_argument("--regime-concentrate", default="", help="Comma-separated regime labels the edge is concentrated in (noise elsewhere); '' = uniform edge.")
+    ap.add_argument("--regime-filter", action="store_true", help="Also zero the signal outside the concentrated regimes (regime_filter ON).")
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -104,6 +108,14 @@ def main() -> None:
         candidate.params["entry_band"] = args.entry_band
         candidate.params["exit_band"] = args.exit_band
         print(f"Hysteresis band on planted signal: entry={args.entry_band}, exit={args.exit_band}")
+    regime_keep = [s.strip() for s in args.regime_concentrate.split(",") if s.strip()]
+    regimes = None
+    if regime_keep:
+        from factor_mining.pipeline import _fit_regime_model
+        regimes = _fit_regime_model(frame, args.tail, lambda *_: None).to_numpy()
+        share = float(np.isin(regimes, regime_keep).mean())
+        print(f"Regime-concentrated edge in {regime_keep} ({share:.0%} of bars); "
+              f"filter {'ON (noise-regime bars zeroed)' if args.regime_filter else 'OFF (noise-regime bars traded)'}")
     alphas = _parse_floats(args.alphas)
     horizons = _parse_ints(args.horizons)
     cells = [(h, a) for h in horizons for a in alphas]
@@ -113,7 +125,10 @@ def main() -> None:
         f"(N={args.n_trials} fed to G1/G3)"
     )
 
-    common = dict(settings=settings, draws=args.draws, effective_trials=args.n_trials)
+    common = dict(
+        settings=settings, draws=args.draws, effective_trials=args.n_trials,
+        regimes=regimes, regime_keep=regime_keep, regime_filter=args.regime_filter,
+    )
     if args.workers <= 1:
         trials = []
         for idx, (horizon, alpha) in enumerate(cells):
