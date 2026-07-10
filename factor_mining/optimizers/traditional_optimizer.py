@@ -1408,21 +1408,38 @@ def _combo_turnover_controls(combo: dict, components: list[dict], result_by_cand
         default=_combo_float(turnover_control, "position_buffer", default=0.15),
     )
 
+    # G8 deficit across components, as a fraction of the actual cost: how far gross
+    # break-even sits below the 2x bar. 0 = margin met; 1 = break-even a full cost
+    # unit short. Drives how tight the band must be (2026-07-10 power sweep: entry
+    # 0.6 clears a ~0.4 deficit, 0.8 clears ~1.0+, netSR essentially unchanged).
+    worst_cost_deficit = 0.0
+    for result in component_results:
+        actual = float(result.actual_cost_bps)
+        if actual > 0.0:
+            deficit = (2.0 * actual - float(result.break_even_cost_bps)) / actual
+            worst_cost_deficit = max(worst_cost_deficit, deficit)
+
     controls = {
         "smooth_span": smooth_span,
         "signal_threshold": signal_threshold,
         "position_buffer": position_buffer,
     }
-    if max_turnover > 0.20 or worst_cost_drag > 1.0:
+    if max_turnover > 0.20 or worst_cost_drag > 1.0 or worst_cost_deficit > 0.0:
         controls["smooth_span"] = max(smooth_span, 48)
         controls["signal_threshold"] = max(signal_threshold, 0.25)
         controls["position_buffer"] = max(position_buffer, 0.20)
         # Hysteresis band: hold through conviction, release on decay, so the combo
-        # trades on fewer, larger moves that can clear the round-trip cost (G8). Kept
-        # only when the turnover/cost-drag diagnostic fires — off otherwise.
-        entry_band = _combo_float(combo, "entry_band", default=_combo_float(turnover_control, "entry_band", default=0.30))
-        exit_band = _combo_float(combo, "exit_band", default=_combo_float(turnover_control, "exit_band", default=0.15))
-        controls["entry_band"] = max(entry_band, 0.30)
+        # trades on fewer, larger moves that can clear the round-trip cost (G8).
+        # Tightness scales with the measured deficit; off when nothing fires.
+        if worst_cost_deficit >= 1.0:
+            floor_entry, floor_exit = 0.80, 0.40
+        elif worst_cost_deficit >= 0.4:
+            floor_entry, floor_exit = 0.60, 0.25
+        else:
+            floor_entry, floor_exit = 0.30, 0.15
+        entry_band = _combo_float(combo, "entry_band", default=_combo_float(turnover_control, "entry_band", default=floor_entry))
+        exit_band = _combo_float(combo, "exit_band", default=_combo_float(turnover_control, "exit_band", default=floor_exit))
+        controls["entry_band"] = max(entry_band, floor_entry)
         controls["exit_band"] = min(max(exit_band, 0.10), controls["entry_band"])
     return controls
 

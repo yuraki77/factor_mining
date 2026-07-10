@@ -283,9 +283,12 @@ _LOCAL_TUNING_LOOKBACKS = (6, 12, 24, 48, 96)
 _LOCAL_TUNING_SMOOTH_SPANS = (1, 12, 24, 48, 96)
 _LOCAL_TUNING_SIGNAL_THRESHOLDS = (0.0, 0.10, 0.20, 0.30)
 _LOCAL_TUNING_POSITION_BUFFERS = (0.05, 0.10, 0.20, 0.30)
-# Coupled (entry_band, exit_band) hysteresis pairs, offered only to turnover-heavy
-# parents (the ones G8 rejects for churn). exit < entry gives genuine hysteresis.
-_LOCAL_TUNING_BANDS = ((0.30, 0.15), (0.45, 0.22))
+# Coupled (entry_band, exit_band) hysteresis pairs, offered to turnover-heavy or
+# cost-margin-failing parents (the ones G8 rejects). exit < entry gives genuine
+# hysteresis. The 2026-07-10 power sweep (docs/power_sweep_2026-07.md) measured the
+# cost-clearing region starting at ~0.6 entry: tightening 0.4→0.8 raised gross
+# break-even 10.9→18.3 bps with netSR essentially unchanged (25.3→24.8).
+_LOCAL_TUNING_BANDS = ((0.30, 0.15), (0.45, 0.22), (0.60, 0.25), (0.80, 0.40))
 _LOCAL_TUNING_ZSCORE_WINDOWS = (96, 288, 576)
 _LOCAL_TUNING_TANH_SCALES = (1.0, 2.0, 3.0)
 _LOCAL_TUNING_MIN_PRIORITY = 1.75
@@ -2976,7 +2979,11 @@ def _local_tuning_band_values(
     cost_drag = 0.0
     if result.metrics_gross is not None:
         cost_drag = result.metrics_gross.sharpe - result.metrics_primary.sharpe
-    if result.factor_turnover > 0.15 or cost_drag > 1.0:
+    # G8 deficit is a trigger in its own right: a low-turnover parent can still fail
+    # the cost margin, and band tightening is the measured near-free lever for it.
+    actual_cost = float(result.actual_cost_bps)
+    g8_deficit = actual_cost > 0.0 and float(result.break_even_cost_bps) < 2.0 * actual_cost
+    if result.factor_turnover > 0.15 or cost_drag > 1.0 or g8_deficit:
         for pair in _LOCAL_TUNING_BANDS:
             if pair not in values:
                 values.append(pair)
@@ -3152,7 +3159,12 @@ def _local_grid_acquisition_score(
     smooth_span = max(1, int(params.get("smooth_span", parent.params.get("smooth_span", 1)) or 1))
     signal_threshold = float(params.get("signal_threshold", parent.params.get("signal_threshold", 0.0)) or 0.0)
     position_buffer = float(params.get("position_buffer", parent.params.get("position_buffer", 0.05)) or 0.05)
-    conservatism = np.log2(float(smooth_span)) + 4.0 * signal_threshold + 2.0 * position_buffer
+    entry_band = float(params.get("entry_band", parent.params.get("entry_band", 0.0)) or 0.0)
+    # entry_band joins the conservatism term so the severity scaling (which already
+    # encodes the G8 deficit via _local_tuning_problem_severity's cost_ratio) ranks
+    # tighter bands FIRST for cost-blocked parents and LAST for healthy ones — the
+    # cost-margin acquisition objective from the 2026-07-10 power sweep.
+    conservatism = np.log2(float(smooth_span)) + 4.0 * signal_threshold + 2.0 * position_buffer + 4.0 * entry_band
     problem_severity = _local_tuning_problem_severity(result)
     score += (0.45 * problem_severity - 0.10) * conservatism
 

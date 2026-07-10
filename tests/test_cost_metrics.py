@@ -211,6 +211,82 @@ def test_band_reduces_backtest_turnover_end_to_end() -> None:
     assert banded.oos_trade_count <= plain.oos_trade_count
 
 
+def _cost_result(
+    cid: str,
+    *,
+    turnover: float,
+    break_even: float,
+    actual: float,
+    gross_sharpe: float = 1.2,
+    net_sharpe: float = 1.0,
+):
+    from factor_mining.models import BacktestResult, MetricsBlock
+
+    return BacktestResult(
+        experiment_id=f"e{cid}", candidate_id=cid, hypothesis_family="momentum",
+        method_id="factor_scoring", symbol="BTCUSDT", market="um_futures", interval="5m",
+        metrics_primary=MetricsBlock(sharpe=net_sharpe), metrics_gross=MetricsBlock(sharpe=gross_sharpe),
+        factor_turnover=turnover, break_even_cost_bps=break_even, actual_cost_bps=actual,
+    )
+
+
+def test_combo_bands_scale_with_cost_deficit() -> None:
+    """The combo path must react to a MEASURED G8 deficit, not only to churn: a
+    low-turnover combo whose break-even sits a full cost-unit under the 2x bar gets
+    the tight 0.80/0.40 band the power sweep showed clears it; a moderate deficit
+    gets 0.60/0.25 (sweep: tightening was near-free in netSR)."""
+    from factor_mining.optimizers.traditional_optimizer import _combo_turnover_controls
+
+    components = [{"candidate_id": "a"}]
+    # deficit = (2*6 - 2)/6 ≈ 1.67 → severe
+    severe = _combo_turnover_controls({}, components, {"a": _cost_result("a", turnover=0.01, break_even=2.0, actual=6.0)})
+    assert (severe["entry_band"], severe["exit_band"]) == (0.80, 0.40)
+    # deficit = (12 - 9)/6 = 0.5 → moderate
+    moderate = _combo_turnover_controls({}, components, {"a": _cost_result("a", turnover=0.01, break_even=9.0, actual=6.0)})
+    assert (moderate["entry_band"], moderate["exit_band"]) == (0.60, 0.25)
+    # margin met (break_even 30 > 12) and calm → no band keys at all
+    healthy = _combo_turnover_controls({}, components, {"a": _cost_result("a", turnover=0.01, break_even=30.0, actual=6.0)})
+    assert "entry_band" not in healthy
+
+
+def test_local_band_values_offered_on_cost_margin_failure() -> None:
+    """The local grid must offer band pairs to a CALM parent that fails the cost
+    margin — churn is not the only way to fail G8, and band tightening is the
+    measured near-free repair. Healthy calm parents keep a single no-op pair so
+    their grids are unchanged."""
+    from factor_mining.pipeline import _local_tuning_band_values
+
+    parent = CandidateStrategySpec(
+        candidate_id="p", hypothesis_id="h", method_id="factor_scoring",
+        hypothesis_family="momentum", symbol="BTCUSDT", market="um_futures", interval="5m",
+    )
+    failing = _local_tuning_band_values(parent, _cost_result("a", turnover=0.01, break_even=2.0, actual=6.0))
+    assert (0.80, 0.40) in failing and (0.60, 0.25) in failing
+
+    healthy = _local_tuning_band_values(parent, _cost_result("a", turnover=0.01, break_even=30.0, actual=6.0))
+    assert healthy == [(0.0, 0.0)]
+
+
+def test_acquisition_ranks_tight_bands_by_cost_pressure() -> None:
+    """The cost-margin objective, both directions: under a severe G8 deficit the
+    tighter band must rank FIRST (it is the repair), and for a healthy parent it
+    must rank LAST (never over-throttle what already clears the margin)."""
+    from factor_mining.pipeline import _local_grid_acquisition_score
+
+    parent = CandidateStrategySpec(
+        candidate_id="p", hypothesis_id="h", method_id="factor_scoring",
+        hypothesis_family="momentum", symbol="BTCUSDT", market="um_futures", interval="5m",
+    )
+    tight = {"smooth_span": 24, "signal_threshold": 0.1, "position_buffer": 0.1, "entry_band": 0.80, "exit_band": 0.40}
+    loose = {"smooth_span": 24, "signal_threshold": 0.1, "position_buffer": 0.1, "entry_band": 0.30, "exit_band": 0.15}
+
+    pressured = _cost_result("a", turnover=0.01, break_even=0.0, actual=6.0)  # severity 1.0
+    assert _local_grid_acquisition_score(parent, pressured, None, tight) > _local_grid_acquisition_score(parent, pressured, None, loose)
+
+    healthy = _cost_result("a", turnover=0.01, break_even=30.0, actual=6.0)  # severity 0.0
+    assert _local_grid_acquisition_score(parent, healthy, None, tight) < _local_grid_acquisition_score(parent, healthy, None, loose)
+
+
 def test_combo_turnover_controls_emit_bands_only_when_churny() -> None:
     """The optimizer's combo path must add band params when (and only when) the combo's
     components are turnover-heavy — otherwise a fine low-turnover combo gets no band."""
