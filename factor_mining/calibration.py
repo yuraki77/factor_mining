@@ -389,28 +389,48 @@ def power_sweep(
     regimes=None,
     regime_keep=None,
     regime_filter: bool = False,
+    regime_mode: str = "off",
 ) -> list[PowerTrial]:
     """Sweep planted-edge strength at one payoff horizon. One candidate spec suffices:
     the planted signal replaces the candidate's own signal — the spec only supplies
     interval/method/cost context — so alphas × draws control the Monte Carlo.
 
     When ``regimes``/``regime_keep`` are given, the edge is regime-concentrated (see
-    :func:`plant_regime_concentrated_signal`); ``regime_filter=True`` additionally zeroes
-    the signal outside the kept regimes (models ``regime_filter`` ON). Comparing the two
-    isolates whether filtering recovers a regime-concentrated edge."""
+    :func:`plant_regime_concentrated_signal`) and ``regime_mode`` selects the repair
+    shape applied to it, REUSING the pipeline's real implementations so the harness
+    measures production code: "off" (trade the mixed signal), "hard"/"soft"/
+    "entry_only" (``_apply_regime_filter_mode``), or "signed" (the edge INVERTS
+    outside kept regimes and ``_apply_regime_signs`` must recover it).
+    ``regime_filter=True`` is the deprecated alias for ``regime_mode="hard"``."""
+    from factor_mining.pipeline import _apply_regime_filter_mode, _apply_regime_signs
+
     cs = calibration_settings(settings, n_resamples=resamples)
     rng = np.random.default_rng(seed)
     keep = list(regime_keep) if regime_keep else []
-    mask = np.isin(np.asarray(regimes, dtype=object), keep) if (regimes is not None and keep) else None
+    mode = "hard" if (regime_filter and regime_mode == "off") else str(regime_mode)
+    labels = np.asarray(regimes, dtype=object) if regimes is not None else None
+    mask = np.isin(labels, keep) if (labels is not None and keep) else None
     trials: list[PowerTrial] = []
     for alpha in alphas:
         for _ in range(draws):
             if mask is not None:
-                sig = plant_regime_concentrated_signal(
-                    frame, regimes, keep, rng, alpha=float(alpha), noise=noise, horizon=horizon
-                )
-                if regime_filter:
-                    sig = np.where(mask, sig, 0.0)
+                if mode == "signed":
+                    # inversion plant: real edge everywhere, sign flipped outside keep
+                    base = plant_signal_with_horizon(frame, rng, alpha=float(alpha), noise=noise, horizon=horizon)
+                    flipped = pd.Series(np.where(mask, base, -base))
+                    other = sorted({str(x) for x in labels} - set(map(str, keep)))
+                    sig = _apply_regime_signs(
+                        flipped, {label: -1 for label in other}, pd.Series(labels), None
+                    ).to_numpy()
+                else:
+                    sig = plant_regime_concentrated_signal(
+                        frame, regimes, keep, rng, alpha=float(alpha), noise=noise, horizon=horizon
+                    )
+                    if mode in {"hard", "soft", "entry_only"}:
+                        sig = _apply_regime_filter_mode(
+                            pd.Series(sig), mask,
+                            {"regime_filter_mode": mode, "regime_soft_weight": 0.25},
+                        ).to_numpy()
             else:
                 sig = plant_signal_with_horizon(frame, rng, alpha=float(alpha), noise=noise, horizon=horizon)
             trials.append(

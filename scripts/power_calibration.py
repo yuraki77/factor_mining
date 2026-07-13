@@ -94,7 +94,9 @@ def main() -> None:
     ap.add_argument("--entry-band", type=float, default=0.0, help="Hysteresis entry band on the planted signal (0 = off).")
     ap.add_argument("--exit-band", type=float, default=0.0, help="Hysteresis exit band (< entry).")
     ap.add_argument("--regime-concentrate", default="", help="Comma-separated regime labels the edge is concentrated in (noise elsewhere); '' = uniform edge.")
-    ap.add_argument("--regime-filter", action="store_true", help="Also zero the signal outside the concentrated regimes (regime_filter ON).")
+    ap.add_argument("--regime-filter", action="store_true", help="Deprecated alias for --regime-mode hard.")
+    ap.add_argument("--regime-mode", default="off", choices=["off", "hard", "soft", "entry_only", "signed"],
+                    help="Repair shape applied to the regime-concentrated edge, using the REAL pipeline implementations. 'signed' plants an inverting edge instead of a concentrated one.")
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -128,6 +130,7 @@ def main() -> None:
     common = dict(
         settings=settings, draws=args.draws, effective_trials=args.n_trials,
         regimes=regimes, regime_keep=regime_keep, regime_filter=args.regime_filter,
+        regime_mode=args.regime_mode,
     )
     if args.workers <= 1:
         trials = []
