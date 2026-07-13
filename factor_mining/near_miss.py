@@ -93,6 +93,9 @@ def analyze_near_miss(
         reasons.append("regime_mixing")
         suggested["regime_filter"] = [str(best_regime)]
         actions.append("add_regime_filter")
+        # The repair generator also spawns entry_only/soft/signed shapes for this
+        # reason — record the softer path so the Watch stratum is self-describing.
+        actions.append("soften_regime_filter")
 
     best_funding_key = diagnostics.get("best_funding_key")
     if best_funding_key and _conditional_edge(diagnostics, "max_abs_funding_ic"):

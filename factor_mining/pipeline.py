@@ -2709,7 +2709,7 @@ def _candidate_complexity_score(candidate: CandidateStrategySpec) -> int:
     )
     if has_turnover_controls:
         score += 1
-    for key in ("regime_filter", "funding_state_filter", "funding_trend_filter"):
+    for key in ("regime_filter", "funding_state_filter", "funding_trend_filter", "regime_signs"):
         if params.get(key):
             score += 1
     if str(params.get("side_mode", "both")).lower() in {"long_only", "short_only"}:
@@ -3098,6 +3098,9 @@ def _optimizer_style_param_diff(parent_params: dict[str, Any], child_params: dic
         "factor_lookback",
         "zscore_window",
         "tanh_scale",
+        "regime_filter_mode",
+        "regime_soft_weight",
+        "regime_signs",
     }
     return {
         key: child_params[key]
@@ -3250,9 +3253,26 @@ def _pre_gate_repairs_for_parent(
 
     regime_params = _regime_repair_params(evidence)
     if regime_params:
+        # Four regime shapes, not one: the hard filter alone created a jointly
+        # infeasible G7×G8 region (0 of 1,820 regime_mixing near-misses held both
+        # positive margin and >=100 OOS trades). entry_only/soft preserve trades
+        # while cutting noise-regime exposure; signed handles edges that invert
+        # by regime. All face the same gates — this widens the repair search,
+        # it does not loosen anything.
         repairs.append(_spawn_pre_gate_repair(parent, "pre_gate_regime_filter", regime_params))
+        repairs.append(_spawn_pre_gate_repair(
+            parent, "pre_gate_regime_entry_only",
+            {**regime_params, "regime_filter_mode": "entry_only"},
+        ))
+        repairs.append(_spawn_pre_gate_repair(
+            parent, "pre_gate_regime_soft",
+            {**regime_params, "regime_filter_mode": "soft", "regime_soft_weight": 0.25},
+        ))
         bundled_params.update(regime_params)
         bundled_reasons += 1
+    signed_params = _regime_signed_repair_params(evidence)
+    if signed_params:
+        repairs.append(_spawn_pre_gate_repair(parent, "pre_gate_regime_signed", signed_params))
 
     funding_params = _funding_repair_params(evidence)
     if funding_params:
@@ -3316,7 +3336,13 @@ def _repair_acquisition_score(
         score += 1.2
     if variant == "pre_gate_horizon" and evidence is not None:
         score += 0.8
-    if variant in {"pre_gate_regime_filter", "pre_gate_funding_filter"}:
+    if variant in {
+        "pre_gate_regime_filter",
+        "pre_gate_regime_entry_only",
+        "pre_gate_regime_soft",
+        "pre_gate_regime_signed",
+        "pre_gate_funding_filter",
+    }:
         score += 0.7
     if variant == "pre_gate_side_mode":
         score += 0.5
@@ -3414,6 +3440,31 @@ def _regime_repair_params(evidence: FactorEvidenceReport | None) -> dict[str, li
     return {"regime_filter": [label]}
 
 
+def _regime_signed_repair_params(evidence: FactorEvidenceReport | None) -> dict[str, Any]:
+    """Signed regime variant, offered only when the evidence shows a genuine sign
+    INVERSION across regimes (one clearly positive and one clearly negative mean
+    IC) — otherwise signs degenerate to identity or to the hard filter. The ICs in
+    ``regime_conditional_ic`` are signed Pearson values (evidence.py:_conditional_ic);
+    only the best-regime selection elsewhere takes the abs."""
+    if evidence is None:
+        return {}
+    signs: dict[str, int] = {}
+    has_negative = has_positive = False
+    for label, by_horizon in evidence.regime_conditional_ic.items():
+        if not by_horizon or str(label) == "unknown":
+            continue
+        mean_ic = float(np.mean([float(v) for v in by_horizon.values()]))
+        if abs(mean_ic) < _PRE_GATE_MIN_CONDITIONAL_IC:
+            continue
+        sign = 1 if mean_ic > 0 else -1
+        signs[str(label)] = sign
+        has_negative = has_negative or sign < 0
+        has_positive = has_positive or sign > 0
+    if not (has_negative and has_positive):
+        return {}
+    return {"regime_signs": signs}
+
+
 def _funding_repair_params(evidence: FactorEvidenceReport | None) -> dict[str, list[str]]:
     if evidence is None:
         return {}
@@ -3474,6 +3525,9 @@ def _repair_signature_params(params: dict[str, Any]) -> dict[str, Any]:
         "exit_band",
         "factor_lookback",
         "regime_filter",
+        "regime_filter_mode",
+        "regime_soft_weight",
+        "regime_signs",
         "funding_state_filter",
         "funding_trend_filter",
         "side_mode",
@@ -4768,13 +4822,17 @@ def _apply_candidate_filters(
     build_context: SignalBuildContext | None = None,
 ) -> pd.Series:
     filtered = signal.copy()
+    regime_signs = params.get("regime_signs")
+    if isinstance(regime_signs, dict) and regime_signs:
+        filtered = _apply_regime_signs(filtered, regime_signs, forward_regimes, build_context)
     regime_filter = _filter_values(params.get("regime_filter"))
     if regime_filter:
         if build_context is not None and len(filtered) == len(build_context.frame):
-            filtered = filtered.where(build_context.cached_filter_mask("regime", regime_filter), 0.0)
+            regime_mask = build_context.cached_filter_mask("regime", regime_filter)
         else:
             regimes = pd.Series(forward_regimes.to_numpy(), index=filtered.index).astype(str)
-            filtered = filtered.where(regimes.isin(regime_filter), 0.0)
+            regime_mask = regimes.isin(regime_filter).to_numpy()
+        filtered = _apply_regime_filter_mode(filtered, regime_mask, params)
 
     funding_state_filter = _filter_values(params.get("funding_state_filter"))
     if funding_state_filter:
@@ -4803,6 +4861,74 @@ def _filter_values(value: Any) -> set[str]:
     if isinstance(value, list | tuple | set):
         return {str(item) for item in value}
     return {str(value)}
+
+
+def _apply_regime_filter_mode(signal: pd.Series, mask, params: dict) -> pd.Series:
+    """Regime-filter shapes beyond the hard zero (the G7×G8 frontier fix):
+
+    hard        — zero outside allowed regimes (today's behavior, the default).
+    soft        — scale outside-regime signal by ``regime_soft_weight`` instead of
+                  zeroing: keeps the trade count G7 needs, shrinks the noise-regime
+                  exposure that destroys the G8 margin.
+    entry_only  — block ENTRIES (flat→position and sign flips) outside allowed
+                  regimes but let same-sign holds ride through regime transitions.
+                  Causal: uses only the prior OUTPUT and the already-lagged regime.
+    """
+    mode = str(params.get("regime_filter_mode", "hard") or "hard").lower()
+    if mode == "soft":
+        try:
+            weight = min(1.0, max(0.0, float(params.get("regime_soft_weight", 0.25))))
+        except (TypeError, ValueError):
+            weight = 0.25
+        return signal.where(mask, signal * weight)
+    if mode == "entry_only":
+        arr = signal.to_numpy(dtype=float)
+        allowed = np.asarray(mask, dtype=bool)
+        out = np.zeros_like(arr)
+        prev = 0.0
+        for i in range(len(arr)):
+            value = arr[i]
+            if allowed[i] or (prev != 0.0 and value != 0.0 and (value > 0.0) == (prev > 0.0)):
+                out[i] = value
+            prev = out[i]
+        return pd.Series(out, index=signal.index)
+    return signal.where(mask, 0.0)
+
+
+def _sign_of(value: Any) -> int:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 1
+    return 1 if number > 0 else (-1 if number < 0 else 0)
+
+
+def _apply_regime_signs(
+    signal: pd.Series,
+    regime_signs: dict,
+    forward_regimes: pd.Series,
+    build_context: "SignalBuildContext | None",
+) -> pd.Series:
+    """Multiply the signal by a per-regime sign (absent labels → +1): for the
+    population whose edge INVERTS by regime rather than vanishing, this preserves
+    the trade count a hard filter would destroy while fixing the mixed-regime IC."""
+    negative = {str(k) for k, v in regime_signs.items() if _sign_of(v) < 0}
+    zeroed = {str(k) for k, v in regime_signs.items() if _sign_of(v) == 0}
+    if not negative and not zeroed:
+        return signal
+    if build_context is not None and len(signal) == len(build_context.frame):
+        neg_mask = build_context.cached_filter_mask("regime", negative) if negative else None
+        zero_mask = build_context.cached_filter_mask("regime", zeroed) if zeroed else None
+    else:
+        labels = pd.Series(forward_regimes.to_numpy(), index=signal.index).astype(str)
+        neg_mask = labels.isin(negative).to_numpy() if negative else None
+        zero_mask = labels.isin(zeroed).to_numpy() if zeroed else None
+    out = signal
+    if neg_mask is not None:
+        out = out.where(~neg_mask, -out)
+    if zero_mask is not None:
+        out = out.where(~zero_mask, 0.0)
+    return out
 
 
 def _stable_signal_key(payload: Any) -> str:
