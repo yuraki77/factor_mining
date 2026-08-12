@@ -42,6 +42,7 @@ from factor_mining.mining import (
     normalize_family,
 )
 from factor_mining.near_miss import analyze_near_misses
+from factor_mining.research.mechanism_compiler import MechanismExperimentPlan
 from factor_mining.research_gate import apply_research_gate, build_research_survivor_records, research_survivor_payloads
 from factor_mining.models import (
     UTC,
@@ -68,6 +69,12 @@ from factor_mining.stats.metrics import (
 )
 from factor_mining.storage import MetadataStore
 from factor_mining.trial_ledger import TrialLedger
+
+
+# The public release validates the interchange contract only. Outcome-bearing
+# execution stays fail-closed until the protected control plane is separately
+# reviewed and published; accepting and ignoring a plan would be unsafe.
+MECHANISM_PLAN_EXECUTION_SUPPORTED = False
 
 
 @dataclass
@@ -652,6 +659,7 @@ def run_pipeline(
     direction_scope: dict[str, Any] | None = None,
     trial_budget: int | None = None,
     stop_event: threading.Event | None = None,
+    mechanism_plan: MechanismExperimentPlan | None = None,
 ) -> PipelineResult:
     """Execute the full factor mining workflow with optional iterative optimization.
 
@@ -674,6 +682,16 @@ def run_pipeline(
         raise ValueError("--tail and --sample-bars are mutually exclusive")
     if sample_bars is not None and sample_mode != "block":
         raise ValueError("sample_mode must be 'block'")
+    if mechanism_plan is not None:
+        # Revalidate at the process boundary; model_copy() can bypass Pydantic
+        # validators and must not turn a once-valid plan into a mutable token.
+        MechanismExperimentPlan.model_validate(
+            mechanism_plan.model_dump(mode="python")
+        )
+        raise RuntimeError(
+            "mechanism-plan execution is not published in this interface-only "
+            "release"
+        )
 
     global _EVENT_SINK, _RUN_ID
     previous_sink = _EVENT_SINK
